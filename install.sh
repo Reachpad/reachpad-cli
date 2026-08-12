@@ -4,7 +4,7 @@
 # $REACHPAD_INSTALL_DIR). POSIX sh: this runs on machines we know nothing
 # about, so no bashisms.
 #
- sh| sh
+#   curl -fsSL https://raw.githubusercontent.com/Tako-Research/reachpad-cli/main/install.sh | sh
 #
 # Nothing here needs root, and the script refuses to guess: an unsupported
 # platform is an error naming the platform, never a wrong binary.
