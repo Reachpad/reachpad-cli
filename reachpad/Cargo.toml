@@ -1,0 +1,64 @@
+[package]
+name = "reach"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The SHIPPED binary is `reachpad` (the agent-native pivot: the CLI is the
+# product interface). The package and lib stay `reach` so `-p reach`,
+# `use reach::` and the in-process integration tests are untouched. An
+# explicit [[bin]] replaces the auto-discovered `reach` bin, so exactly one
+# binary ships.
+[[bin]]
+name = "reachpad"
+path = "src/main.rs"
+
+[features]
+# Item 13 parity: reach has no hardware path at all; the feature exists so
+# `cargo check -p reach --features hw` compiles like every other bin.
+hw = []
+
+[dependencies]
+runtime.workspace = true
+proto.workspace = true
+authz.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+bytes.workspace = true
+prost.workspace = true
+futures.workspace = true
+biscuit-auth.workspace = true
+# NEW EXTERNAL DEP (pinned here; flagged in the build report): WebSocket
+# *client* for `reach tail`. The hub already pins tokio-tungstenite 0.24 as a
+# dev-dependency (test client, ADR-0011 note); the CLI needs the client half
+# at runtime — §10 BOM names tungstenite for the WS fallback path.
+# rustls-tls-webpki-roots: `wss://` to a real hub (ADR-0026) with the same
+# rustls the QUIC path uses — no native-tls, no system cert dependency.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# M1: QUIC client path to the real hub endpoint (§6, ADR-0026).
+quinn.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+# ADR-0040: `https://` for the control plane, on the same rustls (and the same
+# TlsTrust postures) the QUIC data path already uses. Workspace-pinned; hub and
+# controld already depend on it, so this adds no crate to the build graph.
+tokio-rustls.workspace = true
+# Regenerates the deterministic pinned dev hub certificate client-side
+# (`--quic-dev-pin`); byte-equality with hub's is pinned by tests/quic_tail.rs.
+rcgen.workspace = true
+# OS-root certificate verification for quic:// to a real hostname. Already
+# in the build graph at this exact version via quinn's default
+# `platform-verifier` feature — this direct reference adds no new code.
+rustls-platform-verifier = "0.7"
+blake3.workspace = true
+
+
+[lints]
+workspace = true

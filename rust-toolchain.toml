@@ -1,0 +1,26 @@
+# PINNED TO AN EXACT VERSION, deliberately (2026-08-07).
+#
+# This said `channel = "stable"` until now, and that is why the `fmt` gate
+# went red across fifteen files nobody had touched: rustfmt's width and
+# chain heuristics change between stable releases, so every new stable
+# reformats the world under a repository that was green the day before, and
+# the gate stops meaning "formatted the way we chose" and starts meaning
+# "formatted the way this month's rustfmt happens to". A gate whose verdict
+# moves on its own is not a gate.
+#
+# Both halves of the fix landed together: this pin (the cause) and one
+# mechanical `cargo fmt --all` (the symptom). Verified before pinning that
+# CI's rustfmt and this box's produce BYTE-IDENTICAL diffs at this version,
+# so the reformat is reproducible on both.
+#
+# To move it: bump the version here in its OWN commit, run `cargo fmt --all`
+# in a SECOND commit, and keep the two separate so the reformat stays
+# mechanically verifiable against the version that produced it.
+# llvm-tools-preview: live-path-cov.sh resolves llvm-profdata from `rustc
+# --print sysroot`, which honours THIS pin — a component installed on any
+# other toolchain (e.g. by CI's rust-toolchain@stable step) is invisible to
+# it. Omitting it here turned protocol-coverage red on every run after the
+# pin landed.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]

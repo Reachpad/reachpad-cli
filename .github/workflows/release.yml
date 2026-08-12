@@ -1,0 +1,69 @@
+# Release binaries, built FROM THIS REPOSITORY's source on GitHub's runners.
+# The provenance chain a user can check: this workflow run links the tag, the
+# tag names a commit whose source is readable here, and SHA256SUMS in the
+# release matches the tarballs. Nothing is built anywhere private.
+#
+# Tags arrive from the source-of-truth sync (the private reachpad-infra repo
+# pushes a snapshot and its cli-v* tag together).
+name: release
+on:
+  push:
+    tags: ["cli-v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the toolchain, so the cross target must be
+      # added to the PIN, not to whatever stable an action would install.
+      - name: toolchain (the rust-toolchain.toml pin) + cross target
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+      - name: install protoc (crates/proto build dependency)
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install protobuf
+          else
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
+          fi
+      - name: build
+        run: cargo build --release -p reach --target ${{ matrix.target }}
+      - name: package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf reachpad-${{ matrix.target }}.tar.gz reachpad
+          shasum -a 256 reachpad-${{ matrix.target }}.tar.gz > reachpad-${{ matrix.target }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reachpad-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/reachpad-*.tar.gz
+            target/${{ matrix.target }}/release/reachpad-*.tar.gz.sha256
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: combined checksum file
+        run: cat *.sha256 > SHA256SUMS
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            SHA256SUMS
+          fail_on_unmatched_files: true

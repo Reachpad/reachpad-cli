@@ -1,0 +1,38 @@
+# cargo-fuzz targets for the frozen §6 framing (M0 item 7).
+#
+# Deliberately its own (empty) workspace so the root workspace — whose
+# Cargo.toml is frozen — does not pick it up; CI never builds this crate.
+# Run with a nightly toolchain: `cargo +nightly fuzz run frame_roundtrip`.
+
+[package]
+name = "proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "UNLICENSED"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+proto = { path = ".." }
+
+[[bin]]
+name = "frame_roundtrip"
+path = "fuzz_targets/frame_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_decode"
+path = "fuzz_targets/stream_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this crate out of the root workspace (root Cargo.toml is frozen and
+# cannot list an `exclude`); an empty table makes this its own workspace.
+[workspace]

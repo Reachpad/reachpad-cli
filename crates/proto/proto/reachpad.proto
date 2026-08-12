@@ -1,0 +1,140 @@
+// Frozen formats (INFRA_SPEC.md §4.2 event envelope, §4.3 manifest header,
+// §12 change rules). Field numbers and semantics of Event and Manifest are
+// FROZEN — changes require human approval. New messages may be appended.
+syntax = "proto3";
+
+package reachpad.v1;
+
+// ---- §4.2 event envelope (FROZEN) -------------------------------------
+message Event {
+  uint32 v         = 1; // envelope format version (I11)
+  bytes  workspace = 2; // workspace id
+  uint64 seq       = 3; // hub-assigned, contiguous per workspace (I3)
+  bytes  principal = 4; // never empty (I5)
+  uint32 type      = 5; // append-only registry (proto::events)
+  uint64 ts_ms     = 6; // hub receive time; ordering authority is seq, never ts
+  bytes  payload   = 7; // type-specific protobuf
+}
+
+// ---- §4.3 snapshot manifest (header fields FROZEN) ---------------------
+enum Kind {
+  KIND_UNSPECIFIED  = 0;
+  KIND_DISK         = 1;
+  KIND_DISK_MEM     = 2;
+  KIND_ROOTFS_LAYER = 3;
+}
+
+message ChunkRef {
+  uint64 offset     = 1;
+  uint64 len        = 2; // plaintext length
+  bytes  blake3     = 3; // hash of plaintext (chunk id)
+  string enc_key_id = 4;
+}
+
+message Manifest {
+  uint32 v                 = 1; // format version (I11)
+  bytes  workspace         = 2;
+  bytes  parent            = 3; // parent manifest addr (chain); empty = root
+  Kind   kind              = 4;
+  uint64 log_seq           = 5; // log position this seals (I4)
+  repeated ChunkRef chunks = 6;
+  bytes  pool_id           = 7; // set iff kind == KIND_DISK_MEM
+  bytes  host_cpu_sig      = 8; // set iff kind == KIND_DISK_MEM: the sealing
+                                // host's guest-visible CPU identity. A
+                                // restoring node MUST compare it against its
+                                // own BEFORE asking the VMM to load, and
+                                // degrade to the disk half on mismatch.
+                                //
+                                // `v` STAYS 1. `Cas::get_manifest` rejects on
+                                // `v != MANIFEST_V` by exact equality, so a
+                                // bump makes every existing manifest
+                                // unreadable — disk ones included. Appending
+                                // at v=1 is wire-safe: manifests sealed
+                                // before this decode with an empty signature,
+                                // which `restore_memory` refuses by name
+                                // rather than mistaking for corruption.
+}
+
+// ---- §6 handshake / capability negotiation ------------------------------
+message ClientHello {
+  uint32 min_version           = 1;
+  uint32 max_version           = 2;
+  repeated string capabilities = 3; // unknown capabilities are skipped, never fatal
+  bytes  token                 = 4; // Biscuit (I6)
+  bytes  workspace             = 5;
+}
+
+message ServerHello {
+  uint32 version               = 1; // chosen protocol version
+  repeated string capabilities = 2; // intersection the server will honor
+  string error                 = 3; // non-empty = handshake refused
+}
+
+// Channel management on ctl (channel 0). Channel ids are u16 on the wire.
+message ChannelOpen {
+  uint32 channel = 1; // proposed channel id
+  string kind    = 2; // "ctl" | "pty" | "events" | "fs" | "presence"
+  uint32 index   = 3; // e.g. pty number for kind == "pty"
+}
+
+message ChannelAck {
+  uint32 channel  = 1;
+  bool   accepted = 2;
+  string error    = 3;
+}
+
+// ---- common event payloads ----------------------------------------------
+message PtyData      { bytes data = 1; uint32 pty = 2; }
+message HarnessStep  { string harness = 1; string kind = 2; bytes body = 3; }
+message FsDiff       { string path = 1; bytes diff = 2; }
+message GitOp        { string op = 1; string ref = 2; string detail = 3; }
+message LeaseChange  { bytes node = 1; uint64 fencing_token = 2; }
+message SnapshotSealed { bytes manifest_addr = 1; uint64 log_seq = 2; uint32 kind = 3; }
+message GrantChanged { bytes principal = 1; string role = 2; uint64 expires_at_ms = 3; }
+message SecretUsed   { string credential_id = 1; string use_point = 2; }
+message Presence     { bytes principal = 1; string display = 2; }
+message WsLifecycle  { string transition = 1; } // created|attached|paused|forked|rewound|archived
+// A snapshot that was taken but is LESS than what was attempted — today, a
+// pause whose disk half sealed and whose memory half did not (report §30.6).
+// Distinct from `SnapshotSealed{kind:Disk}`, which is also what a pause that
+// never tried to seal memory looks like: this one says a warm resume was
+// attempted and LOST, which is the difference between a policy and a failure.
+message SnapshotDegraded {
+  string half            = 1;  // "memory"
+  string reason          = 2;  // the error, as the node saw it
+  uint64 attempted_bytes = 3;  // what the capture had already written
+}
+
+// One command run through the exec surface (ADR-0059 §7, event type 16).
+//
+// Emitted by the NODE through the workspace's hub link so it lands in the
+// DURABLE log I1 protects — not in controld's index, which is metadata and
+// which `segcheck` cannot read. "Which key ran this" has to be answerable
+// from the log that survives, or the audit story is a promise about a table.
+//
+// `argv[0]` and an argument COUNT, never the arguments: an argument carries a
+// secret often enough (`--token=…`) that a log which records them is a log
+// that leaks them.
+message ExecRan {
+  string exec_id       = 1;
+  string program       = 2;   // argv[0] only
+  uint32 argc          = 3;   // how many, never which
+  string cwd           = 4;
+  // Exited and signalled are kept APART: "exited 0", "exited 101" and "killed
+  // by SIGKILL" are three outcomes, and collapsing the third into 128+n loses
+  // the distinction before anyone can use it. `has_exit_code` is what tells
+  // them apart, because proto3 cannot: a bare 0 and an absent value are the
+  // same bytes on the wire.
+  bool   has_exit_code = 5;
+  int32  exit_code     = 6;
+  string signal        = 7;   // empty when it exited normally
+  uint64 duration_ms   = 8;
+  bool   truncated     = 9;
+  bool   timed_out     = 10;
+  // The audit answer. Empty when the caller used a Biscuit rather than a key.
+  string api_key_id    = 11;
+  // Whether THIS exec is what woke a paused workspace. One boolean written at
+  // the only moment anything knows, so a later usage question is a read
+  // rather than a migration (the deferred-billing hedge, ADR-0059 §12(e)).
+  bool   caused_resume = 12;
+}
