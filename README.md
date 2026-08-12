@@ -6,7 +6,7 @@ machine underneath, so a paused workspace resumes mid-session.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Tako-Research/reachpad-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Reachpad/reachpad-cli/main/install.sh | sh
 ```
 
 Linux x86_64/arm64 (musl, static) and macOS arm64. The script fetches the

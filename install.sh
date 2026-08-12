@@ -4,13 +4,13 @@
 # $REACHPAD_INSTALL_DIR). POSIX sh: this runs on machines we know nothing
 # about, so no bashisms.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Tako-Research/reachpad-cli/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Reachpad/reachpad-cli/main/install.sh | sh
 #
 # Nothing here needs root, and the script refuses to guess: an unsupported
 # platform is an error naming the platform, never a wrong binary.
 set -eu
 
-REPO="Tako-Research/reachpad-cli"
+REPO="Reachpad/reachpad-cli"
 INSTALL_DIR="${REACHPAD_INSTALL_DIR:-$HOME/.local/bin}"
 
 os=$(uname -s)
@@ -21,7 +21,7 @@ case "$os/$arch" in
     Darwin/arm64)           target="aarch64-apple-darwin" ;;
     *)
         echo "reachpad: no prebuilt binary for $os/$arch." >&2
-        echo "Open an issue at https://github.com/Tako-Research/reachpad-cli and we will add the target." >&2
+        echo "Open an issue at https://github.com/Reachpad/reachpad-cli and we will add the target." >&2
         exit 1
         ;;
 esac
