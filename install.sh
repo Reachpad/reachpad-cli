@@ -60,5 +60,6 @@ case ":$PATH:" in
         echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
         ;;
 esac
-echo "next: get your credential at https://reachpad.dev/connect, then run:"
-echo "  reachpad --endpoint m1.reachpad.dev auth login --operator-token -"
+echo "next: sign in through WorkOS:"
+echo "  reachpad auth login"
+echo "on a remote machine, use 'reachpad auth login --no-browser' and open the displayed URL elsewhere"
