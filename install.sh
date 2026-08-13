@@ -4,7 +4,7 @@
 # $REACHPAD_INSTALL_DIR). POSIX sh: this runs on machines we know nothing
 # about, so no bashisms.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Reachpad/reachpad-cli/main/install.sh | sh
+#   curl -fsSL https://reachpad.dev/install | sh
 #
 # Nothing here needs root, and the script refuses to guess: an unsupported
 # platform is an error naming the platform, never a wrong binary.
@@ -60,6 +60,6 @@ case ":$PATH:" in
         echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
         ;;
 esac
-echo "next: sign in through WorkOS:"
-echo "  reachpad auth login"
-echo "on a remote machine, use 'reachpad auth login --no-browser' and open the displayed URL elsewhere"
+echo "next: start Reachpad:"
+echo "  reachpad"
+echo "the guided first run signs in through WorkOS and lists your workspaces"

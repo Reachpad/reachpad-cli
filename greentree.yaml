@@ -1,0 +1,14 @@
+version: 1
+checks:
+  format:
+    run: cargo fmt --all -- --check
+    required_for_publish: true
+    watch: false
+  test:
+    run: cargo test --workspace
+    required_for_publish: true
+    watch: false
+  installer:
+    run: shellcheck install.sh && sh -n install.sh
+    required_for_publish: true
+    watch: false

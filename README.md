@@ -5,8 +5,16 @@ machine underneath, so a paused workspace resumes mid-session.
 
 ## Install
 
+With Homebrew on Apple silicon macOS or x86_64/arm64 Linux:
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Reachpad/reachpad-cli/main/install.sh | sh
+brew install --cask reachpad/tap/reachpad
+```
+
+Or with the checksum-verifying installer:
+
+```sh
+curl -fsSL https://reachpad.dev/install | sh
 ```
 
 Linux x86_64/arm64 (musl, static) and macOS arm64. The script fetches the
@@ -14,19 +22,19 @@ latest release from this repository, verifies its checksum against
 SHA256SUMS, and installs to `~/.local/bin/reachpad` (override with
 `REACHPAD_INSTALL_DIR`).
 
-## Sign in
+## Get started
 
-Run the browser-based WorkOS login:
+Run Reachpad:
 
 ```sh
-reachpad auth login
+reachpad
 ```
 
-The CLI shows a short code and opens WorkOS hosted sign-in. WorkOS handles the
-account login and any required MFA or SSO. After approval, Reachpad exchanges
-the short-lived WorkOS token once and saves a user-scoped Reachpad credential
-and the production endpoint with mode 0600. No password or authentication
-factor is entered into Reachpad.
+On first use, the CLI shows a short code, opens WorkOS hosted sign-in, and then
+lists your workspaces. WorkOS handles the account login and any required MFA or
+SSO. After approval, Reachpad exchanges the short-lived WorkOS token once and
+saves a user-scoped Reachpad credential and the production endpoint with mode
+0600. No password or authentication factor is entered into Reachpad.
 
 On a remote machine without a usable browser, run `reachpad auth login
 --no-browser` and open the displayed URL on another device. The manual
@@ -40,6 +48,20 @@ reachpad ws list
 reachpad ws create --name scratch
 reachpad attach <workspace-id>
 ```
+
+Useful maintenance commands:
+
+```sh
+reachpad doctor
+reachpad update
+reachpad completions bash
+reachpad completions zsh
+reachpad completions fish
+```
+
+`reachpad update` respects how Reachpad was installed: Homebrew installs are
+directed to `brew upgrade --cask reachpad`, while installer-managed binaries
+are updated in place after the release checksum is verified.
 
 Docs: [reachpad.dev/docs/cli](https://reachpad.dev/docs/cli)
 
