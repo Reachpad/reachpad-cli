@@ -4,7 +4,9 @@
 use anyhow::Context;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use clap::CommandFactory as _;
 use clap::Parser as _;
+use std::io::IsTerminal as _;
 
 use crate::api::Client;
 use crate::attach;
@@ -42,25 +44,49 @@ pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
     // only the missing default that makes the next `reachpad ws list` work.
     let token_path = cli.token_path();
     if cli.endpoint.is_none() {
-        if let Some(saved) = tokenfile::read_connection_config(&token_path)? {
-            crate::cli_auth::validate_connection_urls(&saved.controld, &saved.hub)
-                .context("saved Reachpad connection configuration is unsafe")?;
-            if cli.controld == crate::cli::DEFAULT_CONTROLD {
-                cli.controld = saved.controld;
+        match tokenfile::read_connection_config(&token_path) {
+            Ok(Some(saved)) => {
+                crate::cli_auth::validate_connection_urls(&saved.controld, &saved.hub)
+                    .context("saved Reachpad connection configuration is unsafe")?;
+                if cli.controld == crate::cli::DEFAULT_CONTROLD {
+                    cli.controld = saved.controld;
+                }
+                if cli.hub == crate::cli::DEFAULT_HUB {
+                    cli.hub = saved.hub;
+                }
             }
-            if cli.hub == crate::cli::DEFAULT_HUB {
-                cli.hub = saved.hub;
+            Ok(None) => {}
+            Err(_) if matches!(cli.command.as_ref(), Some(Command::Doctor)) => {
+                // Doctor reports the malformed file by name. Letting the
+                // ordinary startup path fail here would make the diagnostic
+                // command unable to diagnose the state it exists for.
             }
+            Err(error) => return Err(error),
         }
     }
 
     tracing::info!(mode = cfg.mode().as_str(), "reachpad ready");
 
     let Some(command) = cli.command.take() else {
-        anyhow::bail!("no command given (try `reachpad --help`)");
+        let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        return run_onboarding(&cli, token_path, interactive).await;
     };
 
     match command {
+        Command::Doctor => {
+            return crate::doctor::run(&cli.controld, &cli.hub, cli.trust(), &cli.token_path())
+                .await;
+        }
+        Command::Update => return crate::self_update::run(),
+        Command::Completions { shell } => {
+            let generator = match shell {
+                crate::cli::CompletionShell::Bash => clap_complete::Shell::Bash,
+                crate::cli::CompletionShell::Zsh => clap_complete::Shell::Zsh,
+                crate::cli::CompletionShell::Fish => clap_complete::Shell::Fish,
+            };
+            let mut stdout = std::io::stdout();
+            clap_complete::generate(generator, &mut Cli::command(), "reachpad", &mut stdout);
+        }
         Command::Credits => {
             let credential = tokenfile::read_operator_token(&cli.token_path())?;
             let client = Client::with_trust(&cli.controld, cli.trust());
@@ -189,7 +215,7 @@ pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
             );
         }
         Command::Auth(auth) => {
-            run_auth(&cli.controld, cli.trust(), cli.token_path(), auth).await?;
+            run_auth(&cli.controld, &cli.hub, cli.trust(), cli.token_path(), auth).await?;
         }
         Command::Key(key) => {
             run_key(&cli.controld, cli.trust(), cli.token_path(), key).await?;
@@ -199,6 +225,75 @@ pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
             print_inspection(&inspect::inspect_b64(&token_b64)?);
         }
     }
+    Ok(0)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OnboardingAction {
+    RefuseNonInteractive,
+    SignInThenList,
+    List,
+}
+
+fn onboarding_action(interactive: bool, operator_token_exists: bool) -> OnboardingAction {
+    match (interactive, operator_token_exists) {
+        (false, _) => OnboardingAction::RefuseNonInteractive,
+        (true, false) => OnboardingAction::SignInThenList,
+        (true, true) => OnboardingAction::List,
+    }
+}
+
+async fn run_onboarding(
+    cli: &Cli,
+    token_path: std::path::PathBuf,
+    interactive: bool,
+) -> anyhow::Result<i32> {
+    let action = onboarding_action(interactive, tokenfile::operator_token_exists(&token_path)?);
+    if action == OnboardingAction::RefuseNonInteractive {
+        anyhow::bail!("no command given (try `reachpad --help`)");
+    }
+
+    let mut controld = cli.controld.clone();
+    if action == OnboardingAction::SignInThenList {
+        eprintln!("No saved Reachpad sign-in was found. Starting browser sign-in.");
+        run_auth(
+            &controld,
+            &cli.hub,
+            cli.trust(),
+            token_path.clone(),
+            crate::cli::AuthCommand::Login {
+                operator_token: None,
+                account_url: crate::cli_auth::DEFAULT_ACCOUNT_URL.to_owned(),
+                no_browser: false,
+            },
+        )
+        .await?;
+
+        let saved = tokenfile::read_connection_config(&token_path)?
+            .context("browser sign-in did not save the Reachpad endpoints")?;
+        crate::cli_auth::validate_connection_urls(&saved.controld, &saved.hub)
+            .context("browser sign-in saved unsafe Reachpad endpoints")?;
+        controld = saved.controld;
+    }
+
+    println!();
+    println!("Your workspaces:");
+    run_ws(
+        &controld,
+        cli.trust(),
+        token_path,
+        WsCommand::List {
+            user: None,
+            principal: "dev-principal".to_owned(),
+            idp_assertion: None,
+        },
+    )
+    .await?;
+    println!();
+    println!("Next commands:");
+    println!("  Create a workspace: reachpad ws create --name <name>");
+    println!("  Open a workspace:   reachpad ws token <workspace-id>");
+    println!("                      reachpad attach <workspace-id>");
     Ok(0)
 }
 
@@ -235,6 +330,7 @@ fn wall_now_ms() -> u64 {
 /// `reachpad auth …` — the operator-credential half of ADR-0034.
 async fn run_auth(
     controld: &str,
+    hub: &str,
     trust: crate::transport::TlsTrust,
     token_path: std::path::PathBuf,
     cmd: crate::cli::AuthCommand,
@@ -260,7 +356,16 @@ async fn run_auth(
                 // Exchange BEFORE saving: a credential that does not work is
                 // not one worth keeping on disk, and the failure names why.
                 let session = client.operator_session(&credential).await?;
+                crate::cli_auth::validate_connection_urls(controld, hub)
+                    .context("refusing to save unsafe Reachpad endpoints")?;
                 tokenfile::write_operator_token(&token_path, &credential)?;
+                tokenfile::write_connection_config(
+                    &token_path,
+                    &tokenfile::ConnectionConfig {
+                        controld: controld.to_owned(),
+                        hub: hub.to_owned(),
+                    },
+                )?;
                 println!(
                     "logged in: user={} principal={}",
                     session.user_id, session.principal_id
@@ -268,6 +373,10 @@ async fn run_auth(
                 println!(
                     "  operator credential saved: {} (0600)",
                     tokenfile::operator_path(&token_path).display()
+                );
+                println!(
+                    "  endpoints saved: {} (0600)",
+                    tokenfile::connection_path(&token_path).display()
                 );
                 println!(
                     "  identity token valid until {} (ms since epoch); renew with `reachpad auth session`",
@@ -688,7 +797,7 @@ async fn run_ws(
             let presented = tokenfile::read_token(&token_path)?;
             let at = client.archive(&id, &presented).await?;
             println!("archived: workspace={id} archived_at_ms={at}");
-            println!("  nothing was deleted: the snapshot chain and the event log remain");
+            println!("  no data is deleted immediately; archived state follows managed retention");
         }
         WsCommand::Token {
             id,
@@ -798,5 +907,27 @@ fn print_inspection(i: &inspect::Inspection) {
         for line in source.lines().filter(|l| !l.trim().is_empty()) {
             println!("    {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod onboarding_tests {
+    use super::*;
+
+    #[test]
+    fn bare_command_only_onboards_an_interactive_terminal() {
+        assert_eq!(
+            onboarding_action(false, false),
+            OnboardingAction::RefuseNonInteractive
+        );
+        assert_eq!(
+            onboarding_action(false, true),
+            OnboardingAction::RefuseNonInteractive
+        );
+        assert_eq!(
+            onboarding_action(true, false),
+            OnboardingAction::SignInThenList
+        );
+        assert_eq!(onboarding_action(true, true), OnboardingAction::List);
     }
 }

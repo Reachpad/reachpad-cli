@@ -306,8 +306,23 @@ pub async fn complete_device_authorization(
 /// flow, so a remote machine with no desktop works without port forwarding.
 pub fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "linux")]
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return false;
+    {
+        // Reachpad workspaces expose the owner's real browser through this
+        // host command even though the remote shell has no desktop display.
+        // Other Linux machines fall through to their ordinary desktop opener.
+        if std::process::Command::new("devbox-browser-open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return true;
+        }
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return false;
+        }
     }
     #[cfg(target_os = "linux")]
     let mut command = std::process::Command::new("xdg-open");

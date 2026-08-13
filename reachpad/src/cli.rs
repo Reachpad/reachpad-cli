@@ -112,6 +112,16 @@ impl Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Check the installation, saved login, endpoints, and connectivity.
+    Doctor,
+    /// Install the latest release, or print the package-manager upgrade command.
+    Update,
+    /// Generate a shell completion script on stdout.
+    Completions {
+        /// Shell whose completion syntax should be generated.
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
     /// Show the account's compute-credit balance.
     Credits,
     /// Workspace lifecycle (create / attach / release).
@@ -183,6 +193,13 @@ pub enum Command {
     /// Token utilities.
     #[command(subcommand)]
     Token(TokenCommand),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 #[derive(Subcommand, Debug)]
@@ -391,9 +408,9 @@ pub enum WsCommand {
     },
     /// Archive a workspace (POST /v1/workspaces/:id/archive).
     ///
-    /// Frees the entitlement slot it holds. Nothing is deleted: the snapshot
-    /// chain and the event log are untouched (I4, I5) — the workspace simply
-    /// stops counting as live and can no longer be attached.
+    /// Frees the entitlement slot it holds and stops compute use. Nothing is
+    /// deleted immediately, but archived state follows managed retention
+    /// rather than a permanent-backup promise (ADR-0070).
     Archive {
         /// Workspace id.
         id: String,
@@ -568,6 +585,50 @@ mod tests {
             panic!("manual auth login should parse");
         };
         assert_eq!(operator_token.as_deref(), Some("-"));
+    }
+
+    #[test]
+    fn bare_reachpad_is_reserved_for_first_run_onboarding() {
+        let cli = parse(&["reachpad"]);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn maintenance_commands_and_completion_shells_parse() {
+        assert!(matches!(
+            parse(&["reachpad", "doctor"]).command,
+            Some(Command::Doctor)
+        ));
+        assert!(matches!(
+            parse(&["reachpad", "update"]).command,
+            Some(Command::Update)
+        ));
+        assert!(matches!(
+            parse(&["reachpad", "completions", "zsh"]).command,
+            Some(Command::Completions {
+                shell: CompletionShell::Zsh
+            })
+        ));
+        assert!(Cli::try_parse_from(["reachpad", "completions", "nushell"]).is_err());
+    }
+
+    #[test]
+    fn every_supported_shell_generates_a_reachpad_script() {
+        use clap::CommandFactory as _;
+
+        for generator in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+        ] {
+            let mut output = Vec::new();
+            clap_complete::generate(generator, &mut Cli::command(), "reachpad", &mut output);
+            let script = String::from_utf8(output).unwrap();
+            assert!(
+                script.contains("reachpad"),
+                "empty script for {generator:?}"
+            );
+        }
     }
 
     #[test]

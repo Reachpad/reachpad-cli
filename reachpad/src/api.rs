@@ -814,9 +814,10 @@ impl Client {
         ))
     }
 
-    /// POST /v1/workspaces/:id/archive. Owner-only, and it destroys nothing:
-    /// the chain and the log stay, the workspace stops counting against
-    /// `max_workspaces` (I13). Returns when it was archived.
+    /// POST /v1/workspaces/:id/archive. Owner-only. The workspace stops
+    /// counting against `max_workspaces` and nothing is deleted immediately;
+    /// archived state follows ADR-0070's managed-retention boundary. Returns
+    /// when it was archived.
     pub async fn archive(&self, workspace: &str, biscuit_b64: &str) -> Result<u64, ApiError> {
         let body = self
             .post(
