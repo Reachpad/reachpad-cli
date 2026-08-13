@@ -8,7 +8,7 @@ machine underneath, so a paused workspace resumes mid-session.
 With Homebrew on Apple silicon macOS or x86_64/arm64 Linux:
 
 ```sh
-brew install --cask reachpad/tap/reachpad
+brew install reachpad/tap/reachpad
 ```
 
 Or with the checksum-verifying installer:
@@ -60,7 +60,7 @@ reachpad completions fish
 ```
 
 `reachpad update` respects how Reachpad was installed: Homebrew installs are
-directed to `brew upgrade --cask reachpad`, while installer-managed binaries
+directed to `brew upgrade reachpad`, while installer-managed binaries
 are updated in place after the release checksum is verified.
 
 Docs: [reachpad.dev/docs/cli](https://reachpad.dev/docs/cli)
