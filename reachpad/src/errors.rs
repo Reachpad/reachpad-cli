@@ -1,0 +1,1240 @@
+//! One compiled table from wire code to the sentence a user acts on, the exit
+//! code that sentence deserves, and whether trying again could help.
+//!
+//! Three rules the table exists to keep:
+//!
+//! - **Numbers come from the server.** A row's `numbers` clause is rendered
+//!   only when every field it names is in the refusal body (I13: limits are
+//!   entitlement values read off the wire, never constants in a client). The
+//!   clause disappears rather than inventing a number.
+//! - **Sentences are product words.** No `§`, no "biscuit", no bare code, no
+//!   milliseconds-since-epoch; each one names the next command.
+//! - **The exit code is semantic.** `run` carries the guest's own code; every
+//!   other command exits 0/2/3/4/5/6/7, and 70 means reachpad accepted the
+//!   command and lost its result.
+
+use serde_json::{json, Value};
+
+use crate::api::ApiError;
+
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_USAGE: i32 = 2;
+pub const EXIT_CREDENTIAL: i32 = 3;
+pub const EXIT_NO_SUCH_WORKSPACE: i32 = 4;
+pub const EXIT_WRONG_STATE: i32 = 5;
+pub const EXIT_LIMIT: i32 = 6;
+pub const EXIT_UNAVAILABLE: i32 = 7;
+/// EX_SOFTWARE: the command was accepted and its result was lost.
+pub const EXIT_LOST_RESULT: i32 = 70;
+
+/// controld self-terminates an exec stream this long after the timeout it was
+/// given (`execbroker::EXEC_STREAM_GRACE_MS`).
+pub const EXEC_STREAM_GRACE_MS: u64 = 150_000;
+/// Room for that verdict to travel back before the client stops waiting.
+pub const DEADLINE_MARGIN_MS: u64 = 30_000;
+/// The exec timeout controld applies when the request names none.
+pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 600_000;
+
+/// How long the client waits for an exec, given the timeout the user asked
+/// for. Strictly longer than the server's own bound (trap 31), so the verdict
+/// the user sees is the server's `exec.end` and not a local timeout that says
+/// nothing about whether the command ran.
+pub fn exec_deadline_ms(timeout_ms: Option<u64>) -> u64 {
+    timeout_ms
+        .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS)
+        .saturating_add(EXEC_STREAM_GRACE_MS)
+        .saturating_add(DEADLINE_MARGIN_MS)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retriable {
+    No,
+    Yes,
+    /// `no_capacity` only: the fleet may make room, or it may be structurally
+    /// unable to serve this workspace. The body's `cause` says which.
+    WhenCauseTransient,
+}
+
+pub struct Row {
+    pub code: &'static str,
+    /// Chooses between rows sharing a code: the body field and the value it
+    /// must have. Selective rows come first; a row with `None` is the
+    /// fallback.
+    pub selector: Option<(&'static str, &'static str)>,
+    /// Always safe to render: it names no server number.
+    pub sentence: &'static str,
+    /// Rendered only when every `{field}` in it is present in the body.
+    pub numbers: Option<&'static str>,
+    pub next_command: Option<&'static str>,
+    pub exit_code: i32,
+    pub retriable: Retriable,
+}
+
+const SIGN_IN: &str = "reachpad auth login";
+
+pub const TABLE: &[Row] = &[
+    // ---- no credential, in all five spellings the fleet has for it --------
+    Row {
+        code: "no_credential",
+        selector: None,
+        sentence: "Not signed in. Run `reachpad auth login` — get your credential at https://reachpad.dev/connect.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "no_identity_token",
+        selector: None,
+        sentence: "Not signed in. Run `reachpad auth login` — get your credential at https://reachpad.dev/connect.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "no_token",
+        selector: None,
+        sentence: "Not signed in. Run `reachpad auth login` — get your credential at https://reachpad.dev/connect.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "no_operator_token",
+        selector: None,
+        sentence: "Not signed in. Run `reachpad auth login` — get your credential at https://reachpad.dev/connect.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "no_authority",
+        selector: None,
+        sentence: "Nothing proved who is asking. Run `reachpad auth login`, or pass an API key with `--api-key env:<VAR>`.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    // ---- the credential is there and not accepted ------------------------
+    Row {
+        code: "bad_operator_token",
+        selector: None,
+        sentence: "That credential was not accepted. Get a fresh one at https://reachpad.dev/connect and run `reachpad auth login`.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "operator_token_expired",
+        selector: None,
+        sentence: "Your credential has expired. Get a fresh one at https://reachpad.dev/connect and run `reachpad auth login`.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "operator_token_revoked",
+        selector: None,
+        sentence: "Your credential was revoked. Get a new one at https://reachpad.dev/connect and run `reachpad auth login`.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "operator_token_scoped",
+        selector: None,
+        sentence: "That credential is scoped to one purpose and cannot drive workspaces. Get a full one at https://reachpad.dev/connect.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "scope_required",
+        selector: None,
+        sentence: "That credential is not scoped for this. Get the right one at https://reachpad.dev/connect.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "not_user_identity",
+        selector: None,
+        sentence: "That credential does not identify a user. Run `reachpad auth login`.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "bad_idp_assertion",
+        selector: None,
+        sentence: "Your sign-in was not accepted. Get a fresh credential at https://reachpad.dev/connect.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "bad_token",
+        selector: None,
+        sentence: "The saved access for {workspace} is unreadable. Run the command again — reachpad mints a fresh one.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "bad_token_encoding",
+        selector: None,
+        sentence: "The saved access for {workspace} is unreadable. Run the command again — reachpad mints a fresh one.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "user_unknown",
+        selector: None,
+        sentence: "This account is not set up yet. Sign in at https://reachpad.dev/connect first.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    // ---- the credential is fine and does not reach this far --------------
+    Row {
+        code: "not_authorized",
+        selector: None,
+        sentence: "Your access to {workspace} does not allow this.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "not_owner",
+        selector: None,
+        sentence: "This needs owner access to {workspace}. Mint the key with `--role owner`, or use the credential from `reachpad auth login`.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        // Decided by this client, not by a server: the state route withholds
+        // the fencing token from a caller it would not let write, and pause
+        // needs write access — NOT owner, which is what the `not_owner`
+        // sentence would have sent the user to mint.
+        code: "no_write_access",
+        selector: None,
+        sentence: "Pausing {workspace} needs write access, and this credential can only read it. Use a key minted with `--role collaborator` (or `--role owner`), or ask its owner to share it with `--role collaborator`.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "not_workspace_owner",
+        selector: None,
+        sentence: "This needs owner access to {workspace}. Mint the key with `--role owner`, or use the credential from `reachpad auth login`.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "principal_unknown",
+        selector: None,
+        sentence: "That credential does not name anyone this fleet knows. Run `reachpad auth login` again.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "principal_not_of_user",
+        selector: None,
+        sentence: "That credential belongs to another account. Run `reachpad auth login` again.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "not_your_user",
+        selector: None,
+        sentence: "That credential belongs to another account. Run `reachpad auth login` again.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    // ---- API keys --------------------------------------------------------
+    Row {
+        code: "api_key_unknown",
+        selector: None,
+        sentence: "That API key is not known here. Mint one with `reachpad keys mint`.",
+        numbers: None,
+        next_command: Some("reachpad keys mint"),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "api_key_expired",
+        selector: None,
+        sentence: "That API key has expired. Mint a new one with `reachpad keys mint`.",
+        numbers: None,
+        next_command: Some("reachpad keys mint"),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "api_key_revoked",
+        selector: None,
+        sentence: "That API key was revoked. Mint a new one with `reachpad keys mint`.",
+        numbers: None,
+        next_command: Some("reachpad keys mint"),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "api_key_out_of_scope",
+        selector: None,
+        sentence: "That API key does not cover {workspace}. Mint one that names it: `reachpad keys mint --workspace {workspace}`.",
+        numbers: None,
+        next_command: Some("reachpad keys mint"),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "api_key_lookup_failed",
+        selector: None,
+        sentence: "reachpad could not check that API key just now. Try again.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "unknown_api_key",
+        selector: None,
+        sentence: "There is no such API key on this account. `reachpad keys list` shows the ones there are.",
+        numbers: None,
+        next_command: Some("reachpad keys list"),
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "bad_role",
+        selector: None,
+        sentence: "That is not a role a key can have. Use `--role collaborator` or `--role owner`.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // `share --role`: the grant roles are narrower than a key's, because
+        // `owner` is not grantable (§7.4).
+        code: "invalid_role",
+        selector: None,
+        sentence: "That is not a role a share can have. Use `--role viewer` or `--role collaborator`.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "workspace_not_of_user",
+        selector: None,
+        sentence: "One of the workspaces named for this key is not on this account. `reachpad list` shows the ones that are.",
+        numbers: None,
+        next_command: Some("reachpad list"),
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
+    // ---- no such thing ---------------------------------------------------
+    Row {
+        code: "workspace_not_found",
+        selector: None,
+        sentence: "There is no workspace {workspace} on this account. `reachpad list` shows the ones there are.",
+        numbers: None,
+        next_command: Some("reachpad list"),
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // `share --grantee`: a mistyped principal is the ordinary case, so it
+        // says which half of the command to look at.
+        code: "grantee_unknown",
+        selector: None,
+        sentence: "There is no such principal on this fleet, so {workspace} was not shared. Check the id given to `--grantee`.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "snapshot_not_found",
+        selector: None,
+        sentence: "That save does not exist. `reachpad status {workspace}` shows the one {workspace} resumes from.",
+        numbers: None,
+        next_command: Some("reachpad status {workspace}"),
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "snapshot_not_of_workspace",
+        selector: None,
+        sentence: "That save belongs to another workspace.",
+        numbers: None,
+        next_command: Some("reachpad status {workspace}"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "operator_token_not_found",
+        selector: None,
+        sentence: "That credential is no longer on this account.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
+    // ---- wrong state -----------------------------------------------------
+    Row {
+        // 409 from attach, 410 from run: one fact, two statuses.
+        code: "workspace_archived",
+        selector: None,
+        sentence: "{workspace} is archived. Fork it to work from its last save: `reachpad fork {workspace}`.",
+        numbers: None,
+        next_command: Some("reachpad fork {workspace}"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // I7: sharing is gated on the redaction filter being on, and the gate
+        // refuses the share rather than trusting later enforcement.
+        code: "redaction_filter_disabled",
+        selector: None,
+        sentence: "{workspace} cannot be shared while its redaction filter is off.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "lease_held",
+        selector: None,
+        sentence: "{workspace} is running on another node. Pause it first: `reachpad pause {workspace}`.",
+        numbers: Some("It is held by {holder_node}."),
+        next_command: Some("reachpad pause {workspace}"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // Also the answer for a workspace that has never started. NOT the
+        // `no_sealed_snapshot` sentence: that one says there is nothing to
+        // fork from, and a fork child that has never run IS forkable.
+        code: "no_active_lease",
+        selector: None,
+        sentence: "{workspace} is not running, so there is nothing to save. `reachpad run {workspace} -- <command>` starts it.",
+        numbers: None,
+        next_command: Some("reachpad run {workspace} -- <command>"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "stale_fencing_token",
+        selector: None,
+        sentence: "Something else took over {workspace} while this command was running. Run `reachpad status {workspace}` and try again.",
+        numbers: None,
+        next_command: Some("reachpad status {workspace}"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "no_sealed_snapshot",
+        selector: None,
+        sentence: "{workspace} has never been saved, so there is nothing to fork from. `reachpad pause {workspace}` saves it now.",
+        numbers: None,
+        next_command: Some("reachpad pause {workspace}"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "workspace_stopping",
+        selector: None,
+        sentence: "{workspace} is saving on its way down.",
+        numbers: Some("Try again in about {retry_after_s}s."),
+        next_command: Some("reachpad status {workspace}"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "already_at_snapshot",
+        selector: None,
+        sentence: "{workspace} already resumes from that save.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "not_an_earlier_snapshot",
+        selector: None,
+        sentence: "That save is not earlier than the one {workspace} resumes from now.",
+        numbers: None,
+        next_command: Some("reachpad status {workspace}"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    // ---- limits ----------------------------------------------------------
+    Row {
+        code: "entitlement_limit",
+        selector: Some(("limit", "max_workspaces")),
+        sentence: "You are at your workspace limit. Archive one you are done with: `reachpad archive <id>`.",
+        numbers: Some("You have {live_workspaces} of {max_workspaces}."),
+        next_command: Some("reachpad archive <id>"),
+        exit_code: EXIT_LIMIT,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "entitlement_limit",
+        selector: Some(("limit", "max_concurrent")),
+        sentence: "You are at your limit of workspaces running at once. Pause one, or wait — idle workspaces pause themselves.",
+        numbers: Some("{active_leases} of {max_concurrent} are running."),
+        next_command: Some("reachpad pause <id>"),
+        exit_code: EXIT_LIMIT,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "entitlement_limit",
+        selector: None,
+        sentence: "You are at an account limit. `reachpad auth whoami` shows your limits.",
+        numbers: None,
+        next_command: Some("reachpad auth whoami"),
+        exit_code: EXIT_LIMIT,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "no_entitlement",
+        selector: None,
+        sentence: "This account has no workspace allowance. Set one up at https://reachpad.dev/pricing.",
+        numbers: None,
+        next_command: Some("reachpad auth whoami"),
+        exit_code: EXIT_LIMIT,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The refusal body's `balance_credits` is a server-side constant 0,
+        // not a reading — so this row states no balance.
+        code: "credits_exhausted",
+        selector: None,
+        sentence: "Out of compute credits. Top up at https://reachpad.dev/pricing.",
+        numbers: None,
+        next_command: Some("reachpad auth whoami"),
+        exit_code: EXIT_LIMIT,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "exec_concurrency_exceeded",
+        selector: None,
+        sentence: "{workspace} is already running as many commands at once as it may.",
+        numbers: Some("{running} of {exec_max_concurrent} are running."),
+        next_command: None,
+        exit_code: EXIT_LIMIT,
+        retriable: Retriable::Yes,
+    },
+    // ---- unavailable -----------------------------------------------------
+    Row {
+        code: "no_capacity",
+        selector: None,
+        sentence: "The fleet has no room for {workspace} right now.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::WhenCauseTransient,
+    },
+    Row {
+        code: "core_state_contended",
+        selector: None,
+        sentence: "reachpad is busy coordinating this account. Try again.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "placement_incomplete",
+        selector: None,
+        sentence: "reachpad could not finish starting {workspace}. Try again.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "control_upstream_unavailable",
+        selector: None,
+        sentence: "reachpad's control plane is not answering right now. Try again.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "internal",
+        selector: None,
+        sentence: "reachpad hit an error on its side. Try again; if it persists, report it at https://reachpad.dev.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    // ---- the request itself ----------------------------------------------
+    Row {
+        code: "empty_argv",
+        selector: None,
+        sentence: "No command was given to run. Put it after `--`: `reachpad run {workspace} -- <command>`.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "control_request_too_large",
+        selector: None,
+        sentence: "That request is too large for reachpad's front door — `--stdin` carries about 1 MiB.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "malformed_control_request",
+        selector: None,
+        sentence: "reachpad's front door could not read that request.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The axum extractors refuse a body before any handler runs, so this
+        // one arrives WITHOUT the `{"error":…}` shape every other row has.
+        code: "request_not_understood",
+        selector: None,
+        sentence: "This fleet could not read reachpad's request. Update the CLI (`reachpad --version`), or the fleet is older than it.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    // ---- a command that started and whose result was lost ----------------
+    Row {
+        code: "node_gone",
+        selector: None,
+        sentence: "reachpad accepted the command for {workspace} and lost its result — whether it ran is unknown; it may never have started.",
+        numbers: None,
+        next_command: Some("reachpad events {workspace}"),
+        exit_code: EXIT_LOST_RESULT,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "exec_deadline_exceeded",
+        selector: None,
+        sentence: "The command on {workspace} hit its timeout and was killed. Give it longer with `--timeout`.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_LOST_RESULT,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "client_deadline_exceeded",
+        selector: None,
+        sentence: "reachpad stopped waiting for {workspace} before the fleet answered — whether the command ran is unknown.",
+        numbers: None,
+        next_command: Some("reachpad events {workspace}"),
+        exit_code: EXIT_LOST_RESULT,
+        retriable: Retriable::No,
+    },
+    // ---- a wait this client gave up on -----------------------------------
+    Row {
+        // Distinct from `wait_timeout` on purpose: a workspace still sealing
+        // is working, and saying "gave up waiting" about it reads as a
+        // failure it is not. The seal budget is the server's, not ours.
+        code: "still_sealing",
+        selector: None,
+        sentence: "{workspace} is still saving.",
+        numbers: Some("It has been saving for {waited_s}s."),
+        next_command: Some("reachpad status {workspace}"),
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "wait_timeout",
+        selector: None,
+        sentence: "Gave up waiting for {workspace}.",
+        numbers: Some("It was {state} after {waited_s}s, not {target}."),
+        next_command: Some("reachpad status {workspace}"),
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    // ---- a fleet older than this CLI (deployment skew) --------------------
+    Row {
+        // hub's answer for a path it does not forward. `api::is_route_absent`
+        // turns it into the fallback each verb has one for; this row is the
+        // sentence for the verbs that have none.
+        code: "not_found",
+        selector: None,
+        sentence: "This fleet has no such endpoint: it is older than this CLI. Redeploy the fleet, or run an older reachpad against it.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // A notice, not a refusal: the command still runs, with less to say.
+        // Emitted once per command.
+        code: "fleet_older_than_cli",
+        selector: None,
+        sentence: "This fleet is older than this CLI: it cannot report a workspace's state directly, so some fields read `unknown`.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_OK,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "fleet_predates_pause",
+        selector: None,
+        sentence: "This fleet predates one-call pause, so reachpad will not guess how to stop {workspace}. Run `reachpad status {workspace}` once it is redeployed.",
+        numbers: None,
+        next_command: Some("reachpad status {workspace}"),
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // A fleet with no state route cannot say when a workspace reaches a
+        // state, so a `--wait` against it could only poll toward an answer
+        // that never comes. Refused at once, and never reported as a wait
+        // that succeeded.
+        code: "fleet_predates_wait",
+        selector: None,
+        sentence: "This fleet cannot report a workspace's state, so `--wait` would never see {workspace} change. Run the command without `--wait`, or wait for the fleet to be redeployed.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "fleet_predates_replay",
+        selector: None,
+        sentence: "This fleet cannot replay past events, and reachpad will not show a live stream as if it were the replay you asked for. Run `reachpad events {workspace}` without `--since`.",
+        numbers: None,
+        next_command: Some("reachpad events {workspace}"),
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
+];
+
+/// `no_capacity` causes that a later attempt could see differently
+/// (`scheduler::why_no_capacity`). The rest describe a fleet that does not
+/// serve this workspace at all, and retrying only wastes the user's time.
+const TRANSIENT_CAPACITY_CAUSES: &[&str] = &[
+    "all_full",
+    "all_draining_or_cordoned",
+    "reserved_for_other_users",
+    "unknown",
+];
+
+/// The row for `code`, preferring one whose selector matches the body.
+pub fn row(code: &str, body: &Value) -> Option<&'static Row> {
+    let mut fallback = None;
+    for row in TABLE {
+        if row.code != code {
+            continue;
+        }
+        match row.selector {
+            Some((field, value)) => {
+                if body.get(field).and_then(Value::as_str) == Some(value) {
+                    return Some(row);
+                }
+            }
+            None => fallback = fallback.or(Some(row)),
+        }
+    }
+    fallback
+}
+
+/// A rendered refusal: what to say, what it means, and what to exit with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliError {
+    pub code: String,
+    pub message: String,
+    pub next_command: Option<String>,
+    pub retriable: bool,
+    pub status: Option<u16>,
+    pub exit_code: i32,
+    /// What the command DID before it was refused, when that is something a
+    /// caller has to know about — `fork --count`'s children, which exist and
+    /// hold slots whether or not the fan-out finished. `None` on every
+    /// refusal that changed nothing, which is nearly all of them.
+    pub data: Option<Value>,
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+impl From<anyhow::Error> for CliError {
+    /// Anything the table does not know about is a local failure: it has a
+    /// sentence of its own already, and no exit code more specific than 1.
+    fn from(err: anyhow::Error) -> CliError {
+        CliError {
+            code: "reachpad_error".to_owned(),
+            message: format!("{err:#}"),
+            next_command: None,
+            retriable: false,
+            status: None,
+            exit_code: 1,
+            data: None,
+        }
+    }
+}
+
+impl CliError {
+    /// A usage refusal decided locally, before anything left this machine.
+    pub fn usage(message: impl Into<String>) -> CliError {
+        CliError {
+            code: "usage".to_owned(),
+            message: message.into(),
+            next_command: None,
+            retriable: false,
+            status: None,
+            exit_code: EXIT_USAGE,
+            data: None,
+        }
+    }
+
+    /// A table row by code alone — for the refusals the client decides itself
+    /// (a missing credential, a fleet too old for the command).
+    pub fn from_code(code: &str, workspace: Option<&str>) -> CliError {
+        CliError::from_body(code, &Value::Null, workspace)
+    }
+
+    /// A table row whose numbers this CLI knows rather than the server — how
+    /// long a `--wait` waited, and what it was waiting for. The rule is
+    /// unchanged: a clause renders only when every field it names is present.
+    pub fn from_body(code: &str, body: &Value, workspace: Option<&str>) -> CliError {
+        CliError::render(code, body, None, workspace)
+            .unwrap_or_else(|| CliError::unnamed(code, None, None, 1))
+    }
+
+    pub fn from_api(err: &ApiError, workspace: Option<&str>) -> CliError {
+        match err {
+            ApiError::Api {
+                status,
+                code,
+                detail,
+                body,
+            } => CliError::render(code, body, Some(*status), workspace).unwrap_or_else(|| {
+                // No row: say exactly what the server said rather than
+                // paraphrase a code this CLI does not know.
+                CliError::unnamed(code, detail.as_deref(), Some(*status), 1)
+            }),
+            ApiError::Deadline => CliError::from_code("client_deadline_exceeded", workspace),
+            ApiError::Transport(message) | ApiError::Shape(message) => CliError {
+                code: "reachpad_error".to_owned(),
+                message: message.clone(),
+                next_command: None,
+                retriable: false,
+                status: None,
+                exit_code: 1,
+                data: None,
+            },
+        }
+    }
+
+    /// The terminal `exec.end` of a run that carried an `error` instead of an
+    /// exit code.
+    pub fn from_exec_end(end: &Value, workspace: Option<&str>) -> CliError {
+        let code = end
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("node_gone");
+        CliError::render(code, end, None, workspace).unwrap_or_else(|| {
+            CliError::unnamed(
+                code,
+                end.get("detail").and_then(Value::as_str),
+                None,
+                EXIT_LOST_RESULT,
+            )
+        })
+    }
+
+    /// A code with no row: the server's own words, and no claim about what it
+    /// means beyond the exit code the caller decided.
+    fn unnamed(code: &str, detail: Option<&str>, status: Option<u16>, exit_code: i32) -> CliError {
+        CliError {
+            code: code.to_owned(),
+            message: match detail {
+                Some(detail) => format!("{code}: {detail}"),
+                None => format!("the fleet refused this: {code}"),
+            },
+            next_command: None,
+            retriable: false,
+            status,
+            exit_code,
+            data: None,
+        }
+    }
+
+    fn render(
+        code: &str,
+        body: &Value,
+        status: Option<u16>,
+        workspace: Option<&str>,
+    ) -> Option<CliError> {
+        let row = row(code, body)?;
+        let mut message = fill(row.sentence, body, workspace).unwrap_or_else(|| {
+            fill(row.sentence, body, Some("this workspace")).unwrap_or_default()
+        });
+        if let Some(numbers) = row.numbers.and_then(|n| fill(n, body, workspace)) {
+            message.push(' ');
+            message.push_str(&numbers);
+        }
+        Some(CliError {
+            code: code.to_owned(),
+            message,
+            next_command: row.next_command.and_then(|c| fill(c, body, workspace)),
+            retriable: match row.retriable {
+                Retriable::No => false,
+                Retriable::Yes => true,
+                Retriable::WhenCauseTransient => body
+                    .get("cause")
+                    .and_then(Value::as_str)
+                    .is_some_and(|cause| TRANSIENT_CAPACITY_CAUSES.contains(&cause)),
+            },
+            status,
+            exit_code: row.exit_code,
+            data: None,
+        })
+    }
+
+    /// `{"ok":false,…}` — the machine-readable half of the same refusal.
+    /// `data` appears only when the refused command changed something first.
+    pub fn envelope(&self, command: &str) -> Value {
+        let mut out = json!({
+            "ok": false,
+            "command": command,
+            "error": {
+                "code": self.code,
+                "message": self.message,
+                "retriable": self.retriable,
+                "next_command": self.next_command,
+                "status": self.status,
+            }
+        });
+        if let Some(data) = &self.data {
+            out["data"] = data.clone();
+        }
+        out
+    }
+}
+
+/// `{"ok":true,…}` — every command's `--json` success line.
+pub fn ok_envelope(command: &str, data: Value) -> Value {
+    json!({ "ok": true, "command": command, "data": data })
+}
+
+/// Substitute `{field}` from the refusal body, plus `{workspace}` which the
+/// client knows. `None` when any field is absent — that is what keeps a
+/// sentence from claiming a number the server did not send.
+fn fill(template: &str, body: &Value, workspace: Option<&str>) -> Option<String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let close = rest[open..].find('}')? + open;
+        let name = &rest[open + 1..close];
+        out.push_str(&field(name, body, workspace)?);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+fn field(name: &str, body: &Value, workspace: Option<&str>) -> Option<String> {
+    if name == "workspace" {
+        return workspace.map(str::to_owned);
+    }
+    // The one derived field: a wait a person can read, from the milliseconds
+    // the server sends.
+    if name == "retry_after_s" {
+        let ms = body.get("retry_after_ms")?.as_u64()?;
+        return Some(ms.div_ceil(1000).to_string());
+    }
+    match body.get(name)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every refusal in these tests has a row; a code with none is its own
+    /// test below.
+    fn render(code: &str, body: &Value, status: Option<u16>, workspace: Option<&str>) -> CliError {
+        CliError::render(code, body, status, workspace).expect("the table has a row for this code")
+    }
+
+    #[test]
+    fn every_row_is_renderable_and_carries_a_semantic_exit_code() {
+        let allowed = [
+            EXIT_OK,
+            EXIT_USAGE,
+            EXIT_CREDENTIAL,
+            EXIT_NO_SUCH_WORKSPACE,
+            EXIT_WRONG_STATE,
+            EXIT_LIMIT,
+            EXIT_UNAVAILABLE,
+            EXIT_LOST_RESULT,
+        ];
+        for row in TABLE {
+            assert!(
+                allowed.contains(&row.exit_code),
+                "{}: exit {}",
+                row.code,
+                row.exit_code
+            );
+            assert!(
+                fill(row.sentence, &Value::Null, Some("ws-1")).is_some(),
+                "{}: the sentence names a field the server may not send",
+                row.code
+            );
+            assert!(!row.sentence.contains('§'), "{}", row.code);
+            assert!(
+                !row.sentence.to_lowercase().contains("biscuit"),
+                "{}",
+                row.code
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_with_selectors_resolves_to_the_right_row() {
+        let concurrent =
+            json!({"limit": "max_concurrent", "max_concurrent": 5, "active_leases": 5});
+        let err = render("entitlement_limit", &concurrent, Some(403), Some("ws-1"));
+        assert!(
+            err.message.contains("5 of 5 are running"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.exit_code, EXIT_LIMIT);
+
+        let workspaces =
+            json!({"limit": "max_workspaces", "max_workspaces": 10, "live_workspaces": 10});
+        let err = render("entitlement_limit", &workspaces, Some(403), Some("ws-1"));
+        assert!(err.message.contains("10 of 10"), "{}", err.message);
+        assert_eq!(err.next_command.as_deref(), Some("reachpad archive <id>"));
+
+        // No `limit` field at all: the fallback row, and no invented numbers.
+        let err = render("entitlement_limit", &json!({}), Some(403), Some("ws-1"));
+        assert!(err.message.contains("account limit"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_number_the_server_did_not_send_is_not_printed() {
+        let err = render("lease_held", &json!({}), Some(409), Some("ws-1"));
+        assert_eq!(
+            err.message,
+            "ws-1 is running on another node. Pause it first: `reachpad pause ws-1`."
+        );
+        let err = render(
+            "lease_held",
+            &json!({"holder_node": "n-01"}),
+            Some(409),
+            Some("ws-1"),
+        );
+        assert!(
+            err.message.ends_with("It is held by n-01."),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn the_hardcoded_zero_balance_is_never_quoted_back() {
+        let body =
+            json!({"balance_credits": 0, "detail": "no compute credits", "remedy": "top up"});
+        let err = render("credits_exhausted", &body, Some(402), Some("ws-1"));
+        assert_eq!(
+            err.message,
+            "Out of compute credits. Top up at https://reachpad.dev/pricing."
+        );
+        assert!(!err.message.contains('0'), "{}", err.message);
+    }
+
+    #[test]
+    fn no_capacity_is_retriable_only_when_the_cause_can_change() {
+        let transient = render(
+            "no_capacity",
+            &json!({"cause": "all_full"}),
+            Some(503),
+            Some("ws-1"),
+        );
+        assert!(transient.retriable);
+        let structural = render(
+            "no_capacity",
+            &json!({"cause": "no_node_serves_this_class"}),
+            Some(503),
+            Some("ws-1"),
+        );
+        assert!(!structural.retriable);
+        // No cause at all is not a promise that retrying helps.
+        let unknown = render("no_capacity", &json!({}), Some(503), Some("ws-1"));
+        assert!(!unknown.retriable);
+    }
+
+    #[test]
+    fn a_wait_is_stated_in_seconds_from_the_servers_milliseconds() {
+        let err = render(
+            "workspace_stopping",
+            &json!({"retry_after_ms": 30000}),
+            Some(409),
+            Some("ws-1"),
+        );
+        assert!(
+            err.message.ends_with("Try again in about 30s."),
+            "{}",
+            err.message
+        );
+        assert!(err.retriable);
+    }
+
+    #[test]
+    fn both_archived_statuses_are_one_sentence_and_one_exit_code() {
+        for status in [409u16, 410] {
+            let err = render("workspace_archived", &json!({}), Some(status), Some("ws-9"));
+            assert_eq!(err.exit_code, EXIT_WRONG_STATE);
+            assert!(err.message.contains("ws-9 is archived"), "{}", err.message);
+            assert_eq!(err.status, Some(status));
+        }
+    }
+
+    #[test]
+    fn a_code_with_no_row_keeps_the_servers_own_words_and_exits_one() {
+        let err = CliError::from_api(
+            &ApiError::Api {
+                status: 500,
+                code: "something_new".to_owned(),
+                detail: Some("a fleet newer than this CLI".to_owned()),
+                body: json!({"error": "something_new"}),
+            },
+            Some("ws-1"),
+        );
+        assert_eq!(err.exit_code, 1);
+        assert!(
+            err.message.contains("a fleet newer than this CLI"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn an_exec_end_that_lost_the_result_exits_70() {
+        let err = CliError::from_exec_end(
+            &json!({"ev": "exec.end", "error": "node_gone", "exit_code": Value::Null}),
+            Some("ws-1"),
+        );
+        assert_eq!(err.exit_code, EXIT_LOST_RESULT);
+        assert!(
+            err.message.contains("may never have started"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn the_client_deadline_leaves_room_for_the_servers_own_verdict() {
+        assert_eq!(exec_deadline_ms(Some(600_000)), 600_000 + 150_000 + 30_000);
+        assert_eq!(exec_deadline_ms(None), 780_000);
+        assert!(exec_deadline_ms(Some(1_000)) > 1_000 + EXEC_STREAM_GRACE_MS);
+    }
+
+    #[test]
+    fn the_envelopes_are_the_shape_an_agent_parses() {
+        let err = render("workspace_not_found", &json!({}), Some(404), Some("ws-7"));
+        assert_eq!(
+            err.envelope("workspace.status"),
+            json!({
+                "ok": false,
+                "command": "workspace.status",
+                "error": {
+                    "code": "workspace_not_found",
+                    "message": "There is no workspace ws-7 on this account. `reachpad list` shows the ones there are.",
+                    "retriable": false,
+                    "next_command": "reachpad list",
+                    "status": 404,
+                }
+            })
+        );
+        assert_eq!(
+            ok_envelope("workspace.create", json!({"id": "ws-7"})),
+            json!({"ok": true, "command": "workspace.create", "data": {"id": "ws-7"}})
+        );
+    }
+
+    /// `pause` on a workspace that never ran says what pause means, not what
+    /// fork means: a fork child has a snapshot to fork from the moment it is
+    /// born, so "nothing to fork from" would be false as well as off-topic.
+    #[test]
+    fn nothing_to_save_is_not_nothing_to_fork_from() {
+        let err = CliError::from_code("no_active_lease", Some("ws-1"));
+        assert_eq!(err.exit_code, EXIT_WRONG_STATE);
+        assert!(!err.message.contains("fork"), "{}", err.message);
+        assert!(err.message.contains("nothing to save"), "{}", err.message);
+        assert!(err.message.contains("reachpad run ws-1"), "{}", err.message);
+        // The fork refusal is the other sentence, and still says its own
+        // thing.
+        let fork = CliError::from_code("no_sealed_snapshot", Some("ws-1"));
+        assert!(
+            fork.message.contains("nothing to fork from"),
+            "{}",
+            fork.message
+        );
+    }
+
+    #[test]
+    fn all_five_no_credential_spellings_exit_three() {
+        for code in [
+            "no_credential",
+            "no_identity_token",
+            "no_token",
+            "no_operator_token",
+            "no_authority",
+        ] {
+            let err = CliError::from_code(code, None);
+            assert_eq!(err.exit_code, EXIT_CREDENTIAL, "{code}");
+            assert_eq!(err.next_command.as_deref(), Some(SIGN_IN), "{code}");
+        }
+    }
+}

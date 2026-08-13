@@ -3,7 +3,6 @@
 
 #[tokio::main]
 async fn main() {
-    runtime::init_tracing("reachpad");
     match reach::run(std::env::args().collect()).await {
         Ok(code) => std::process::exit(code),
         Err(e) => {

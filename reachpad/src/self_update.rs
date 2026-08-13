@@ -1,10 +1,21 @@
-//! Native release updates. Homebrew owns files it installs, so its update
-//! path remains Homebrew rather than a second writer racing the cask.
+//! `reachpad update` — native release updates.
+//!
+//! ADR-0072. The rule the whole module exists for: **whoever installed the
+//! binary owns it.** Homebrew tracks the files it wrote and will fight a
+//! second writer, and a Cargo target directory is rebuilt from source, so for
+//! both this command prints the command that installer owns instead of
+//! replacing files behind its back. Only a native install — the one this CLI
+//! placed itself — updates itself, by re-running the same checksum-verifying
+//! installer that put it there.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::Context;
+use serde_json::json;
+
+use crate::commands::Ctx;
+use crate::errors::{CliError, EXIT_OK};
 
 const INSTALLER_URL: &str = "https://reachpad.dev/install";
 
@@ -15,6 +26,20 @@ pub enum InstallSource {
     Native,
 }
 
+impl InstallSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            InstallSource::Homebrew => "homebrew",
+            InstallSource::Development => "development",
+            InstallSource::Native => "native",
+        }
+    }
+}
+
+/// Which installer owns this file, decided from the path alone — no network,
+/// no package database. Homebrew's two prefixes (`Caskroom`, `Cellar`) and a
+/// cargo `target/{debug,release}` are the shapes that must never be
+/// self-modified.
 pub fn install_source(executable: &Path) -> InstallSource {
     let components: Vec<_> = executable
         .components()
@@ -35,41 +60,77 @@ pub fn install_source(executable: &Path) -> InstallSource {
     InstallSource::Native
 }
 
-pub fn run() -> anyhow::Result<i32> {
-    let executable = std::env::current_exe().context("locating the running reachpad binary")?;
-    match install_source(&executable) {
-        InstallSource::Homebrew => {
-            println!("Reachpad is installed by Homebrew.");
-            println!("Run: brew upgrade --cask reachpad");
-            return Ok(0);
-        }
-        InstallSource::Development => {
-            println!("Reachpad is running from a Cargo target directory.");
-            println!("Rebuild this checkout with: cargo build -p reach");
-            return Ok(0);
-        }
-        InstallSource::Native => {}
+pub(crate) fn run(ctx: &Ctx) -> Result<i32, CliError> {
+    let executable = std::env::current_exe()
+        .context("locating the running reachpad binary")
+        .map_err(CliError::from)?;
+    let source = install_source(&executable);
+    if let Some(command) = deferred_to(source) {
+        ctx.emit(
+            json!({
+                "installed_by": source.as_str(),
+                "updated": false,
+                "run": command,
+            }),
+            &[
+                format!("This copy of reachpad was installed by {}.", owner(source)),
+                format!("  Update it with: {command}"),
+            ],
+        );
+        return Ok(EXIT_OK);
     }
 
     let install_dir = executable
         .parent()
-        .context("the running reachpad binary has no parent directory")?;
-    anyhow::ensure!(
-        executable.file_name().and_then(|name| name.to_str()) == Some("reachpad"),
-        "refusing to update a binary not named reachpad at {}",
-        executable.display()
-    );
+        .context("the running reachpad binary has no parent directory")
+        .map_err(CliError::from)?;
+    // The installer writes `reachpad` into this directory. If the running file
+    // is named something else, the update would leave the caller running a
+    // binary the update did not touch, and say it succeeded.
+    if executable.file_name().and_then(|name| name.to_str()) != Some("reachpad") {
+        return Err(CliError::usage(format!(
+            "refusing to update {}: it is not named reachpad, so the installer \
+             would write a different file than the one running.",
+            executable.display()
+        )));
+    }
 
-    let scratch = create_scratch_dir()?;
+    let scratch = create_scratch_dir().map_err(CliError::from)?;
     let installer = scratch.join("install.sh");
     let result = run_native_update(&installer, install_dir);
     let _ = std::fs::remove_file(&installer);
     let _ = std::fs::remove_dir(&scratch);
-    result?;
+    result.map_err(CliError::from)?;
 
-    println!("Reachpad update completed in {}.", install_dir.display());
-    println!("Run `reachpad --version` to confirm the installed version.");
-    Ok(0)
+    ctx.emit(
+        json!({
+            "installed_by": source.as_str(),
+            "updated": true,
+            "install_dir": install_dir.display().to_string(),
+        }),
+        &[
+            format!("Updated reachpad in {}.", install_dir.display()),
+            "  `reachpad --version` says which version is installed now.".to_owned(),
+        ],
+    );
+    Ok(EXIT_OK)
+}
+
+/// The command that owns updates for an installation this one must not touch.
+fn deferred_to(source: InstallSource) -> Option<&'static str> {
+    match source {
+        InstallSource::Homebrew => Some("brew upgrade --cask reachpad"),
+        InstallSource::Development => Some("cargo build -p reach"),
+        InstallSource::Native => None,
+    }
+}
+
+fn owner(source: InstallSource) -> &'static str {
+    match source {
+        InstallSource::Homebrew => "Homebrew",
+        InstallSource::Development => "cargo, in a target directory",
+        InstallSource::Native => "the Reachpad installer",
+    }
 }
 
 fn create_scratch_dir() -> anyhow::Result<PathBuf> {
@@ -147,5 +208,20 @@ mod tests {
             install_source(Path::new("/home/user/.local/bin/reachpad")),
             InstallSource::Native
         );
+    }
+
+    /// The two sources this command must not write to are exactly the two
+    /// that name someone else's command; a native install names none.
+    #[test]
+    fn only_a_native_install_updates_itself() {
+        assert_eq!(
+            deferred_to(InstallSource::Homebrew),
+            Some("brew upgrade --cask reachpad")
+        );
+        assert_eq!(
+            deferred_to(InstallSource::Development),
+            Some("cargo build -p reach")
+        );
+        assert_eq!(deferred_to(InstallSource::Native), None);
     }
 }

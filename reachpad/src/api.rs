@@ -21,16 +21,53 @@ pub struct ExecSpec<'a> {
     pub stdin_b64: Option<String>,
 }
 
-/// How an exec proves it may run: the caller's own capability, or an API key
-/// that mints one server-side (ADR-0059 §4).
+/// What an exec stream hands back as it runs.
+///
+/// One callback rather than two, because the caller's decision — bytes to the
+/// terminal or a JSON line — is the same decision for both, and a second
+/// closure is a second place to forget one of them.
+#[derive(Debug)]
+pub enum ExecItem<'a> {
+    /// Output as it arrives. `fd` is 1 or 2, never merged.
+    Out { fd: u8, bytes: &'a [u8] },
+    /// The workspace was paused and this command woke it, so the delay is a
+    /// resume rather than a hang.
+    Waiting { reason: &'a str },
+}
+
+/// How a call on ONE workspace proves it may act: the caller's own capability
+/// for that workspace, or an API key that mints one server-side (ADR-0059 §4,
+/// extended to the workspace-scoped reads and writes by ADR-0069).
 ///
 /// An enum rather than two optional strings so "neither" and "both" are
 /// unrepresentable — the first is a request the server must refuse and the
 /// second is a question about precedence nobody should have to answer.
+///
+/// The two carriers differ on the wire: a Biscuit goes in the request body
+/// (or, on a GET, the bearer header), a key always goes on the bearer header.
 #[derive(Clone, Copy, Debug)]
-pub enum ExecAuth<'a> {
+pub enum Auth<'a> {
     Biscuit(&'a str),
     ApiKey(&'a str),
+}
+
+impl<'a> Auth<'a> {
+    /// The bearer header this carrier uses on a GET, where there is no body
+    /// to put a Biscuit in.
+    fn bearer(self) -> &'a str {
+        match self {
+            Auth::Biscuit(b) | Auth::ApiKey(b) => b,
+        }
+    }
+
+    /// `(bearer, body-biscuit)` for a POST: a key authenticates by header, a
+    /// Biscuit by the route's own `biscuit` field.
+    fn split(self) -> (Option<&'a str>, Option<&'a str>) {
+        match self {
+            Auth::ApiKey(k) => (Some(k), None),
+            Auth::Biscuit(b) => (None, Some(b)),
+        }
+    }
 }
 
 /// API failure: transport trouble, a non-2xx status (with controld's error
@@ -51,9 +88,44 @@ pub enum ApiError {
         status: u16,
         code: String,
         detail: Option<String>,
+        /// The whole refusal body. The sentence a user reads interpolates the
+        /// server's own numbers out of it, and hardcoding any of them client
+        /// side would break I13.
+        body: Value,
     },
     #[error("unexpected response shape: {0}")]
     Shape(String),
+    /// The client stopped waiting before the server answered.
+    #[error("reachpad stopped waiting before the fleet answered")]
+    Deadline,
+}
+
+/// Turn a non-2xx answer into the refusal the error table renders.
+///
+/// A body with no `error` field is not controld's shape at all: the axum
+/// extractors refuse a malformed request before any handler runs, and that is
+/// the one refusal with no code in it.
+fn refusal(resp: http_min::Response) -> ApiError {
+    let code = resp
+        .body
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| match resp.status {
+            400 | 415 | 422 => "request_not_understood".to_owned(),
+            _ => "unknown".to_owned(),
+        });
+    let detail = resp
+        .body
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    ApiError::Api {
+        status: resp.status,
+        code,
+        detail,
+        body: resp.body,
+    }
 }
 
 /// Result of a workspace creation (§8 flow 2): the new id plus the creator's
@@ -76,20 +148,118 @@ pub struct Attach {
 
 /// What an operator credential exchanges for (ADR-0034): the short-lived
 /// user-scoped identity token, and who it says you are.
+///
+/// `token_id` / `token_expires_at_ms` describe the CREDENTIAL ROW that was
+/// presented — the 30-90 day one on disk — not the hour-long identity token
+/// in `expires_at_ms`. A fleet that predates ADR-0069 sends neither.
 #[derive(Debug, Clone)]
 pub struct OperatorSession {
     pub user_id: String,
     pub principal_id: String,
     pub identity_token: String,
     pub expires_at_ms: u64,
+    pub token_id: Option<String>,
+    pub token_expires_at_ms: Option<u64>,
+    pub scopes: Vec<String>,
 }
 
-/// One row of `reach ws list`.
+/// One credential row of `GET /v1/operator/tokens`.
+///
+/// `scopes` is the field that tells a laptop credential apart from the
+/// account's scoped doors (`identity`, `provision`): an EMPTY scope list is a
+/// credential a person signs in with, and a non-empty one belongs to a
+/// service — `auth logout --all` revokes the first kind only.
+#[derive(Debug, Clone)]
+pub struct OperatorTokenRow {
+    pub id: String,
+    pub label: String,
+    pub expires_at_ms: u64,
+    pub usable: bool,
+    pub scopes: Vec<String>,
+}
+
+/// The entitlement values a listing or a status carries, so a manager plans
+/// against its caps instead of discovering them by a refusal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub max_workspaces: Option<u64>,
+    pub max_concurrent: Option<u64>,
+    /// Running + sealing: everything holding a concurrency slot.
+    pub live_workspaces: u64,
+}
+
+/// One row of `reachpad list`. `state` and `head` are absent against a fleet
+/// that predates ADR-0069.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub id: String,
     pub name: String,
     pub forks: usize,
+    pub state: Option<String>,
+    pub head: Option<Head>,
+    pub parent: Option<Parent>,
+    pub created_at_ms: u64,
+    pub archived_at_ms: Option<u64>,
+}
+
+/// The save a workspace resumes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Head {
+    pub snapshot: String,
+    pub kind: String,
+    pub sealed_at_ms: Option<u64>,
+}
+
+/// The workspace and save a fork was rooted at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parent {
+    pub workspace: String,
+    pub snapshot: Option<String>,
+}
+
+/// The result of `GET /v1/workspaces` — rows plus the account's limits.
+#[derive(Debug, Clone)]
+pub struct Listing {
+    pub workspaces: Vec<Workspace>,
+    /// `None` against a fleet that predates ADR-0069.
+    pub limits: Option<Limits>,
+}
+
+/// The live lease on a workspace. `fencing_token` arrives only for a caller
+/// the server also authorizes to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    pub node: String,
+    pub expires_at_ms: u64,
+    pub heartbeat_at_ms: u64,
+    pub fencing_token: Option<u64>,
+}
+
+/// `GET /v1/workspaces/:id` (S2): everything derivable about one workspace,
+/// read without taking a lease or waking anything.
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub lease: Option<Lease>,
+    pub head: Option<Head>,
+    pub parent: Option<Parent>,
+    pub snapshots: u64,
+    pub forks: u64,
+    pub idle_pause_seconds: u64,
+    pub limits: Limits,
+    pub created_at_ms: u64,
+    pub archived_at_ms: Option<u64>,
+}
+
+/// What a release did: `released` ended the lease now (a discard), `sealing`
+/// means the node was told to save first and the lease ends when it stops
+/// renewing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Released {
+    pub released: bool,
+    pub sealing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +267,15 @@ pub struct CreditBalance {
     pub balance_millicredits: u64,
     pub unit: String,
     pub updated_at_ms: u64,
+}
+
+/// Percent-encode one PATH segment. Same alphabet as [`encode_query`], which
+/// is what makes it segment-safe: `/` is escaped too, so an id that arrived
+/// from a file, an environment variable or an agent's output cannot add a
+/// path element — nor a CRLF and a second request line — to the request this
+/// client is building.
+fn encode_segment(value: &str) -> String {
+    encode_query(value)
 }
 
 /// Percent-encode everything that is not unreserved, so a user id can never
@@ -237,21 +416,7 @@ impl Client {
         if (200..300).contains(&resp.status) {
             Ok(resp.body)
         } else {
-            let code = resp
-                .body
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned();
-            Err(ApiError::Api {
-                status: resp.status,
-                code,
-                detail: resp
-                    .body
-                    .get("detail")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            })
+            Err(refusal(resp))
         }
     }
 
@@ -301,7 +466,58 @@ impl Client {
             principal_id: str_at(&body, &["principal_id"])?,
             identity_token: str_at(&body, &["identity_token"])?,
             expires_at_ms: u64_at(&body, &["expires_at_ms"])?,
+            token_id: body["token_id"].as_str().map(str::to_owned),
+            token_expires_at_ms: body["token_expires_at_ms"].as_u64(),
+            scopes: string_array(&body["scopes"]),
         })
+    }
+
+    /// GET /v1/operator/tokens → every credential row on this account, which
+    /// is what `auth logout --all` revokes.
+    pub async fn operator_tokens(
+        &self,
+        operator_token: &str,
+    ) -> Result<Vec<OperatorTokenRow>, ApiError> {
+        let resp = http_min::get_json_trust(
+            &self.controld,
+            "/v1/operator/tokens",
+            Some(operator_token),
+            &self.trust,
+        )
+        .await
+        .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
+        if !(200..300).contains(&resp.status) {
+            return Err(refusal(resp));
+        }
+        Ok(at(&resp.body, &["operator_tokens"])?
+            .as_array()
+            .ok_or_else(|| ApiError::Shape("operator_tokens is not an array".to_owned()))?
+            .iter()
+            .map(|t| OperatorTokenRow {
+                id: t["id"].as_str().unwrap_or_default().to_owned(),
+                label: t["label"].as_str().unwrap_or_default().to_owned(),
+                expires_at_ms: t["expires_at_ms"].as_u64().unwrap_or(0),
+                usable: t["usable"].as_bool().unwrap_or(false),
+                scopes: string_array(&t["scopes"]),
+            })
+            .collect())
+    }
+
+    /// POST /v1/operator/tokens/:id/revoke, authenticated by a live
+    /// credential of the same user — which is why `logout` revokes its own
+    /// row LAST.
+    pub async fn revoke_operator_token(
+        &self,
+        operator_token: &str,
+        id: &str,
+    ) -> Result<(), ApiError> {
+        self.post_auth(
+            &format!("/v1/operator/tokens/{}/revoke", encode_segment(id)),
+            json!({}),
+            Some(operator_token),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn credit_balance(
@@ -326,6 +542,10 @@ impl Client {
     ///
     /// The returned Biscuit is what every later call for this workspace
     /// presents; there is no way to name a principal instead (I6).
+    ///
+    /// `name` is ALWAYS sent, empty string included: a fleet that predates
+    /// the optional-name change refuses a body without the field, so omitting
+    /// it would make an unnamed `create` depend on deployment order.
     pub async fn create_workspace(
         &self,
         user_id: &str,
@@ -358,33 +578,20 @@ impl Client {
         &self,
         user_id: &str,
         identity_token: &str,
-    ) -> Result<Vec<Workspace>, ApiError> {
+    ) -> Result<Listing, ApiError> {
         let path = format!("/v1/workspaces?user_id={}", encode_query(user_id));
         let resp =
             http_min::get_json_trust(&self.controld, &path, Some(identity_token), &self.trust)
                 .await
                 .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
         if !(200..300).contains(&resp.status) {
-            let code = resp
-                .body
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned();
-            return Err(ApiError::Api {
-                status: resp.status,
-                code,
-                detail: resp
-                    .body
-                    .get("detail")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            });
+            return Err(refusal(resp));
         }
         let rows = at(&resp.body, &["workspaces"])?
             .as_array()
             .ok_or_else(|| ApiError::Shape("workspaces is not an array".to_owned()))?;
-        rows.iter()
+        let workspaces = rows
+            .iter()
             .map(|row| {
                 Ok(Workspace {
                     id: str_at(row, &["id"])?,
@@ -394,16 +601,85 @@ impl Client {
                         .and_then(Value::as_array)
                         .map(Vec::len)
                         .unwrap_or(0),
+                    state: row["state"].as_str().map(str::to_owned),
+                    head: row["head"]["snapshot"].as_str().map(|s| Head {
+                        snapshot: s.to_owned(),
+                        kind: row["head"]["kind"].as_str().unwrap_or_default().to_owned(),
+                        sealed_at_ms: None,
+                    }),
+                    parent: parent_of(&row["origin"]),
+                    created_at_ms: row["created_at_ms"].as_u64().unwrap_or(0),
+                    archived_at_ms: row["archived_at_ms"].as_u64(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(Listing {
+            workspaces,
+            limits: limits_of(&resp.body["limits"]),
+        })
+    }
+
+    /// GET /v1/workspaces/:id (S2) — the read every other verb is decided
+    /// from. Never takes a lease, never wakes anything, never spends a credit.
+    ///
+    /// Against a fleet that predates this route the answer is a bare 404;
+    /// [`is_route_absent`] tells that apart from "no such workspace", which
+    /// carries controld's own `workspace_not_found`.
+    pub async fn workspace_status(
+        &self,
+        workspace: &str,
+        auth: Auth<'_>,
+    ) -> Result<Status, ApiError> {
+        let path = format!("/v1/workspaces/{}", encode_segment(workspace));
+        let resp =
+            http_min::get_json_trust(&self.controld, &path, Some(auth.bearer()), &self.trust)
+                .await
+                .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
+        if !(200..300).contains(&resp.status) {
+            return Err(refusal(resp));
+        }
+        let body = resp.body;
+        let ws = &body["workspace"];
+        Ok(Status {
+            id: str_at(ws, &["id"])?,
+            name: ws["name"].as_str().unwrap_or_default().to_owned(),
+            state: str_at(&body, &["state"])?,
+            lease: body["lease"].as_object().map(|l| Lease {
+                node: l
+                    .get("node")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                expires_at_ms: l.get("expires_at_ms").and_then(Value::as_u64).unwrap_or(0),
+                heartbeat_at_ms: l
+                    .get("heartbeat_at_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                fencing_token: l.get("fencing_token").and_then(Value::as_u64),
+            }),
+            head: body["head_snapshot"]["id"].as_str().map(|id| Head {
+                snapshot: id.to_owned(),
+                kind: body["head_snapshot"]["kind"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                sealed_at_ms: body["head_snapshot"]["sealed_at_ms"].as_u64(),
+            }),
+            parent: parent_of(&ws["origin"]),
+            snapshots: body["snapshots"].as_u64().unwrap_or(0),
+            forks: body["forks"].as_u64().unwrap_or(0),
+            idle_pause_seconds: body["idle_pause_seconds"].as_u64().unwrap_or(0),
+            limits: limits_of(&body["limits"]).unwrap_or_default(),
+            created_at_ms: ws["created_at_ms"].as_u64().unwrap_or(0),
+            archived_at_ms: ws["archived_at_ms"].as_u64(),
+        })
     }
 
     /// POST /v1/workspaces/:id/attach → node, fencing token, Biscuit.
     pub async fn attach(&self, workspace: &str, biscuit_b64: &str) -> Result<Attach, ApiError> {
         let body = self
             .post(
-                &format!("/v1/workspaces/{workspace}/attach"),
+                &format!("/v1/workspaces/{}/attach", encode_segment(workspace)),
                 json!({ "biscuit": biscuit_b64 }),
             )
             .await?;
@@ -424,28 +700,33 @@ impl Client {
     pub async fn release(
         &self,
         workspace: &str,
-        biscuit_b64: &str,
+        auth: Auth<'_>,
         fencing_token: u64,
         discard: bool,
-    ) -> Result<bool, ApiError> {
+    ) -> Result<Released, ApiError> {
+        let (bearer, biscuit) = auth.split();
         let body = self
-            .post(
-                &format!("/v1/workspaces/{workspace}/release"),
+            .post_auth(
+                &format!("/v1/workspaces/{}/release", encode_segment(workspace)),
                 json!({
                     "fencing_token": fencing_token,
-                    "biscuit": biscuit_b64,
+                    "biscuit": biscuit.unwrap_or_default(),
                     "discard": discard,
                 }),
+                bearer,
             )
             .await?;
-        Ok(body["released"].as_bool().unwrap_or(false))
+        Ok(Released {
+            released: body["released"].as_bool().unwrap_or(false),
+            sealing: body["sealing"].as_bool().unwrap_or(false),
+        })
     }
 
     /// POST /v1/workspaces/:id/exec — run one command (ADR-0059).
     ///
-    /// Streams: `on_out` is called with `(fd, bytes)` for each output chunk as
-    /// it arrives, never after the fact. The return value is the terminating
-    /// `exec.end` object.
+    /// Streams: `on_item` is called for each output chunk as it arrives,
+    /// never after the fact. The return value is the terminating `exec.end`
+    /// object.
     ///
     /// **A stream that ends without `exec.end` is a FAILURE**, and this
     /// function turns that into an `Err` rather than a zero exit — §6's rule,
@@ -454,12 +735,12 @@ impl Client {
     pub async fn exec<F>(
         &self,
         workspace: &str,
-        auth: ExecAuth<'_>,
+        auth: Auth<'_>,
         spec: &ExecSpec<'_>,
-        mut on_out: F,
+        mut on_item: F,
     ) -> Result<Value, ApiError>
     where
-        F: FnMut(u8, &[u8]),
+        F: FnMut(ExecItem<'_>),
     {
         let mut body = json!({ "argv": spec.argv, "env": spec.env });
         if let Some(cwd) = spec.cwd {
@@ -471,18 +752,16 @@ impl Client {
         if let Some(stdin) = &spec.stdin_b64 {
             body["stdin_b64"] = json!(stdin);
         }
-        let bearer = match auth {
-            ExecAuth::ApiKey(k) => Some(k),
-            ExecAuth::Biscuit(b) => {
-                body["biscuit"] = json!(b);
-                None
-            }
-        };
+        let (bearer, biscuit) = auth.split();
+        if let Some(b) = biscuit {
+            body["biscuit"] = json!(b);
+        }
         let mut end: Option<Value> = None;
-        let mut refusal: Option<Value> = None;
-        let status = http_min::post_ndjson_stream(
+        let mut streamed_refusal: Option<Value> = None;
+        let path = format!("/v1/workspaces/{}/exec", encode_segment(workspace));
+        let stream = http_min::post_ndjson_stream(
             &self.controld,
-            &format!("/v1/workspaces/{workspace}/exec"),
+            &path,
             &body,
             bearer,
             &self.trust,
@@ -497,43 +776,55 @@ impl Client {
                         if let Some(b64) = v.get("data_b64").and_then(Value::as_str) {
                             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64)
                             {
-                                on_out(fd, &bytes);
+                                on_item(ExecItem::Out { fd, bytes: &bytes });
                             }
                         }
                     }
                     Some("exec.waiting") => {
-                        // The workspace was paused and this exec woke it. Said
-                        // out loud so a caller knows the delay is a RESUME and
-                        // not a hang.
-                        eprintln!("reachpad: workspace is resuming…");
+                        let reason = v
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("resuming");
+                        on_item(ExecItem::Waiting { reason });
                     }
                     Some("exec.end") => end = Some(v),
                     // A non-streamed refusal (the request never became a
                     // stream): keep it so the error names what happened.
                     _ => {
                         if v.get("error").is_some() {
-                            refusal = Some(v);
+                            streamed_refusal = Some(v);
                         }
                     }
                 }
                 true
             },
-        )
-        .await
-        .map_err(|e| ApiError::Transport(e.to_string()))?;
+        );
+        // Strictly longer than controld's own bound on this stream, so the
+        // verdict the caller reports is the server's `exec.end` rather than a
+        // local timeout that says nothing about whether the command ran
+        // (trap 31).
+        let deadline =
+            std::time::Duration::from_millis(crate::errors::exec_deadline_ms(spec.timeout_ms));
+        let status = tokio::time::timeout(deadline, stream)
+            .await
+            .map_err(|_| ApiError::Deadline)?
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
 
         if let Some(end) = end {
             return Ok(end);
         }
-        if let Some(r) = refusal {
+        if let Some(r) = streamed_refusal {
+            let code = r
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("exec_refused")
+                .to_owned();
+            let detail = r.get("detail").and_then(Value::as_str).map(str::to_owned);
             return Err(ApiError::Api {
                 status,
-                code: r
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("exec_refused")
-                    .to_owned(),
-                detail: r.get("detail").and_then(Value::as_str).map(str::to_owned),
+                code,
+                detail,
+                body: r,
             });
         }
         Err(ApiError::Transport(format!(
@@ -550,30 +841,15 @@ impl Client {
     pub async fn head_snapshot(
         &self,
         workspace: &str,
-        biscuit_b64: &str,
+        auth: Auth<'_>,
     ) -> Result<Option<(String, Option<String>)>, ApiError> {
-        let path = format!(
-            "/v1/workspaces/{workspace}/lineage?biscuit={}",
-            encode_query(biscuit_b64)
-        );
-        let resp = http_min::get_json_trust(&self.controld, &path, None, &self.trust)
-            .await
-            .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
+        let path = format!("/v1/workspaces/{}/lineage", encode_segment(workspace));
+        let resp =
+            http_min::get_json_trust(&self.controld, &path, Some(auth.bearer()), &self.trust)
+                .await
+                .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
         if !(200..300).contains(&resp.status) {
-            return Err(ApiError::Api {
-                status: resp.status,
-                code: resp
-                    .body
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_owned(),
-                detail: resp
-                    .body
-                    .get("detail")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            });
+            return Err(refusal(resp));
         }
         let head = &resp.body["head_snapshot"];
         Ok(head["kind"]
@@ -599,7 +875,10 @@ impl Client {
             req["name"] = json!(n);
         }
         let body = self
-            .post(&format!("/v1/workspaces/{workspace}/fork"), req)
+            .post(
+                &format!("/v1/workspaces/{}/fork", encode_segment(workspace)),
+                req,
+            )
             .await?;
         Ok(Forked {
             workspace: str_at(&body, &["workspace", "id"])?,
@@ -626,7 +905,10 @@ impl Client {
             req["preserved_name"] = json!(n);
         }
         let body = self
-            .post(&format!("/v1/workspaces/{workspace}/rewind"), req)
+            .post(
+                &format!("/v1/workspaces/{}/rewind", encode_segment(workspace)),
+                req,
+            )
             .await?;
         Ok(Rewound {
             head_snapshot: str_at(&body, &["head_snapshot", "id"])?,
@@ -639,29 +921,18 @@ impl Client {
     /// GET /v1/workspaces/:id/lineage → every sealed snapshot (oldest first)
     /// and the head this workspace resumes from. This is what makes `rewind`
     /// drivable: a caller picks a snapshot id off this list.
-    pub async fn lineage(&self, workspace: &str, biscuit_b64: &str) -> Result<Lineage, ApiError> {
-        let path = format!(
-            "/v1/workspaces/{workspace}/lineage?biscuit={}",
-            encode_query(biscuit_b64)
-        );
-        let resp = http_min::get_json_trust(&self.controld, &path, None, &self.trust)
-            .await
-            .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
+    ///
+    /// The token travels as `Authorization: Bearer`, not in the query: hub
+    /// logs the request line of every non-success it proxies, and a credential
+    /// in a URL is a credential in a log file.
+    pub async fn lineage(&self, workspace: &str, auth: Auth<'_>) -> Result<Lineage, ApiError> {
+        let path = format!("/v1/workspaces/{}/lineage", encode_segment(workspace));
+        let resp =
+            http_min::get_json_trust(&self.controld, &path, Some(auth.bearer()), &self.trust)
+                .await
+                .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
         if !(200..300).contains(&resp.status) {
-            return Err(ApiError::Api {
-                status: resp.status,
-                code: resp
-                    .body
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_owned(),
-                detail: resp
-                    .body
-                    .get("detail")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            });
+            return Err(refusal(resp));
         }
         let snapshot_row = |v: &Value| SnapshotRow {
             id: v["id"].as_str().unwrap_or_default().to_owned(),
@@ -737,20 +1008,7 @@ impl Client {
         .await
         .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
         if !(200..300).contains(&resp.status) {
-            return Err(ApiError::Api {
-                status: resp.status,
-                code: resp
-                    .body
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_owned(),
-                detail: resp
-                    .body
-                    .get("detail")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            });
+            return Err(refusal(resp));
         }
         let body = resp.body;
         let rows = at(&body, &["api_keys"])?
@@ -782,7 +1040,7 @@ impl Client {
     /// key" are the same `404 unknown_api_key` by design.
     pub async fn revoke_api_key(&self, operator_token: &str, key_id: &str) -> Result<(), ApiError> {
         self.post(
-            &format!("/v1/api-keys/{key_id}/revoke"),
+            &format!("/v1/api-keys/{}/revoke", encode_segment(key_id)),
             json!({ "operator_token": operator_token }),
         )
         .await
@@ -804,7 +1062,7 @@ impl Client {
     ) -> Result<(String, u64), ApiError> {
         let body = self
             .post(
-                &format!("/v1/workspaces/{workspace}/token"),
+                &format!("/v1/workspaces/{}/token", encode_segment(workspace)),
                 json!({ "user_id": user_id, "identity_token": identity_token }),
             )
             .await?;
@@ -814,15 +1072,18 @@ impl Client {
         ))
     }
 
-    /// POST /v1/workspaces/:id/archive. Owner-only. The workspace stops
-    /// counting against `max_workspaces` and nothing is deleted immediately;
-    /// archived state follows ADR-0070's managed-retention boundary. Returns
-    /// when it was archived.
-    pub async fn archive(&self, workspace: &str, biscuit_b64: &str) -> Result<u64, ApiError> {
+    /// POST /v1/workspaces/:id/archive. Owner-only, and it deletes nothing
+    /// immediately: the chain and the log stay, the workspace stops counting
+    /// against `max_workspaces` (I13). Archived state follows ADR-0070's
+    /// managed-retention boundary rather than a permanent-backup promise.
+    /// Returns when it was archived.
+    pub async fn archive(&self, workspace: &str, auth: Auth<'_>) -> Result<u64, ApiError> {
+        let (bearer, biscuit) = auth.split();
         let body = self
-            .post(
-                &format!("/v1/workspaces/{workspace}/archive"),
-                json!({ "biscuit": biscuit_b64 }),
+            .post_auth(
+                &format!("/v1/workspaces/{}/archive", encode_segment(workspace)),
+                json!({ "biscuit": biscuit.unwrap_or_default() }),
+                bearer,
             )
             .await?;
         Ok(u64_at(&body, &["archived_at_ms"]).unwrap_or(0))
@@ -856,6 +1117,52 @@ impl Client {
             share_token_b64: str_at(&body, &["share_token"])?,
         })
     }
+}
+
+/// Did this refusal mean "this fleet has no such ROUTE" rather than "no such
+/// workspace"?
+///
+/// controld answers an unknown workspace with its own `workspace_not_found`
+/// (the 404-collapse), and hub answers an unproxied path with `not_found`; a
+/// 404 with no code at all is an axum router that never heard of the path.
+/// Telling them apart is what lets `status` fall back on an older fleet
+/// instead of claiming the workspace is gone.
+#[must_use]
+pub fn is_route_absent(err: &ApiError) -> bool {
+    matches!(
+        err,
+        ApiError::Api { status: 404, code, .. } if code == "unknown" || code == "not_found"
+    )
+}
+
+fn limits_of(value: &Value) -> Option<Limits> {
+    value.as_object().map(|l| Limits {
+        max_workspaces: l.get("max_workspaces").and_then(Value::as_u64),
+        max_concurrent: l.get("max_concurrent").and_then(Value::as_u64),
+        live_workspaces: l
+            .get("live_workspaces")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+fn parent_of(origin: &Value) -> Option<Parent> {
+    Some(Parent {
+        workspace: origin["workspace_id"].as_str()?.to_owned(),
+        snapshot: origin["snapshot_id"].as_str().map(str::to_owned),
+    })
+}
+
+fn string_array(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn at<'v>(body: &'v Value, path: &[&str]) -> Result<&'v Value, ApiError> {
@@ -894,6 +1201,23 @@ mod tests {
             "x%20HTTP%2F1.1%0D%0AX%3A%20y"
         );
         assert_eq!(encode_query("a&b=c"), "a%26b%3Dc");
+    }
+
+    /// The same property for the PATH: a workspace id that came from a file,
+    /// an environment variable or an agent's output cannot add a path element
+    /// or a second request line to the request this client builds.
+    #[test]
+    fn a_workspace_id_cannot_reshape_the_request_line_either() {
+        assert_eq!(encode_segment("ws-402"), "ws-402");
+        assert_eq!(
+            encode_segment("ws-1 HTTP/1.1\r\nX: y"),
+            "ws-1%20HTTP%2F1.1%0D%0AX%3A%20y"
+        );
+        assert_eq!(
+            encode_segment("../../admin/v1/nodes"),
+            "..%2F..%2Fadmin%2Fv1%2Fnodes"
+        );
+        assert_eq!(encode_segment("ws-1?biscuit=x"), "ws-1%3Fbiscuit%3Dx");
     }
 
     #[test]

@@ -107,6 +107,52 @@ pub fn validate_connection_urls(controld_url: &str, hub_url: &str) -> anyhow::Re
     validate_hub_url(hub_url)
 }
 
+/// The host a hub URL dials, for the one comparison below. `ws://` and
+/// `wss://` are handed to tungstenite verbatim, so their host is read the same
+/// way `http_min` reads one.
+fn hub_host(url: &str) -> anyhow::Result<String> {
+    match HubUrl::parse(url)? {
+        HubUrl::Quic { host, .. } => Ok(host),
+        HubUrl::Ws(_) => {
+            let as_http = url
+                .replacen("wss://", "https://", 1)
+                .replacen("ws://", "http://", 1);
+            Ok(http_min::parse_url(&as_http)?.host)
+        }
+    }
+}
+
+/// Collapse the exchange's plane pair into the one string the v1 CLI keeps
+/// (`[endpoint]` in config.toml): ADR-0040 is one host, one port, both planes,
+/// and `Cli::planes` derives control and hub from it.
+///
+/// The pair is not simply trusted. Both planes must name the SAME host; a
+/// deployment that split them is one this CLI's `--endpoint` cannot describe,
+/// and silently keeping only the control host would leave the hub pointing
+/// somewhere the server did not say. That refusal names the override flags.
+pub fn endpoint_from_login(controld_url: &str, hub_url: &str) -> anyhow::Result<String> {
+    validate_connection_urls(controld_url, hub_url)?;
+    let control = http_min::parse_url(controld_url)?;
+    anyhow::ensure!(
+        control.base_path.is_empty(),
+        "sign-in returned a control-plane URL with a path prefix, which `--endpoint` cannot carry"
+    );
+    let hub = hub_host(hub_url)?;
+    anyhow::ensure!(
+        hub.eq_ignore_ascii_case(&control.host),
+        "sign-in put the control plane on {} and the hub on {hub}; this CLI describes one host \
+         for both. Use --controld and --hub explicitly.",
+        control.host
+    );
+    Ok(match control.scheme {
+        // Loopback development: keep the scheme and port, which is exactly
+        // what `Cli::planes` expects to see for a plaintext endpoint.
+        http_min::Scheme::Plaintext => format!("http://{}", control.authority()),
+        http_min::Scheme::Tls if control.port == 443 => control.host,
+        http_min::Scheme::Tls => control.authority(),
+    })
+}
+
 fn validate_operator_token(value: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         value.len() <= MAX_TOKEN_LEN,
@@ -363,6 +409,28 @@ mod tests {
         assert!(validate_account_url("https://reachpad.dev.example.com").is_err());
         assert!(validate_account_url("https://reachpad.dev:444").is_err());
         assert!(validate_account_url("https://reachpad.dev/prefix").is_err());
+    }
+
+    #[test]
+    fn the_exchanged_pair_collapses_to_one_endpoint_or_is_refused() {
+        assert_eq!(
+            endpoint_from_login("https://m1.reachpad.dev", "quic://m1.reachpad.dev").unwrap(),
+            "m1.reachpad.dev"
+        );
+        assert_eq!(
+            endpoint_from_login("https://m1.reachpad.dev", "wss://m1.reachpad.dev/ws").unwrap(),
+            "m1.reachpad.dev"
+        );
+        assert_eq!(
+            endpoint_from_login("http://127.0.0.1:7401", "ws://127.0.0.1:7420/ws").unwrap(),
+            "http://127.0.0.1:7401"
+        );
+        // Two hosts is a fleet shape one `--endpoint` cannot describe, so it
+        // is refused rather than half-kept.
+        assert!(endpoint_from_login("https://m1.reachpad.dev", "quic://m2.reachpad.dev").is_err());
+        // And the pair is still validated on this path.
+        assert!(endpoint_from_login("http://m1.reachpad.dev", "quic://m1.reachpad.dev").is_err());
+        assert!(endpoint_from_login("https://m1.reachpad.dev", "ws://m1.reachpad.dev/ws").is_err());
     }
 
     #[test]

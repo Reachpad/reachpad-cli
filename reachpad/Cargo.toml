@@ -19,7 +19,6 @@ path = "src/main.rs"
 hw = []
 
 [dependencies]
-runtime.workspace = true
 proto.workspace = true
 authz.workspace = true
 anyhow.workspace = true

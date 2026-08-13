@@ -9,11 +9,10 @@
 //! drives create → attach → share → tail → refused-mutation entirely
 //! through the public surfaces.
 //!
-//! §15: the CLI is a *client* — it holds ZERO platform secrets. Its
-//! [`SPEC`] has empty required and optional lists; the only credentials it
-//! touches are the user's own (Biscuit + operator credential), kept in 0600
-//! files (`~/.config/reachpad/` by default; the pre-rename `~/.config/reach/`
-//! keeps working via a read-through fallback).
+//! §15: the CLI is a *client* — it holds ZERO platform secrets. It reads no
+//! platform environment at all; the only credentials it touches are the
+//! user's own, kept in 0600 files under `~/.config/reachpad/` and
+//! `~/.local/state/reachpad/` (see [`conf`] and [`state`]).
 //!
 //! The crate keeps the package name `reach` so `-p reach` and `use reach::`
 //! stay stable; only the SHIPPED BINARY is named `reachpad` (`[[bin]]` in
@@ -24,7 +23,12 @@
 //! - [`http_min`] — hand-rolled minimal HTTP/1.1 JSON client over tokio
 //!   `TcpStream` (deliberately no reqwest/hyper — §10 anti-bloat).
 //! - [`api`] — typed calls to controld's public endpoints.
-//! - [`tokenfile`] — token file read/write (0600) + attach state.
+//! - [`errors`] — wire code → sentence, exit code, `--json` envelope.
+//! - [`privatefile`] — 0700 dirs, 0600 files, atomic writes, checked reads.
+//! - [`conf`] — `config.toml` / `credentials.toml` and their strict parser.
+//! - [`render`] — the one place wire spellings become surface ones.
+//! - [`state`] — cached workspace tokens and identity, per profile.
+//! - [`tokenfile`] — v0.1.0 token file read/write (0600) + attach state.
 //! - [`inspect`] — offline token fact printing (no verification, no root
 //!   key: `UnverifiedBiscuit` parse only).
 //! - [`transport`] — the frozen §6 frames over WebSocket (ADR-0007
@@ -42,42 +46,17 @@ pub mod attach;
 pub mod cli;
 pub mod cli_auth;
 pub mod commands;
+pub mod conf;
 pub mod doctor;
+pub mod errors;
 pub mod http_min;
 pub mod inspect;
+pub mod privatefile;
+pub mod render;
 pub mod self_update;
+pub mod state;
 pub mod tail;
 pub mod tokenfile;
 pub mod transport;
 
-/// §15 registry for reach: a pure client — no platform secrets, ever.
-/// Client credentials (the user's Biscuit) live in the token file instead.
-pub const SPEC: runtime::Spec = runtime::Spec {
-    bin: "reachpad",
-    required: &[],
-    optional: &[],
-};
-
 pub use commands::run;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spec_holds_zero_platform_secrets() {
-        // §15 structural rule for clients: nothing required, nothing
-        // optional — a stolen laptop image contains no platform secret.
-        assert_eq!(SPEC.bin, "reachpad");
-        assert!(SPEC.required.is_empty());
-        assert!(SPEC.optional.is_empty());
-    }
-
-    #[test]
-    fn dev_mode_boots_with_zero_env() {
-        // §15 dev convention: a bare checkout loads config with no
-        // provisioning at all.
-        let cfg = runtime::config::load_with(&SPEC, |_| None).unwrap();
-        assert_eq!(cfg.mode(), runtime::Mode::Dev);
-    }
-}

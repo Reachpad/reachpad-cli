@@ -1,143 +1,455 @@
-//! Command dispatch. All wall-clock reads and printing live here, at the
+//! Command dispatch. All wall-clock reads and all printing live here, at the
 //! outermost shell layer (I12 discipline even in a CLI).
+//!
+//! Every verb returns an exit code rather than an error string: the refusal a
+//! user reads comes from the compiled table in [`crate::errors`], and the
+//! number the shell reads comes from the same row. `--json` is a rendering of
+//! that one decision, never a second code path.
 
-use anyhow::Context;
+use std::io::IsTerminal as _;
+use std::io::Write as _;
+
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use clap::CommandFactory as _;
 use clap::Parser as _;
-use std::io::IsTerminal as _;
+use serde_json::{json, Value};
 
-use crate::api::Client;
-use crate::attach;
-use crate::cli::{Cli, Command, TokenCommand, WsCommand};
-use crate::inspect;
+use crate::api::{self, Auth, Client, ExecItem, ExecSpec};
+use crate::cli::{
+    self, AuthCommand, Cli, Command, KeysCommand, StateFilter, TokenCommand, WaitState, WsCommand,
+};
+use crate::conf;
+use crate::errors::{self, CliError, EXIT_OK, EXIT_USAGE};
+use crate::render;
+use crate::state;
 use crate::tail::{TailItem, TailOptions, TailSession};
-use crate::tokenfile;
-use crate::SPEC;
+
+/// How often `--wait` asks, and the bound it asks within.
+const POLL_MS: u64 = 2_000;
+/// The node's own budget for a seal (`nodeplane::seal_budget_exceeded`).
+const SEAL_BUDGET_MS: u64 = 600_000;
+/// The lease only ends by TTL after the node stops renewing (`boot.rs`).
+const LEASE_TTL_MS: u64 = 30_000;
+/// Room for the last heartbeat to land after that.
+const SEAL_MARGIN_MS: u64 = 60_000;
 
 /// Entry point for `main`: returns the process exit code.
 ///
-/// `--check-config` is handled by `runtime::run_startup` before clap sees
-/// the argv (§15: every binary supports it; reach's Spec is empty — a pure
-/// client holds no platform secrets, so the check trivially passes).
+/// Nothing runs before clap sees the argv. v0.1.0 ran the shared service
+/// startup here, which read `REACHPAD_MODE` (so an unrecognized value bricked
+/// `--version`), printed a `reachpad ready` line on every command, and scanned
+/// the WHOLE argv for `--check-config` — including past `--`, so
+/// `run <ws> -- grep --check-config file` printed a config report instead of
+/// running anything. A client has no platform config to check.
 pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
-    let cfg = match runtime::run_startup(&SPEC, argv.iter())? {
-        runtime::Startup::CheckConfigDone { ok } => return Ok(i32::from(!ok)),
-        runtime::Startup::Run(cfg) => cfg,
-    };
-
-    let mut cli = match Cli::try_parse_from(&argv) {
+    // `--help --json` is the catalog, so an agent plans against data rather
+    // than parsing prose. Scanned before clap, which would print prose and
+    // exit — and scanned only up to `--`, so a guest's own `--help` is the
+    // guest's.
+    if cli::wants_catalog(&argv) {
+        println!("{}", serde_json::to_string_pretty(&cli::catalog())?);
+        return Ok(EXIT_OK);
+    }
+    let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(e) => {
             // --help/--version exit 0; usage errors exit 2. clap renders.
-            let code = if e.use_stderr() { 2 } else { 0 };
-            e.print().context("rendering clap output")?;
+            let code = if e.use_stderr() { EXIT_USAGE } else { EXIT_OK };
+            let _ = e.print();
             return Ok(code);
         }
     };
-    // ADR-0040: `--endpoint <host>` is both planes on one host and one port.
-    cli.resolve_endpoint();
+    // The endpoint a login saved is resolved inside `Ctx::new` (conf.rs
+    // `[endpoint]`), not here: `--endpoint` on the command line, then
+    // REACHPAD_ENDPOINT, then the saved one, then the production default.
+    let mut cli = cli;
+    let Some(command) = cli.command.take() else {
+        // No verb is not a usage error on a terminal: it is a person who has
+        // just installed this and typed its name (#50). A pipe still gets the
+        // refusal, so no script starts a browser sign-in by accident.
+        return onboarding(&cli).await;
+    };
+    // The rendering decision is known from the argv alone, so the refusals
+    // raised while BUILDING the context — an unparsable config file, a
+    // literal `--api-key` — are rendered the same way as every later one. A
+    // caller that asked for JSON and got a prose line on stderr cannot read
+    // the code or the remedy, which is the whole point of `--json`.
+    let json = cli.json && !cli.quiet;
+    let ctx = match Ctx::build(&cli, &command, matches!(command, Command::Doctor)) {
+        Ok(ctx) => ctx,
+        Err(e) => return Ok(report(&e, command_name(&command), json)),
+    };
+    match dispatch(&ctx, command).await {
+        Ok(code) => Ok(code),
+        Err(e) => Ok(ctx.report(&e)),
+    }
+}
 
-    // A successful WorkOS CLI login stores the authenticated endpoint pair.
-    // Explicit command-line configuration always wins; saved configuration is
-    // only the missing default that makes the next `reachpad ws list` work.
-    let token_path = cli.token_path();
-    if cli.endpoint.is_none() {
-        match tokenfile::read_connection_config(&token_path) {
-            Ok(Some(saved)) => {
-                crate::cli_auth::validate_connection_urls(&saved.controld, &saved.hub)
-                    .context("saved Reachpad connection configuration is unsafe")?;
-                if cli.controld == crate::cli::DEFAULT_CONTROLD {
-                    cli.controld = saved.controld;
-                }
-                if cli.hub == crate::cli::DEFAULT_HUB {
-                    cli.hub = saved.hub;
-                }
-            }
+// ---------------------------------------------------------------------------
+// Everything one command needs to know about the world
+// ---------------------------------------------------------------------------
+
+pub(crate) struct Ctx {
+    pub(crate) controld: String,
+    pub(crate) hub: String,
+    trust: crate::transport::TlsTrust,
+    pub(crate) paths: conf::Paths,
+    pub(crate) endpoint: String,
+    /// The name this command answers to in `--json`.
+    command: &'static str,
+    json: bool,
+    quiet: bool,
+    timeout_ms: u64,
+    /// `-w` / REACHPAD_WORKSPACE: the fallback for a verb's `<workspace>`
+    /// argument, and the scope list of `keys mint`.
+    workspaces: Vec<String>,
+    api_key: Option<String>,
+    token: Option<String>,
+    token_file: Option<std::path::PathBuf>,
+    /// `--controld` / `--hub`, kept so `auth login` can re-derive the planes
+    /// for an endpoint it only learns about mid-command without losing the
+    /// overrides that outrank it.
+    plane_overrides: (Option<String>, Option<String>),
+    /// The older-fleet notice is said once per command, not once per call.
+    noticed: std::cell::Cell<bool>,
+}
+
+impl Ctx {
+    fn new(cli: &Cli, command: &Command) -> Result<Ctx, CliError> {
+        Ctx::build(cli, command, false)
+    }
+
+    /// `tolerate_unreadable_config` is for `doctor` and nothing else: an
+    /// unparsable `config.toml` or `credentials.toml` is exactly the state
+    /// doctor exists to name, so refusing to build a context for it would
+    /// leave the one command that could explain the breakage unable to run.
+    /// Every other command still refuses — acting on a half-understood
+    /// configuration is worse than stopping.
+    ///
+    /// Both steps below have to be tolerated, not just the config load: the
+    /// v0.1.0 migration READS the credential store to decide whether it has
+    /// anything to do, so a damaged credentials file stops a command there,
+    /// one line before the config is even looked at.
+    fn build(
+        cli: &Cli,
+        command: &Command,
+        tolerate_unreadable_config: bool,
+    ) -> Result<Ctx, CliError> {
+        let paths = conf::Paths::new(&cli.profile);
+        match state::migrate_v0_files(&paths, now_ms()) {
+            Ok(Some(line)) => eprintln!("reachpad: {line}"),
             Ok(None) => {}
-            Err(_) if matches!(cli.command.as_ref(), Some(Command::Doctor)) => {
-                // Doctor reports the malformed file by name. Letting the
-                // ordinary startup path fail here would make the diagnostic
-                // command unable to diagnose the state it exists for.
-            }
-            Err(error) => return Err(error),
+            // Doctor re-reads the store itself and reports what it finds
+            // there, with the file named. Swallowing the error here loses
+            // nothing: the same failure is about to be a printed check.
+            Err(_) if tolerate_unreadable_config => {}
+            Err(e) => return Err(e.into()),
+        }
+        let config = match conf::load_config(&paths) {
+            Ok(config) => config,
+            Err(_) if tolerate_unreadable_config => conf::Config::default(),
+            Err(e) => return Err(e.into()),
+        };
+        let endpoint = cli.endpoint(config.endpoint.as_deref());
+        let planes = cli.planes(&endpoint);
+        let api_key = match &cli.api_key {
+            Some(value) => Some(conf::read_secret_arg("--api-key", value)?),
+            None => None,
+        };
+        Ok(Ctx {
+            controld: planes.controld,
+            hub: planes.hub,
+            trust: cli.trust(),
+            paths,
+            endpoint,
+            command: command_name(command),
+            // `-q` wins over `--json`: a caller that asked for ids wants ids.
+            json: cli.json && !cli.quiet,
+            quiet: cli.quiet,
+            timeout_ms: cli.timeout,
+            workspaces: cli.workspace.clone(),
+            api_key,
+            token: cli.token.clone(),
+            token_file: cli.token_file.clone(),
+            plane_overrides: (cli.controld.clone(), cli.hub.clone()),
+            noticed: std::cell::Cell::new(false),
+        })
+    }
+
+    pub(crate) fn client(&self) -> Client {
+        Client::with_trust(&self.controld, self.trust.clone())
+    }
+
+    /// The two planes for an endpoint other than this command's own — the one
+    /// a WorkOS sign-in just named. `--controld`/`--hub` still win, exactly as
+    /// they do for [`Ctx::new`].
+    fn planes_for(&self, endpoint: &str) -> cli::Planes {
+        if endpoint == self.endpoint {
+            return cli::Planes {
+                controld: self.controld.clone(),
+                hub: self.hub.clone(),
+            };
+        }
+        let (controld, hub) = self.plane_overrides.clone();
+        cli::planes_from(endpoint, controld, hub)
+    }
+
+    /// The workspace this command acts on: the argument, else `-w` /
+    /// `REACHPAD_WORKSPACE`. An explicit argument always wins.
+    fn workspace(&self, given: Option<String>) -> Result<String, CliError> {
+        if given.is_none() && self.workspaces.len() > 1 {
+            return Err(CliError::usage(
+                "this command acts on one workspace; `-w` was given more than once.",
+            ));
+        }
+        given
+            .or_else(|| self.workspaces.first().cloned())
+            .map(|w| w.trim().to_owned())
+            .filter(|w| !w.is_empty())
+            .ok_or_else(|| {
+                CliError::usage(
+                    "no workspace given. Name it on the command line, or set one with \
+                     `-w <id>` or REACHPAD_WORKSPACE.",
+                )
+            })
+    }
+
+    /// The success rendering: a JSON envelope, or the human lines. `-q` says
+    /// only ids are wanted, and those are printed by [`Ctx::ids`].
+    pub(crate) fn emit(&self, data: Value, human: &[String]) {
+        if self.quiet {
+            return;
+        }
+        if self.json {
+            println!("{}", errors::ok_envelope(self.command, data));
+            return;
+        }
+        for line in human {
+            println!("{line}");
         }
     }
 
-    tracing::info!(mode = cfg.mode().as_str(), "reachpad ready");
-
-    let Some(command) = cli.command.take() else {
-        let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-        return run_onboarding(&cli, token_path, interactive).await;
-    };
-
-    match command {
-        Command::Doctor => {
-            return crate::doctor::run(&cli.controld, &cli.hub, cli.trust(), &cli.token_path())
-                .await;
+    /// The `-q` output: workspace ids, one per line, and nothing else.
+    fn ids(&self, ids: &[String]) {
+        if !self.quiet {
+            return;
         }
-        Command::Update => return crate::self_update::run(),
+        for id in ids {
+            println!("{id}");
+        }
+    }
+
+    fn report(&self, err: &CliError) -> i32 {
+        report(err, self.command, self.json)
+    }
+
+    /// Said once per command, on stderr, when this fleet cannot answer
+    /// something this CLI knows how to ask.
+    fn note_older_fleet(&self) {
+        if self.noticed.replace(true) {
+            return;
+        }
+        eprintln!(
+            "reachpad: {}",
+            CliError::from_code("fleet_older_than_cli", None).message
+        );
+    }
+
+    /// The user-scoped identity token every account-level verb needs.
+    async fn identity(&self) -> Result<state::Identity, CliError> {
+        state::identity(&self.client(), &self.paths, now_ms()).await
+    }
+
+    /// The saved operator credential, or the refusal that says which of the
+    /// two reasons it is missing for.
+    pub(crate) fn credential(&self) -> Result<conf::Credential, CliError> {
+        match conf::load_credential(&self.paths, now_ms())? {
+            conf::Stored::Present(c) => Ok(c),
+            conf::Stored::Missing => Err(CliError::from_code("no_credential", None)),
+            conf::Stored::Expired => Err(CliError::from_code("operator_token_expired", None)),
+        }
+    }
+
+    /// What this command presents for ONE workspace, on a route that takes
+    /// either carrier.
+    async fn authority(&self, workspace: &str) -> Result<Held, CliError> {
+        if let Some(key) = &self.api_key {
+            return Ok(Held::Key(key.clone()));
+        }
+        Ok(Held::Biscuit(self.biscuit(workspace).await?))
+    }
+
+    /// This workspace's own token, for the routes that take nothing else.
+    /// `--token` / `--token-file` are the v0.1.0 overrides; otherwise the
+    /// per-workspace cache answers, re-minting silently when it cannot.
+    async fn biscuit(&self, workspace: &str) -> Result<String, CliError> {
+        if let Some(token) = &self.token {
+            return Ok(token.trim().to_owned());
+        }
+        if let Some(path) = &self.token_file {
+            return Ok(crate::tokenfile::read_token(path)?);
+        }
+        state::workspace_token(&self.client(), &self.paths, workspace, now_ms()).await
+    }
+
+    /// Remember a workspace token that a call just handed us. A v0.1.0
+    /// `--token-file` still gets its copy, because the scripts that pass one
+    /// read it back on the next command.
+    fn remember(
+        &self,
+        workspace: &str,
+        biscuit: &str,
+        expires_at_ms: Option<u64>,
+    ) -> Result<(), CliError> {
+        if let Some(path) = &self.token_file {
+            crate::tokenfile::write_token(path, biscuit)?;
+        }
+        if let Some(expires_at_ms) = expires_at_ms {
+            let mut cache = state::load_workspace(&self.paths, workspace)?;
+            cache.token = Some(biscuit.to_owned());
+            cache.expires_at_ms = Some(expires_at_ms);
+            state::save_workspace(&self.paths, workspace, &cache)?;
+        }
+        Ok(())
+    }
+}
+
+/// The one place a refusal is printed: the envelope, or the sentence and the
+/// next command. Used before a [`Ctx`] exists as well as after, so a refusal
+/// is never rendered two ways depending on how early it was raised.
+fn report(err: &CliError, command: &'static str, json: bool) -> i32 {
+    if json {
+        println!("{}", err.envelope(command));
+    } else {
+        eprintln!("reachpad: {}", err.message);
+        if let Some(next) = &err.next_command {
+            eprintln!("  try: {next}");
+        }
+    }
+    err.exit_code
+}
+
+/// What a command holds for one workspace.
+enum Held {
+    Key(String),
+    Biscuit(String),
+}
+
+impl Held {
+    fn auth(&self) -> Auth<'_> {
+        match self {
+            Held::Key(k) => Auth::ApiKey(k),
+            Held::Biscuit(b) => Auth::Biscuit(b),
+        }
+    }
+}
+
+/// Wall clock, read at the shell layer only (I12). Zero on error, which every
+/// expiry check treats as expired.
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+pub(crate) fn now_ms() -> u64 {
+    wall_now_ms()
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Create { .. } => "workspace.create",
+        Command::List { .. } => "workspace.list",
+        Command::Status { .. } => "workspace.status",
+        Command::Run { .. } => "workspace.run",
+        Command::Pause { .. } => "workspace.pause",
+        Command::Fork { .. } => "workspace.fork",
+        Command::Archive { .. } => "workspace.archive",
+        Command::Events { .. } => "workspace.events",
+        Command::Auth(AuthCommand::Login { .. }) => "auth.login",
+        Command::Auth(AuthCommand::Whoami) => "auth.whoami",
+        Command::Auth(AuthCommand::Logout { .. }) => "auth.logout",
+        Command::Keys(KeysCommand::Mint { .. }) => "keys.mint",
+        Command::Keys(KeysCommand::List) => "keys.list",
+        Command::Keys(KeysCommand::Revoke { .. }) => "keys.revoke",
+        Command::Attach { .. } => "workspace.attach",
+        Command::Tail { .. } => "workspace.events",
+        Command::Share { .. } => "workspace.share",
+        Command::Credits => "account.credits",
+        Command::Doctor => "cli.doctor",
+        Command::Update => "cli.update",
+        Command::Completions { .. } => "cli.completions",
+        Command::Token(TokenCommand::Inspect) => "token.inspect",
+        Command::Ws(ws) => match ws {
+            WsCommand::Create { .. } => "workspace.create",
+            WsCommand::List { .. } => "workspace.list",
+            WsCommand::Attach { .. } => "workspace.attach",
+            WsCommand::Exec { .. } => "workspace.run",
+            WsCommand::Fork { .. } => "workspace.fork",
+            WsCommand::Rewind { .. } => "workspace.rewind",
+            WsCommand::Release { .. } => "workspace.release",
+            WsCommand::Lineage { .. } => "workspace.lineage",
+            WsCommand::Archive { .. } => "workspace.archive",
+            WsCommand::Token { .. } => "workspace.token",
+        },
+    }
+}
+
+async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
+    match command {
+        Command::Create { name, name_flag } => create(ctx, name.or(name_flag), None).await,
+        Command::List { state } => list(ctx, state, None).await,
+        Command::Status { workspace, wait } => status(ctx, workspace, wait).await,
+        Command::Run {
+            workspace,
+            shell,
+            cwd,
+            env,
+            stdin,
+            argv,
+        } => {
+            run_command(
+                ctx,
+                RunSpec {
+                    workspace,
+                    shell,
+                    cwd,
+                    env,
+                    stdin,
+                    argv,
+                },
+            )
+            .await
+        }
+        Command::Pause { workspace, wait } => pause(ctx, workspace, wait).await,
+        Command::Fork {
+            workspace,
+            count,
+            snapshot,
+            name,
+        } => fork(ctx, workspace, count, snapshot, name).await,
+        Command::Archive { workspace } => archive(ctx, workspace).await,
+        Command::Events { workspace, since } => events(ctx, workspace, since).await,
+        Command::Auth(auth) => run_auth(ctx, auth).await,
+        Command::Keys(keys) => run_keys(ctx, keys).await,
+        Command::Doctor => crate::doctor::run(ctx).await,
+        Command::Update => crate::self_update::run(ctx),
         Command::Completions { shell } => {
             let generator = match shell {
-                crate::cli::CompletionShell::Bash => clap_complete::Shell::Bash,
-                crate::cli::CompletionShell::Zsh => clap_complete::Shell::Zsh,
-                crate::cli::CompletionShell::Fish => clap_complete::Shell::Fish,
+                cli::CompletionShell::Bash => clap_complete::Shell::Bash,
+                cli::CompletionShell::Zsh => clap_complete::Shell::Zsh,
+                cli::CompletionShell::Fish => clap_complete::Shell::Fish,
             };
+            // The script goes to stdout even under `-q`: redirecting it into a
+            // file is the whole use, and `--json` has nothing to say about a
+            // shell script.
             let mut stdout = std::io::stdout();
             clap_complete::generate(generator, &mut Cli::command(), "reachpad", &mut stdout);
+            Ok(EXIT_OK)
         }
-        Command::Credits => {
-            let credential = tokenfile::read_operator_token(&cli.token_path())?;
-            let client = Client::with_trust(&cli.controld, cli.trust());
-            let session = client.operator_session(&credential).await?;
-            let balance = client
-                .credit_balance(&session.user_id, &session.identity_token)
-                .await?;
-            let whole = balance.balance_millicredits / 1000;
-            let fraction = balance.balance_millicredits % 1000;
-            println!("{whole}.{fraction:03} compute credits");
-            println!("1 credit = 1 active standard-workspace minute");
-            if balance.balance_millicredits <= 50_000 {
-                eprintln!("reachpad: low compute-credit balance");
-            } else if balance.balance_millicredits <= 200_000 {
-                eprintln!("reachpad: compute-credit balance is below 200");
-            }
-        }
-        Command::Ws(ws) => {
-            // `ws exec` exits with the COMMAND's exit code so it composes in
-            // a script; every other `ws` verb returns 0. The code travels as a
-            // return value rather than a `process::exit` so the normal
-            // teardown still runs.
-            return run_ws(&cli.controld, cli.trust(), cli.token_path(), ws).await;
-        }
-        Command::Share {
-            workspace,
-            role,
-            expires_in,
-            grantee,
-        } => {
-            let token_b64 = resolve_token(&cli)?;
-            let expires_at_ms = wall_now_ms().saturating_add(expires_in);
-            run_share(
-                &cli.controld,
-                cli.trust(),
-                &token_b64,
-                &workspace,
-                role,
-                expires_at_ms,
-                &grantee,
-            )
-            .await?;
-        }
-        Command::Tail { workspace } => {
-            let token_b64 = resolve_token(&cli)?;
-            let token = BASE64
-                .decode(token_b64.trim())
-                .context("token is not valid base64")?;
-            let options = TailOptions { trust: cli.trust() };
-            run_tail_command(&cli.hub, &workspace, &token, options).await?;
-        }
+        Command::Ws(ws) => run_ws(ctx, ws).await,
         Command::Attach {
             workspace,
             pty,
@@ -148,399 +460,1334 @@ pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
             no_raw,
             wait_for_node_ms,
         } => {
-            let token_path = cli.token_path();
-            // §8 flow 3: placement first (lease + fencing token), then the
-            // hub session. `--no-place` re-attaches to a workspace whose
-            // lease is already held — the VM keeps running across detaches.
-            if !no_place {
-                let presented = tokenfile::read_token(&token_path)?;
-                let client = Client::with_trust(&cli.controld, cli.trust());
-                let placed = client.attach(&workspace, &presented).await?;
-                tokenfile::write_token(&token_path, &placed.biscuit_b64)?;
-                tokenfile::save_attach_state(
-                    &token_path,
-                    &workspace,
-                    tokenfile::AttachState {
-                        node: placed.node.clone(),
-                        fencing_token: placed.fencing_token,
-                        principal: String::new(),
-                    },
-                )?;
-                eprintln!(
-                    "placed: workspace={workspace} node={} fencing_token={}",
-                    placed.node, placed.fencing_token
-                );
-                if let Some(millicredits) = placed.credits_remaining_millicredits {
-                    eprintln!(
-                        "compute credits remaining: {}.{:03}",
-                        millicredits / 1000,
-                        millicredits % 1000
-                    );
-                }
-            }
-            let token_b64 = resolve_token(&cli)?;
-            let token = BASE64
-                .decode(token_b64.trim())
-                .context("token is not valid base64")?;
-            let options = attach::AttachOptions {
-                pty,
-                open_new: new,
-                trust: cli.trust(),
-                linger: std::time::Duration::from_millis(linger_ms),
-                no_raw,
-                wait_for_node: std::time::Duration::from_millis(wait_for_node_ms),
-            };
-            if list {
-                let roster = attach::list_ptys(&cli.hub, &workspace, &token, &options).await?;
-                match roster.as_slice() {
-                    [] => println!("no live PTYs (the guest reported an empty roster)"),
-                    ptys => {
-                        for p in ptys {
-                            println!("pty {p}");
-                        }
-                    }
-                }
-                return Ok(0);
-            }
-            let summary = attach::attach(&cli.hub, &workspace, &token, &options).await?;
-            // stderr, so a scripted run can pipe the workspace's own output
-            // on stdout without this getting mixed in.
-            eprintln!(
-                "detached: {} byte(s) sent, {} byte(s) received in {} ms; \
-                 durable through seq={} (everything at or below that is in the store)",
-                summary.bytes_sent,
-                summary.bytes_received,
-                summary.duration_ms,
-                summary.durable_through,
-            );
+            attach_command(
+                ctx,
+                AttachSpec {
+                    workspace,
+                    pty,
+                    new,
+                    list,
+                    no_place,
+                    linger_ms,
+                    no_raw,
+                    wait_for_node_ms,
+                },
+            )
+            .await
         }
-        Command::Auth(auth) => {
-            run_auth(&cli.controld, &cli.hub, cli.trust(), cli.token_path(), auth).await?;
-        }
-        Command::Key(key) => {
-            run_key(&cli.controld, cli.trust(), cli.token_path(), key).await?;
-        }
+        Command::Tail { workspace } => tail_command(ctx, workspace).await,
+        Command::Share {
+            workspace,
+            role,
+            expires_in,
+            grantee,
+        } => share(ctx, workspace, role, expires_in, &grantee).await,
+        Command::Credits => credits(ctx).await,
         Command::Token(TokenCommand::Inspect) => {
-            let token_b64 = resolve_token(&cli)?;
-            print_inspection(&inspect::inspect_b64(&token_b64)?);
+            let workspace = self_or_any(ctx)?;
+            let token = ctx.biscuit(&workspace).await?;
+            let facts = crate::inspect::inspect_b64(&token)?;
+            print_inspection(&facts);
+            Ok(EXIT_OK)
         }
     }
-    Ok(0)
 }
 
+/// `token inspect` has no workspace argument of its own; it inspects whatever
+/// token this invocation would present.
+fn self_or_any(ctx: &Ctx) -> Result<String, CliError> {
+    ctx.workspace(None)
+}
+
+// ---------------------------------------------------------------------------
+// First run: bare `reachpad`
+// ---------------------------------------------------------------------------
+
+/// What a bare `reachpad` does, decided before anything is attempted.
+///
+/// The interactivity test is the safety property: a browser sign-in is a
+/// side effect no script asked for, so a pipe keeps the v0.1.0 usage refusal
+/// and its exit code. #50.
 #[derive(Debug, PartialEq, Eq)]
-enum OnboardingAction {
-    RefuseNonInteractive,
+enum Onboarding {
+    /// Not a terminal: the old usage error, unchanged.
+    Refuse,
+    /// A terminal with no credential: sign in, then show what is there.
     SignInThenList,
+    /// A terminal that is already signed in: just show what is there.
     List,
 }
 
-fn onboarding_action(interactive: bool, operator_token_exists: bool) -> OnboardingAction {
-    match (interactive, operator_token_exists) {
-        (false, _) => OnboardingAction::RefuseNonInteractive,
-        (true, false) => OnboardingAction::SignInThenList,
-        (true, true) => OnboardingAction::List,
+fn onboarding_action(interactive: bool, signed_in: bool) -> Onboarding {
+    match (interactive, signed_in) {
+        (false, _) => Onboarding::Refuse,
+        (true, false) => Onboarding::SignInThenList,
+        (true, true) => Onboarding::List,
     }
 }
 
-async fn run_onboarding(
-    cli: &Cli,
-    token_path: std::path::PathBuf,
-    interactive: bool,
-) -> anyhow::Result<i32> {
-    let action = onboarding_action(interactive, tokenfile::operator_token_exists(&token_path)?);
-    if action == OnboardingAction::RefuseNonInteractive {
-        anyhow::bail!("no command given (try `reachpad --help`)");
-    }
-
-    let mut controld = cli.controld.clone();
-    if action == OnboardingAction::SignInThenList {
-        eprintln!("No saved Reachpad sign-in was found. Starting browser sign-in.");
-        run_auth(
-            &controld,
-            &cli.hub,
-            cli.trust(),
-            token_path.clone(),
-            crate::cli::AuthCommand::Login {
-                operator_token: None,
-                account_url: crate::cli_auth::DEFAULT_ACCOUNT_URL.to_owned(),
-                no_browser: false,
-            },
-        )
-        .await?;
-
-        let saved = tokenfile::read_connection_config(&token_path)?
-            .context("browser sign-in did not save the Reachpad endpoints")?;
-        crate::cli_auth::validate_connection_urls(&saved.controld, &saved.hub)
-            .context("browser sign-in saved unsafe Reachpad endpoints")?;
-        controld = saved.controld;
-    }
-
-    println!();
-    println!("Your workspaces:");
-    run_ws(
-        &controld,
-        cli.trust(),
-        token_path,
-        WsCommand::List {
-            user: None,
-            principal: "dev-principal".to_owned(),
-            idp_assertion: None,
-        },
-    )
-    .await?;
-    println!();
-    println!("Next commands:");
-    println!("  Create a workspace: reachpad ws create --name <name>");
-    println!("  Open a workspace:   reachpad ws token <workspace-id>");
-    println!("                      reachpad attach <workspace-id>");
-    Ok(0)
-}
-
-impl Cli {
-    fn token_path(&self) -> std::path::PathBuf {
-        self.token_file
-            .clone()
-            .unwrap_or_else(tokenfile::default_token_path)
+/// A bare `reachpad`, rendered through the same context and error table as
+/// every verb — it IS `list`, with a sign-in in front of it when there is no
+/// credential yet, so its `--json` envelope is a workspace listing.
+async fn onboarding(cli: &Cli) -> anyhow::Result<i32> {
+    let command = Command::List { state: None };
+    let json = cli.json && !cli.quiet;
+    let ctx = match Ctx::new(cli, &command) {
+        Ok(ctx) => ctx,
+        Err(e) => return Ok(report(&e, command_name(&command), json)),
+    };
+    match run_onboarding(cli, &ctx).await {
+        Ok(code) => Ok(code),
+        Err(e) => Ok(ctx.report(&e)),
     }
 }
 
-/// The user's Biscuit: `--token` wins, else the token file.
-fn resolve_token(cli: &Cli) -> anyhow::Result<String> {
-    if let Some(token) = &cli.token {
-        return Ok(token.trim().to_owned());
+async fn run_onboarding(cli: &Cli, ctx: &Ctx) -> Result<i32, CliError> {
+    // Both streams, because the sign-in writes its code to stderr and waits:
+    // a terminal that cannot show the prompt cannot complete the flow.
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    // A credential that cannot be READ is not a first run — it is damage, and
+    // the error names the file. Only a missing or expired one starts a login.
+    let signed_in = match conf::load_credential(&ctx.paths, now_ms())? {
+        conf::Stored::Present(_) => true,
+        conf::Stored::Missing | conf::Stored::Expired => false,
+    };
+    match onboarding_action(interactive, signed_in) {
+        Onboarding::Refuse => Err(CliError::usage(
+            "no command given. `reachpad --help` lists them.",
+        )),
+        Onboarding::List => list(ctx, None, None).await,
+        Onboarding::SignInThenList => {
+            eprintln!("reachpad: no saved sign-in on this machine. Starting browser sign-in.");
+            device_login(ctx, crate::cli_auth::DEFAULT_ACCOUNT_URL, false).await?;
+            // The sign-in may have named a DIFFERENT endpoint than this
+            // invocation defaulted to, and it saved it. Rebuild the context so
+            // the listing that follows asks the fleet the credential belongs
+            // to, not the one this process started out assuming.
+            let ctx = Ctx::new(cli, &Command::List { state: None })?;
+            if !ctx.quiet && !ctx.json {
+                println!();
+            }
+            let code = list(&ctx, None, None).await?;
+            if !ctx.quiet && !ctx.json {
+                println!();
+                println!("Next:");
+                println!("  reachpad create <name>   a new workspace");
+                println!("  reachpad run <id> -- <command>");
+                println!("  reachpad attach <id>     an interactive terminal");
+            }
+            Ok(code)
+        }
     }
-    let path = cli.token_path();
-    tokenfile::read_token(&path).with_context(|| {
-        format!(
-            "no --token given and no token at {} (run `reachpad ws attach <id>` first)",
-            path.display()
-        )
+}
+
+// ---------------------------------------------------------------------------
+// create / list / status / pause / fork / archive
+// ---------------------------------------------------------------------------
+
+/// The identity a create/list uses: the saved credential, or an IdP assertion
+/// the v0.1.0 flags carry (the M1 harness mints its own).
+struct Claimed {
+    user: Option<String>,
+    principal: String,
+    idp_assertion: Option<String>,
+}
+
+async fn user_identity(ctx: &Ctx, claimed: Option<Claimed>) -> Result<(String, String), CliError> {
+    let client = ctx.client();
+    match claimed {
+        Some(Claimed {
+            user: Some(user),
+            principal,
+            idp_assertion: Some(assertion),
+        }) => {
+            let identity = client
+                .identity_token(&user, &principal, &assertion)
+                .await
+                .map_err(|e| CliError::from_api(&e, None))?;
+            Ok((user, identity))
+        }
+        claimed => {
+            let identity = ctx.identity().await?;
+            if let Some(user) = claimed.and_then(|c| c.user) {
+                if user != identity.user_id {
+                    return Err(CliError::usage(format!(
+                        "--user {user} is not the account your credential names ({})",
+                        identity.user_id
+                    )));
+                }
+            }
+            Ok((identity.user_id, identity.identity_token))
+        }
+    }
+}
+
+async fn create(
+    ctx: &Ctx,
+    name: Option<String>,
+    claimed: Option<Claimed>,
+) -> Result<i32, CliError> {
+    let (user, identity) = user_identity(ctx, claimed).await?;
+    let name = name.unwrap_or_default();
+    let created = ctx
+        .client()
+        .create_workspace(&user, &identity, &name)
+        .await
+        .map_err(|e| CliError::from_api(&e, None))?;
+    ctx.remember(&created.workspace, &created.biscuit_b64, None)?;
+    ctx.ids(std::slice::from_ref(&created.workspace));
+    ctx.emit(
+        json!({ "id": created.workspace, "name": name }),
+        // The id IS the output: `reachpad create demo` prints `ws-431` and a
+        // script pipes it straight into the next verb.
+        std::slice::from_ref(&created.workspace),
+    );
+    Ok(EXIT_OK)
+}
+
+async fn list(
+    ctx: &Ctx,
+    filter: Option<StateFilter>,
+    claimed: Option<Claimed>,
+) -> Result<i32, CliError> {
+    let (user, identity) = user_identity(ctx, claimed).await?;
+    let listing = ctx
+        .client()
+        .list_workspaces(&user, &identity)
+        .await
+        .map_err(|e| CliError::from_api(&e, None))?;
+    let stateless = listing.workspaces.iter().any(|w| w.state.is_none());
+    if stateless || listing.limits.is_none() {
+        ctx.note_older_fleet();
+    }
+
+    let mut counts = (0u64, 0u64, 0u64); // running, paused, archived
+    for ws in &listing.workspaces {
+        match cli::bucket(&row_state(ws)) {
+            "running" => counts.0 += 1,
+            "paused" => counts.1 += 1,
+            "archived" => counts.2 += 1,
+            _ => {}
+        }
+    }
+
+    let shown: Vec<&api::Workspace> = listing
+        .workspaces
+        .iter()
+        .filter(|ws| {
+            let bucket = cli::bucket(&row_state(ws));
+            match filter {
+                None => bucket != "archived",
+                Some(StateFilter::All) => true,
+                Some(want) => bucket == want.as_str(),
+            }
+        })
+        .collect();
+
+    ctx.ids(
+        &shown
+            .iter()
+            .map(|ws| ws.id.clone())
+            .collect::<Vec<String>>(),
+    );
+
+    let mut data = json!({
+        "workspaces": shown.iter().map(|ws| render::workspace_json(ws)).collect::<Vec<_>>(),
+    });
+    // Counts are a claim about state, so a fleet that reports no state gets
+    // no counts rather than a made-up zero.
+    if !stateless {
+        data["counts"] = json!({
+            "running": counts.0, "paused": counts.1, "archived": counts.2,
+        });
+    }
+    if let Some(limits) = &listing.limits {
+        data["limits"] = render::limits_json(limits);
+    }
+
+    let mut human = Vec::new();
+    if shown.is_empty() {
+        human.push("no workspaces".to_owned());
+    }
+    for ws in &shown {
+        let head = ws
+            .head
+            .as_ref()
+            .map(|h| format!("saved {} ({})", h.snapshot, h.kind))
+            .unwrap_or_else(|| "never saved".to_owned());
+        human.push(format!(
+            "{}  {:<16} {:<13} {head}",
+            ws.id,
+            render::label(&ws.name),
+            row_state(ws)
+        ));
+    }
+    if !stateless {
+        human.push(format!(
+            "{} running, {} paused, {} archived",
+            counts.0, counts.1, counts.2
+        ));
+    }
+    if let Some(limits) = &listing.limits {
+        human.push(render::limits_line(limits).trim_start().to_owned());
+    }
+    ctx.emit(data, &human);
+    Ok(EXIT_OK)
+}
+
+/// A row's state, with the one thing an older fleet still tells us — that it
+/// is archived — read off the row itself.
+fn row_state(ws: &api::Workspace) -> String {
+    ws.state.clone().unwrap_or_else(|| {
+        if ws.archived_at_ms.is_some() {
+            "archived".to_owned()
+        } else {
+            "unknown".to_owned()
+        }
     })
 }
 
-/// Wall clock, read at the shell layer only (I12).
-fn wall_now_ms() -> u64 {
+async fn status(
+    ctx: &Ctx,
+    workspace: Option<String>,
+    wait: Option<WaitState>,
+) -> Result<i32, CliError> {
+    let workspace = ctx.workspace(workspace)?;
+    let held = ctx.authority(&workspace).await?;
+    let status = match wait {
+        Some(target) => wait_for(ctx, &workspace, &held, target.as_str()).await?,
+        None => read_status(ctx, &workspace, &held).await?,
+    };
+    ctx.emit(
+        render::status_json(&status),
+        &render::status_lines(&status, now_ms()),
+    );
+    Ok(EXIT_OK)
+}
+
+/// S2, with the documented fallback for a fleet that does not have it yet.
+async fn read_status(ctx: &Ctx, workspace: &str, held: &Held) -> Result<api::Status, CliError> {
+    match ctx.client().workspace_status(workspace, held.auth()).await {
+        Ok(status) => Ok(status),
+        Err(e) if api::is_route_absent(&e) => {
+            ctx.note_older_fleet();
+            compose_status(ctx, workspace, held).await
+        }
+        Err(e) => Err(CliError::from_api(&e, Some(workspace))),
+    }
+}
+
+/// The design's own fallback: `list` + `lineage`, with the lease reported as
+/// `unknown` because nothing on an older fleet reports it at all.
+async fn compose_status(ctx: &Ctx, workspace: &str, held: &Held) -> Result<api::Status, CliError> {
+    let client = ctx.client();
+    let lineage = client
+        .lineage(workspace, held.auth())
+        .await
+        .map_err(|e| CliError::from_api(&e, Some(workspace)))?;
+    let mut status = api::Status {
+        id: workspace.to_owned(),
+        name: String::new(),
+        state: "unknown".to_owned(),
+        // An empty node is how the rendering layer says "unknown".
+        lease: Some(api::Lease {
+            node: String::new(),
+            expires_at_ms: 0,
+            heartbeat_at_ms: 0,
+            fencing_token: None,
+        }),
+        head: lineage.head.as_ref().map(|h| api::Head {
+            snapshot: h.id.clone(),
+            kind: h.kind.clone(),
+            sealed_at_ms: Some(h.sealed_at_ms),
+        }),
+        parent: None,
+        snapshots: lineage.snapshots.len() as u64,
+        forks: lineage.forks.len() as u64,
+        idle_pause_seconds: 0,
+        limits: api::Limits::default(),
+        created_at_ms: 0,
+        archived_at_ms: None,
+    };
+    // The row, when the credential can read the account listing at all — an
+    // api key cannot, and a status that names no label is still a status.
+    if let Ok(identity) = ctx.identity().await {
+        if let Ok(listing) = client
+            .list_workspaces(&identity.user_id, &identity.identity_token)
+            .await
+        {
+            if let Some(row) = listing.workspaces.iter().find(|w| w.id == workspace) {
+                status.name = row.name.clone();
+                status.created_at_ms = row.created_at_ms;
+                status.archived_at_ms = row.archived_at_ms;
+                status.parent = row.parent.clone();
+                if row.archived_at_ms.is_some() {
+                    status.state = "archived".to_owned();
+                    status.lease = None;
+                }
+            }
+            if let Some(limits) = listing.limits {
+                status.limits = limits;
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// Poll S2 until the workspace is in `target`'s bucket.
+///
+/// The bound is `--timeout`, EXCEPT while the workspace reports `sealing`:
+/// the node's own seal budget is ten minutes and the lease only ends by TTL
+/// after it stops renewing, so a wait bounded by the default ten minutes
+/// would give up on a workspace that is saving correctly (trap 31, in
+/// reverse). The two timeout messages are different for the same reason.
+async fn wait_for(
+    ctx: &Ctx,
+    workspace: &str,
+    held: &Held,
+    target: &str,
+) -> Result<api::Status, CliError> {
+    let started = now_ms();
+    let mut deadline = started.saturating_add(ctx.timeout_ms);
+    loop {
+        let status = read_status(ctx, workspace, held).await?;
+        if cli::bucket(&status.state) == target {
+            return Ok(status);
+        }
+        // A fleet with no state route reports `unknown` for everything that
+        // is not archived, and `unknown` is in no target's bucket — so this
+        // loop could only spend the whole timeout to end in a message that
+        // reads as a fleet fault. Say what it actually is, once.
+        if status.state == "unknown" {
+            return Err(CliError::from_code("fleet_predates_wait", Some(workspace)));
+        }
+        deadline = deadline.max(wait_deadline(started, ctx.timeout_ms, &status.state));
+        let now = now_ms();
+        if now >= deadline {
+            let waited = json!({
+                "waited_s": now.saturating_sub(started) / 1_000,
+                "state": status.state,
+                "target": target,
+            });
+            let code = if status.state == "sealing" {
+                "still_sealing"
+            } else {
+                "wait_timeout"
+            };
+            return Err(CliError::from_body(code, &waited, Some(workspace)));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(POLL_MS + jitter_ms())).await;
+    }
+}
+
+/// When a `--wait` gives up, given what the workspace is doing.
+///
+/// `--timeout` bounds everything EXCEPT a save in progress: the node's seal
+/// budget alone is ten minutes and the lease ends 30s after it stops
+/// renewing, so the default ten-minute wait would give up on a workspace that
+/// is saving exactly as designed. The bound a wait honors has to be at least
+/// as long as the operation it is waiting for.
+fn wait_deadline(started_ms: u64, timeout_ms: u64, state: &str) -> u64 {
+    let asked = started_ms.saturating_add(timeout_ms);
+    if state != "sealing" {
+        return asked;
+    }
+    asked.max(
+        started_ms
+            .saturating_add(SEAL_BUDGET_MS)
+            .saturating_add(LEASE_TTL_MS)
+            .saturating_add(SEAL_MARGIN_MS),
+    )
+}
+
+/// A little spread on the poll, so N `reachpad` processes watching a fan-out
+/// do not all ask on the same tick.
+fn jitter_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .map(|d| u64::from(d.subsec_nanos()) % 500)
         .unwrap_or(0)
 }
 
-/// `reachpad auth …` — the operator-credential half of ADR-0034.
-async fn run_auth(
-    controld: &str,
-    hub: &str,
-    trust: crate::transport::TlsTrust,
-    token_path: std::path::PathBuf,
-    cmd: crate::cli::AuthCommand,
-) -> anyhow::Result<()> {
-    use crate::cli::AuthCommand;
-    let client = Client::with_trust(controld, trust.clone());
+async fn pause(ctx: &Ctx, workspace: Option<String>, wait: bool) -> Result<i32, CliError> {
+    let workspace = ctx.workspace(workspace)?;
+    let held = ctx.authority(&workspace).await?;
+    let client = ctx.client();
+
+    let mut status = match client.workspace_status(&workspace, held.auth()).await {
+        Ok(status) => status,
+        Err(e) if api::is_route_absent(&e) => {
+            return pause_on_an_older_fleet(ctx, &workspace, &held, wait).await
+        }
+        Err(e) => return Err(CliError::from_api(&e, Some(&workspace))),
+    };
+
+    // The lease can disappear between the read and the release; when it does,
+    // the server says `no_active_lease` and the honest answer is whatever the
+    // next read says — once, not in a loop.
+    let mut reread = false;
+    let sealing = loop {
+        match status.state.as_str() {
+            "archived" => return Err(CliError::from_code("workspace_archived", Some(&workspace))),
+            // Nothing to save, and NOT the fork sentence: a fork child that
+            // has never run still has a snapshot to fork from.
+            "never_started" => {
+                return Err(CliError::from_code("no_active_lease", Some(&workspace)))
+            }
+            "paused" => break false,
+            "sealing" => break true,
+            _ => {}
+        }
+        let Some(fencing_token) = status.lease.as_ref().and_then(|l| l.fencing_token) else {
+            // S2 reports the token only to a caller it also authorizes to
+            // WRITE, and `release` demands exactly that — not owner. The
+            // sentence names the authority that is actually missing.
+            return Err(CliError::from_code("no_write_access", Some(&workspace)));
+        };
+        match client
+            .release(&workspace, held.auth(), fencing_token, false)
+            .await
+        {
+            Ok(_) => break true,
+            Err(e) => match refused_as(&e) {
+                // Something else took the lease between the two calls; the
+                // refusal carries the token that is current now.
+                Some(("stale_fencing_token", body)) => {
+                    let Some(current) = body["current"].as_u64() else {
+                        return Err(CliError::from_api(&e, Some(&workspace)));
+                    };
+                    client
+                        .release(&workspace, held.auth(), current, false)
+                        .await
+                        .map_err(|e| CliError::from_api(&e, Some(&workspace)))?;
+                    break true;
+                }
+                Some(("no_active_lease", _)) if !reread => {
+                    reread = true;
+                    status = read_status(ctx, &workspace, &held).await?;
+                    continue;
+                }
+                _ => return Err(CliError::from_api(&e, Some(&workspace))),
+            },
+        }
+    };
+
+    if !sealing {
+        ctx.emit(
+            json!({ "id": workspace, "state": "paused", "sealing": false }),
+            &[format!("{workspace} is already paused.")],
+        );
+        return Ok(EXIT_OK);
+    }
+    if wait {
+        let status = wait_for(ctx, &workspace, &held, "paused").await?;
+        ctx.emit(
+            json!({ "id": workspace, "state": status.state, "sealing": false }),
+            &[format!("{workspace} is saved and stopped.")],
+        );
+        return Ok(EXIT_OK);
+    }
+    ctx.emit(
+        json!({ "id": workspace, "state": "sealing", "sealing": true }),
+        &[
+            format!("{workspace} is saving disk and memory."),
+            "  It still holds its slot until the save finishes; `--wait` blocks until it does."
+                .to_owned(),
+        ],
+    );
+    Ok(EXIT_OK)
+}
+
+/// A fleet with no state route cannot be asked for the lease, so the only
+/// honest one-call pause is the one whose fencing token we already saved.
+///
+/// `--wait` is refused here rather than dropped: the same fleet cannot report
+/// when the save finished either, so waiting would mean exiting 0 the instant
+/// the seal was ORDERED — the caller's next step (an rsync, a shutdown) would
+/// run ten minutes before the memory image is durable.
+async fn pause_on_an_older_fleet(
+    ctx: &Ctx,
+    workspace: &str,
+    held: &Held,
+    wait: bool,
+) -> Result<i32, CliError> {
+    ctx.note_older_fleet();
+    if wait {
+        return Err(CliError::from_code("fleet_predates_wait", Some(workspace)));
+    }
+    let cached = state::load_workspace(&ctx.paths, workspace)?.fencing_token;
+    let Some(fencing_token) = cached else {
+        return Err(CliError::from_code("fleet_predates_pause", Some(workspace)));
+    };
+    let client = ctx.client();
+    if let Err(e) = client
+        .release(workspace, held.auth(), fencing_token, false)
+        .await
+    {
+        // The cached token is written by `attach` and never invalidated, so
+        // an old one is the ordinary case here — and "something else took
+        // over" would be a false account of it. Retry ONCE with the token the
+        // refusal says is current, exactly as the state-route path does.
+        let Some(("stale_fencing_token", body)) = refused_as(&e) else {
+            return Err(CliError::from_api(&e, Some(workspace)));
+        };
+        let Some(current) = body["current"].as_u64() else {
+            return Err(CliError::from_api(&e, Some(workspace)));
+        };
+        client
+            .release(workspace, held.auth(), current, false)
+            .await
+            .map_err(|e| CliError::from_api(&e, Some(workspace)))?;
+    }
+    ctx.emit(
+        json!({ "id": workspace, "state": "sealing", "sealing": true }),
+        &[format!("{workspace} is saving disk and memory.")],
+    );
+    Ok(EXIT_OK)
+}
+
+/// The code and body of a refusal, when it was one.
+fn refused_as(err: &api::ApiError) -> Option<(&str, &Value)> {
+    match err {
+        api::ApiError::Api { code, body, .. } => Some((code.as_str(), body)),
+        _ => None,
+    }
+}
+
+async fn fork(
+    ctx: &Ctx,
+    workspace: Option<String>,
+    count: u32,
+    snapshot: Option<String>,
+    name: Option<String>,
+) -> Result<i32, CliError> {
+    let workspace = ctx.workspace(workspace)?;
+    if count == 0 {
+        return Err(CliError::usage("--count must be at least 1."));
+    }
+    if count > 1 && name.is_some() {
+        return Err(CliError::usage(
+            "--name names one workspace; with --count the server names them.",
+        ));
+    }
+    let biscuit = ctx.biscuit(&workspace).await?;
+    let held = Held::Biscuit(biscuit);
+    let client = ctx.client();
+
+    // ONE snapshot for all N children: resolved here, so a fan-out cannot
+    // straddle two saves if the source is sealed again mid-loop.
+    let snapshot = match (snapshot, count) {
+        (Some(s), _) => Some(s),
+        (None, 1) => None,
+        (None, _) => read_status(ctx, &workspace, &held)
+            .await?
+            .head
+            .map(|h| h.snapshot),
+    };
+
+    let mut children = Vec::new();
+    let mut rows = Vec::new();
+    for _ in 0..count {
+        let Held::Biscuit(biscuit) = &held else {
+            unreachable!("fork presents the workspace's own token");
+        };
+        let forked = match client
+            .fork(&workspace, biscuit, snapshot.as_deref(), name.as_deref())
+            .await
+        {
+            Ok(forked) => forked,
+            // A fan-out that stops half-way has still SPENT those slots and
+            // written those tokens. Returning here would leave the caller —
+            // and the `xargs` reading this stdout — with no handle for
+            // workspaces that now exist, so the ids go out before the
+            // refusal does.
+            Err(e) => {
+                ctx.ids(&children);
+                let mut err = CliError::from_api(&e, Some(&workspace));
+                if !children.is_empty() {
+                    err.message = format!(
+                        "{} {} of the {count} forks were created first and still exist: {}.",
+                        err.message,
+                        children.len(),
+                        children.join(", ")
+                    );
+                    err.data = Some(json!({ "workspaces": rows }));
+                }
+                return Err(err);
+            }
+        };
+        ctx.remember(&forked.workspace, &forked.biscuit_b64, None)?;
+        rows.push(json!({
+            "id": forked.workspace,
+            "name": forked.name,
+            "parent": { "workspace": workspace, "snapshot": forked.origin_snapshot },
+        }));
+        children.push(forked.workspace);
+    }
+    ctx.ids(&children);
+    ctx.emit(
+        json!({ "workspaces": rows }),
+        &children
+            .iter()
+            .map(|id| id.to_owned())
+            .collect::<Vec<String>>(),
+    );
+    Ok(EXIT_OK)
+}
+
+async fn archive(ctx: &Ctx, workspace: Option<String>) -> Result<i32, CliError> {
+    let workspace = ctx.workspace(workspace)?;
+    let held = ctx.authority(&workspace).await?;
+    let at = ctx
+        .client()
+        .archive(&workspace, held.auth())
+        .await
+        .map_err(|e| CliError::from_api(&e, Some(&workspace)))?;
+    ctx.emit(
+        json!({ "id": workspace, "archived_at": render::time(at) }),
+        &[
+            format!("{workspace} is archived and its slot is free."),
+            // Not "untouched": ADR-0070 makes archived state managed
+            // retention, not a permanent-backup promise. Nothing goes now.
+            "  Nothing is deleted now; archived state follows managed retention.".to_owned(),
+        ],
+    );
+    Ok(EXIT_OK)
+}
+
+// ---------------------------------------------------------------------------
+// run — the byte-exact path
+// ---------------------------------------------------------------------------
+
+struct RunSpec {
+    workspace: Option<String>,
+    shell: Option<String>,
+    cwd: Option<String>,
+    env: Vec<String>,
+    stdin: bool,
+    argv: Vec<String>,
+}
+
+/// Characters that make one argument look like a command line somebody meant
+/// a shell to read.
+const SHELL_METACHARS: &[char] = &[
+    ' ', '\t', '\n', '|', '&', ';', '<', '>', '(', ')', '$', '`', '*', '?', '{', '}', '[', ']',
+];
+
+async fn run_command(ctx: &Ctx, spec: RunSpec) -> Result<i32, CliError> {
+    let workspace = ctx.workspace(spec.workspace)?;
+    let argv = resolve_argv(&workspace, spec.shell, spec.argv)?;
+
+    let mut envs = std::collections::BTreeMap::new();
+    for pair in &spec.env {
+        let Some((k, v)) = pair.split_once('=') else {
+            return Err(CliError::usage(format!(
+                "--env takes NAME=VALUE; {pair:?} has no `=`."
+            )));
+        };
+        envs.insert(k.to_owned(), v.to_owned());
+    }
+    // Local stdin, read to EOF BEFORE the request: the exec route takes stdin
+    // as one field, not a stream.
+    let stdin_b64 = if spec.stdin {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)
+            .map_err(|e| CliError::usage(format!("reading stdin for --stdin: {e}")))?;
+        Some(BASE64.encode(buf))
+    } else {
+        None
+    };
+
+    let held = ctx.authority(&workspace).await?;
+    let exec = ExecSpec {
+        argv: &argv,
+        cwd: spec.cwd.as_deref(),
+        env: &envs,
+        timeout_ms: Some(ctx.timeout_ms),
+        stdin_b64,
+    };
+    let json = ctx.json;
+    let started = std::time::Instant::now();
+    let end = ctx
+        .client()
+        .exec(&workspace, held.auth(), &exec, |item| match item {
+            // stdout to stdout and stderr to stderr, unmerged all the way to
+            // the terminal: a caller diffing build output against warnings
+            // cannot un-merge them, and this is the last place they could be.
+            ExecItem::Out { fd, bytes } if !json => {
+                if fd == 2 {
+                    let _ = std::io::stderr().write_all(bytes);
+                    let _ = std::io::stderr().flush();
+                } else {
+                    let _ = std::io::stdout().write_all(bytes);
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            ExecItem::Out { fd, bytes } => {
+                println!(
+                    "{}",
+                    json!({
+                        "ev": "out",
+                        "workspace": workspace,
+                        "fd": fd,
+                        "text": String::from_utf8_lossy(bytes),
+                    })
+                );
+            }
+            ExecItem::Waiting { reason } if !json => {
+                eprintln!("reachpad: the workspace is {reason}…");
+            }
+            ExecItem::Waiting { reason } => {
+                println!(
+                    "{}",
+                    json!({ "ev": "waiting", "workspace": workspace, "reason": reason })
+                );
+            }
+        })
+        .await
+        .map_err(|e| CliError::from_api(&e, Some(&workspace)))?;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    if end.get("timed_out").and_then(Value::as_bool) == Some(true) && !json {
+        eprintln!("reachpad: the command hit its timeout and was killed.");
+    }
+    if end.get("truncated").and_then(Value::as_bool) == Some(true) && !json {
+        eprintln!("reachpad: output was truncated at this account's cap.");
+    }
+    if end.get("error").and_then(Value::as_str).is_some() {
+        return Err(CliError::from_exec_end(&end, Some(&workspace)));
+    }
+    // EXIT WITH THE COMMAND'S OWN CODE, so this composes in a script. A
+    // signal is not an exit code (§42.1: a policy and a failure must not be
+    // the same value), so a killed command reports 128+n the way a shell does
+    // rather than inventing one.
+    let (code, signal) = match end.get("exit_code").and_then(Value::as_i64) {
+        Some(code) => (code as i32, Value::Null),
+        None => {
+            let signal = end.get("signal").and_then(Value::as_str).unwrap_or("?");
+            if !json {
+                eprintln!("reachpad: killed by {signal}");
+            }
+            (137, json!(signal))
+        }
+    };
+    ctx.emit(
+        json!({
+            "exit_code": code,
+            "signal": signal,
+            "duration_ms": duration_ms,
+            "timed_out": end.get("timed_out").and_then(Value::as_bool).unwrap_or(false),
+            // The prose caller is told on stderr; the machine caller is told
+            // here, or it parses a cut-off log as a complete one.
+            "truncated": end.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+        }),
+        &[],
+    );
+    Ok(code)
+}
+
+/// What to run, from either spelling — and the refusal for the third thing
+/// people type, which is a shell line with no shell asked for.
+fn resolve_argv(
+    workspace: &str,
+    shell: Option<String>,
+    argv: Vec<String>,
+) -> Result<Vec<String>, CliError> {
+    if let Some(line) = shell {
+        if !argv.is_empty() {
+            return Err(CliError::usage(
+                "give a shell line with -s, or an argv after `--`, not both.",
+            ));
+        }
+        return Ok(vec!["sh".to_owned(), "-lc".to_owned(), line]);
+    }
+    if argv.is_empty() {
+        return Err(CliError::usage(format!(
+            "no command given. Put it after `--`: `reachpad run {workspace} -- <command>`, \
+             or pass a shell line: `reachpad run {workspace} -s '<line>'`."
+        )));
+    }
+    // Guessing here is how `run -- "my file"` becomes a shell injection, so
+    // the refusal names both corrected forms instead.
+    if argv.len() == 1 && argv[0].contains(SHELL_METACHARS) {
+        let line = &argv[0];
+        return Err(CliError::usage(format!(
+            "{line:?} is one argument, not a command line. Either pass the argv: \
+             `reachpad run {workspace} -- <program> <args…>`, or ask for a shell: \
+             `reachpad run {workspace} -s {line:?}`."
+        )));
+    }
+    Ok(argv)
+}
+
+// ---------------------------------------------------------------------------
+// events
+// ---------------------------------------------------------------------------
+
+async fn events(ctx: &Ctx, workspace: Option<String>, since: Option<u64>) -> Result<i32, CliError> {
+    let workspace = ctx.workspace(workspace)?;
+    let biscuit = ctx.biscuit(&workspace).await?;
+    let token = BASE64
+        .decode(biscuit.trim())
+        .map_err(|_| CliError::from_code("bad_token_encoding", Some(&workspace)))?;
+    let mut session = TailSession::connect_with(
+        &ctx.hub,
+        &workspace,
+        &token,
+        TailOptions {
+            trust: ctx.trust.clone(),
+            since,
+        },
+    )
+    .await?;
+    // A hub that predates replay echoes no `replay` capability, and a live
+    // stream is not the history that was asked for (I3).
+    if since.is_some() && !session.supports_replay() {
+        return Err(CliError::from_code(
+            "fleet_predates_replay",
+            Some(&workspace),
+        ));
+    }
+    let effective = session
+        .replay_from()
+        .map(|from| from.saturating_sub(1))
+        .unwrap_or_else(|| since.unwrap_or(0));
+    if ctx.json {
+        println!(
+            "{}",
+            json!({ "ev": "connected", "workspace": workspace, "since": effective })
+        );
+    } else if !ctx.quiet {
+        println!("connected to {workspace} (from event {effective}); ctrl-c to stop");
+    }
+
+    loop {
+        tokio::select! {
+            item = session.next_item() => match item? {
+                Some(TailItem::Event(ev)) => {
+                    if ctx.json {
+                        println!("{}", json!({
+                            "ev": ev.type_name,
+                            "workspace": workspace,
+                            "seq": ev.seq,
+                            "ts": render::time(ev.ts_ms),
+                            "text": ev.text(),
+                        }));
+                    } else if !ctx.quiet {
+                        println!("{}  seq={:<6} {:<14} {}", render::rfc3339(ev.ts_ms), ev.seq, ev.type_name, ev.text());
+                    }
+                }
+                // A watermark is not an event; `tail` reports it, `events`
+                // is one object per event and nothing else.
+                Some(TailItem::DurableThrough(_)) => {}
+                None => return Ok(EXIT_OK),
+            },
+            _ = tokio::signal::ctrl_c() => return Ok(EXIT_OK),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// auth
+// ---------------------------------------------------------------------------
+
+async fn run_auth(ctx: &Ctx, cmd: AuthCommand) -> Result<i32, CliError> {
     match cmd {
         AuthCommand::Login {
             operator_token,
             account_url,
             no_browser,
-        } => {
-            if let Some(operator_token) = operator_token {
-                let credential = if operator_token.trim() == "-" {
-                    let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                        .context("reading the operator credential from stdin")?;
-                    buf
-                } else {
-                    operator_token
-                };
-                let credential = credential.trim().to_owned();
-                // Exchange BEFORE saving: a credential that does not work is
-                // not one worth keeping on disk, and the failure names why.
-                let session = client.operator_session(&credential).await?;
-                crate::cli_auth::validate_connection_urls(controld, hub)
-                    .context("refusing to save unsafe Reachpad endpoints")?;
-                tokenfile::write_operator_token(&token_path, &credential)?;
-                tokenfile::write_connection_config(
-                    &token_path,
-                    &tokenfile::ConnectionConfig {
-                        controld: controld.to_owned(),
-                        hub: hub.to_owned(),
-                    },
-                )?;
-                println!(
-                    "logged in: user={} principal={}",
-                    session.user_id, session.principal_id
-                );
-                println!(
-                    "  operator credential saved: {} (0600)",
-                    tokenfile::operator_path(&token_path).display()
-                );
-                println!(
-                    "  endpoints saved: {} (0600)",
-                    tokenfile::connection_path(&token_path).display()
-                );
-                println!(
-                    "  identity token valid until {} (ms since epoch); renew with `reachpad auth session`",
-                    session.expires_at_ms
-                );
-                return Ok(());
-            }
-
-            let device = crate::cli_auth::start_device_authorization(&account_url, &trust).await?;
-            println!("Open {}", device.verification_uri);
-            println!("Enter code: {}", device.user_code);
-            if !no_browser && crate::cli_auth::open_browser(&device.verification_uri_complete) {
-                eprintln!("Opened WorkOS sign-in in your browser.");
-            }
-            eprintln!("Waiting for WorkOS approval...");
-            let login =
-                crate::cli_auth::complete_device_authorization(&account_url, device, &trust)
-                    .await?;
-
-            // Validate the new credential against the endpoint that issued it
-            // before either value reaches disk. A forged or skewed exchange
-            // response cannot replace a known-good login.
-            let login_client = Client::with_trust(&login.controld_url, trust.clone());
-            let session = login_client.operator_session(&login.operator_token).await?;
-            tokenfile::write_operator_token(&token_path, &login.operator_token)?;
-            tokenfile::write_connection_config(
-                &token_path,
-                &tokenfile::ConnectionConfig {
-                    controld: login.controld_url,
-                    hub: login.hub_url,
-                },
-            )?;
-
-            match login.email {
-                Some(email) => println!("signed in as {email}"),
-                None => println!("signed in: user={}", session.user_id),
-            }
-            println!(
-                "  operator credential saved: {} (0600)",
-                tokenfile::operator_path(&token_path).display()
-            );
-            println!(
-                "  credential valid until {} (ms since epoch)",
-                login.operator_expires_at_ms
-            );
-        }
-        AuthCommand::Session => {
-            let credential = tokenfile::read_operator_token(&token_path)?;
-            let session = client.operator_session(&credential).await?;
-            println!(
-                "session: user={} principal={} expires_at_ms={}",
-                session.user_id, session.principal_id, session.expires_at_ms
-            );
-        }
+        } => login(ctx, operator_token, account_url, no_browser).await,
+        AuthCommand::Whoami => whoami(ctx).await,
+        AuthCommand::Logout { all } => logout(ctx, all).await,
     }
-    Ok(())
 }
 
-/// `reachpad key …` — API keys (ADR-0059 §4). Every verb presents the saved
-/// operator credential: a key cannot mint, list, or revoke keys.
-async fn run_key(
-    controld: &str,
-    trust: crate::transport::TlsTrust,
-    token_path: std::path::PathBuf,
-    cmd: crate::cli::KeyCommand,
-) -> anyhow::Result<()> {
-    use crate::cli::KeyCommand;
-    let client = Client::with_trust(controld, trust);
-    let credential = tokenfile::read_operator_token(&token_path)?;
+/// `auth login`, both halves of it.
+///
+/// With no `--operator-token` this is WorkOS CLI Auth (ADR-0070): WorkOS owns
+/// the device code, the browser confirmation and every authentication factor,
+/// and hands back a short-lived session token that Reachpad exchanges ONCE for
+/// the ordinary ADR-0034 operator credential. The two paths converge on
+/// [`save_login`], so a credential from a browser and a credential from a
+/// pipe land in exactly the same store with the same echo and the same
+/// `auth logout` semantics.
+async fn login(
+    ctx: &Ctx,
+    operator_token: Option<String>,
+    account_url: String,
+    no_browser: bool,
+) -> Result<i32, CliError> {
+    let Some(value) = operator_token else {
+        return device_login(ctx, &account_url, no_browser).await;
+    };
+    let credential = conf::read_secret_arg("--operator-token", &value)?;
+    save_login(ctx, credential, ctx.endpoint.clone(), None).await
+}
+
+/// The browser path. Nothing WorkOS returns is persisted: the access token
+/// buys one Reachpad credential and is dropped, and the refresh token is
+/// never read (`cli_auth`).
+async fn device_login(ctx: &Ctx, account_url: &str, no_browser: bool) -> Result<i32, CliError> {
+    let device = crate::cli_auth::start_device_authorization(account_url, &ctx.trust)
+        .await
+        .map_err(CliError::from)?;
+    // The prompt goes to stderr so `--json` keeps one machine-readable line on
+    // stdout; the code itself is not a secret and this is the whole point of
+    // the flow, so it is printed even under `-q`.
+    eprintln!(
+        "Open {} and enter: {}",
+        device.verification_uri, device.user_code
+    );
+    if !no_browser && crate::cli_auth::open_browser(&device.verification_uri_complete) {
+        eprintln!("  Opened it in your browser.");
+    }
+    eprintln!("Waiting for approval...");
+    let login = crate::cli_auth::complete_device_authorization(account_url, device, &ctx.trust)
+        .await
+        .map_err(CliError::from)?;
+    // The endpoint the exchange named, not the one this invocation defaulted
+    // to: a login is also how a laptop learns where its fleet is.
+    let endpoint = crate::cli_auth::endpoint_from_login(&login.controld_url, &login.hub_url)
+        .map_err(CliError::from)?;
+    save_login(ctx, login.operator_token, endpoint, login.email).await
+}
+
+/// Exchange the credential for a session, THEN write it — a credential that
+/// does not work is not one worth keeping on disk, and the failure names why.
+/// This is also where the endpoint is decided, so nothing is written until the
+/// endpoint that will be saved is the one that just answered.
+async fn save_login(
+    ctx: &Ctx,
+    credential: String,
+    endpoint: String,
+    email: Option<String>,
+) -> Result<i32, CliError> {
+    let planes = ctx.planes_for(&endpoint);
+    let client = Client::with_trust(&planes.controld, ctx.trust.clone());
+    let session = client
+        .operator_session(&credential)
+        .await
+        .map_err(|e| CliError::from_api(&e, None))?;
+    conf::save_credential(
+        &ctx.paths,
+        &conf::Credential {
+            operator_token: credential,
+            token_id: session.token_id.clone(),
+            expires_at_ms: session.token_expires_at_ms,
+        },
+    )?;
+    conf::save_endpoint(&ctx.paths, &endpoint)?;
+    state::save_identity(
+        &ctx.paths,
+        &state::Identity {
+            user_id: session.user_id.clone(),
+            principal_id: session.principal_id.clone(),
+            identity_token: session.identity_token.clone(),
+            expires_at_ms: session.expires_at_ms,
+        },
+    )?;
+    let expires = session
+        .token_expires_at_ms
+        .map_or(Value::Null, render::time);
+    let who = email.clone().unwrap_or_else(|| session.user_id.clone());
+    ctx.emit(
+        json!({
+            "endpoint": endpoint,
+            "user": session.user_id,
+            "email": email,
+            "credential": { "kind": "operator", "expires_at": expires },
+        }),
+        &[
+            format!("Signed in to {endpoint} as {who}."),
+            format!(
+                "  Endpoint and credential saved in {}.",
+                ctx.paths.config_dir().display()
+            ),
+        ],
+    );
+    Ok(EXIT_OK)
+}
+
+async fn whoami(ctx: &Ctx) -> Result<i32, CliError> {
+    let credential = ctx.credential()?;
+    let client = ctx.client();
+    let session = client
+        .operator_session(credential.bearer())
+        .await
+        .map_err(|e| CliError::from_api(&e, None))?;
+    let listing = client
+        .list_workspaces(&session.user_id, &session.identity_token)
+        .await
+        .map_err(|e| CliError::from_api(&e, None))?;
+    let balance = client
+        .credit_balance(&session.user_id, &session.identity_token)
+        .await
+        .map_err(|e| CliError::from_api(&e, None))?;
+
+    let running = listing
+        .workspaces
+        .iter()
+        .filter(|w| cli::bucket(&row_state(w)) == "running")
+        .count() as u64;
+    let limits = listing.limits.clone().unwrap_or_default();
+    if listing.limits.is_none() {
+        ctx.note_older_fleet();
+    }
+    // Integer arithmetic on millicredits: a balance is money, and money does
+    // not go through a float on its way to a screen.
+    let credits = format!(
+        "{}.{:03}",
+        balance.balance_millicredits / 1_000,
+        balance.balance_millicredits % 1_000
+    );
+    let expires = session
+        .token_expires_at_ms
+        .map_or(Value::Null, render::time);
+    ctx.emit(
+        json!({
+            "endpoint": ctx.endpoint,
+            "user": session.user_id,
+            "credential": {
+                "kind": "operator",
+                "id": session.token_id,
+                "expires_at": expires,
+            },
+            "limits": render::limits_json(&limits),
+            "credits": {
+                "balance": credits,
+                "unit": balance.unit,
+                "running_workspaces": running,
+                // One credit per minute per running standard workspace.
+                "per_minute": running,
+            },
+        }),
+        &[
+            format!("{} at {}", session.user_id, ctx.endpoint),
+            format!(
+                "  credential: operator{}",
+                session
+                    .token_expires_at_ms
+                    .map(|ms| format!(", expires {}", render::rfc3339(ms)))
+                    .unwrap_or_default()
+            ),
+            render::limits_line(&limits).trim_start().to_owned(),
+            format!("  credits: {credits} ({running} burning now, 1/minute each)"),
+        ],
+    );
+    Ok(EXIT_OK)
+}
+
+/// Sign this machine out, and with `--all` every machine.
+///
+/// Two rules this function is written around:
+///
+/// - **The local files always go.** A user who ran `logout` to clear a laptop
+///   must not be left with the credential still on it because the network was
+///   down. A failed server-side revoke is reported afterwards, with a nonzero
+///   exit and the sentence saying which half happened.
+/// - **`--all` revokes only the credentials you sign in with.** A SCOPED row
+///   is not one of those: the `identity`-scoped row is the front door
+///   reachpad.dev itself presents to mint a new laptop credential (ADR-0066),
+///   so revoking it would leave the account with no self-serve way back to a
+///   CLI at all.
+async fn logout(ctx: &Ctx, all: bool) -> Result<i32, CliError> {
+    let stored = conf::load_credential(&ctx.paths, now_ms())?;
+    let mut revoked: Vec<String> = Vec::new();
+    let mut note = None;
+    let mut failure: Option<CliError> = None;
+    if let conf::Stored::Present(credential) = &stored {
+        let client = ctx.client();
+        let own = credential.token_id.clone();
+        let mut others: Vec<String> = Vec::new();
+        if all {
+            match client.operator_tokens(credential.bearer()).await {
+                Ok(rows) => {
+                    others = rows
+                        .iter()
+                        .filter(|r| r.scopes.is_empty())
+                        .filter(|r| Some(&r.id) != own.as_ref())
+                        .map(|r| r.id.clone())
+                        .collect()
+                }
+                Err(e) => failure = Some(CliError::from_api(&e, None)),
+            }
+        }
+        // Own row LAST: every call above authenticates with it.
+        for id in others.into_iter().chain(own.clone()) {
+            match client.revoke_operator_token(credential.bearer(), &id).await {
+                Ok(()) => {
+                    if !ctx.quiet {
+                        // Listed by id as they go: a user revoking machines
+                        // they are not sitting at should see which rows died.
+                        eprintln!("reachpad: revoked {id}");
+                    }
+                    revoked.push(id);
+                }
+                Err(e) => failure = failure.or_else(|| Some(CliError::from_api(&e, None))),
+            }
+        }
+        if own.is_none() {
+            note = Some(
+                "this credential predates the id echo, so only this machine forgot it \
+                 — revoke it at https://reachpad.dev/connect"
+                    .to_owned(),
+            );
+        }
+    } else {
+        note = Some(match stored {
+            conf::Stored::Expired => "the saved credential had already expired".to_owned(),
+            _ => "there was no credential on this machine".to_owned(),
+        });
+    }
+    // Unconditional, and before anything can return: this is the half of
+    // logout that only this machine can do.
+    conf::forget_credential(&ctx.paths)?;
+    state::forget_all(&ctx.paths)?;
+
+    if let Some(mut failure) = failure {
+        failure.message = format!(
+            "{} This machine forgot its credential and its cached tokens, but the server-side \
+             revoke did not happen and still has to be — the credential is gone from here, so \
+             retry it at https://reachpad.dev/connect.",
+            failure.message
+        );
+        return Err(failure);
+    }
+    let mut human = vec![match revoked.len() {
+        0 => "Signed out on this machine.".to_owned(),
+        1 => "Signed out; the credential is revoked.".to_owned(),
+        n => format!("Signed out; {n} credentials revoked, including your other machines."),
+    }];
+    if let Some(note) = &note {
+        human.push(format!("  {note}"));
+    }
+    ctx.emit(json!({ "revoked": revoked, "note": note }), &human);
+    Ok(EXIT_OK)
+}
+
+// ---------------------------------------------------------------------------
+// keys
+// ---------------------------------------------------------------------------
+
+async fn run_keys(ctx: &Ctx, cmd: KeysCommand) -> Result<i32, CliError> {
+    let credential = ctx.credential()?;
+    let client = ctx.client();
     match cmd {
-        KeyCommand::Mint {
-            label,
-            role,
-            workspace_ids,
-            ttl,
-        } => {
+        KeysCommand::Mint { label, role, ttl } => {
+            let workspace_ids = &ctx.workspaces;
             let scope = (!workspace_ids.is_empty()).then_some(workspace_ids.as_slice());
             let minted = client
-                .create_api_key(&credential, label.as_deref(), &role, scope, ttl)
-                .await?;
-            println!("api key minted: id={} role={}", minted.id, minted.role);
-            println!("  valid until {} (ms since epoch)", minted.expires_at_ms);
-            match scope {
-                Some(ids) => println!("  scope: {}", ids.join(" ")),
-                None => println!("  scope: the whole account"),
-            }
-            println!("  the value below is shown ONCE and is not recoverable:");
-            // stdout, alone on its line, so `reachpad key mint … | tail -1`
-            // captures exactly the secret and nothing else.
-            println!("{}", minted.key);
-        }
-        KeyCommand::List => {
-            let rows = client.list_api_keys(&credential).await?;
-            if rows.is_empty() {
-                println!("no api keys");
-            }
-            for k in rows {
-                let scope = if k.workspace_ids.is_empty() {
-                    "account".to_owned()
-                } else {
-                    k.workspace_ids.join(",")
-                };
-                let state = match (k.usable, k.revoked_at_ms) {
-                    (true, _) => "usable",
-                    (false, Some(_)) => "revoked",
-                    (false, None) => "expired",
-                };
+                .create_api_key(
+                    credential.body_value(),
+                    label.as_deref(),
+                    role.as_str(),
+                    scope,
+                    ttl,
+                )
+                .await
+                .map_err(|e| CliError::from_api(&e, None))?;
+            if ctx.json {
                 println!(
-                    "{}  {}  role={} scope={} expires_at_ms={} [{}]",
-                    k.id, k.label, k.role, scope, k.expires_at_ms, state
+                    "{}",
+                    errors::ok_envelope(
+                        ctx.command,
+                        json!({
+                            "id": minted.id,
+                            "role": minted.role,
+                            "expires_at": render::time(minted.expires_at_ms),
+                            "workspaces": workspace_ids,
+                            "key": minted.key,
+                        })
+                    )
                 );
+                return Ok(EXIT_OK);
             }
+            if !ctx.quiet {
+                println!(
+                    "key {} ({}), valid until {}",
+                    minted.id,
+                    minted.role,
+                    render::rfc3339(minted.expires_at_ms)
+                );
+                match scope {
+                    Some(ids) => println!("  it may act on: {}", ids.join(" ")),
+                    None => println!("  it may act on: every workspace on this account"),
+                }
+                println!("  the value below is shown ONCE and is not recoverable:");
+            }
+            // ALONE on the last line, so `reachpad keys mint | tail -1` is
+            // exactly the secret. A command that mints a credential must
+            // print what it minted (trap 36).
+            println!("{}", minted.key);
+            Ok(EXIT_OK)
         }
-        KeyCommand::Revoke { id } => {
-            client.revoke_api_key(&credential, &id).await?;
-            println!("revoked: {id}");
-            println!("  exec calls presenting it are refused from now; nothing else changed");
+        KeysCommand::List => {
+            let rows = client
+                .list_api_keys(credential.body_value())
+                .await
+                .map_err(|e| CliError::from_api(&e, None))?;
+            let data: Vec<Value> = rows
+                .iter()
+                .map(|k| {
+                    json!({
+                        "id": k.id,
+                        "label": k.label,
+                        "role": k.role,
+                        "workspaces": k.workspace_ids,
+                        "expires_at": render::time(k.expires_at_ms),
+                        "usable": k.usable,
+                    })
+                })
+                .collect();
+            let mut human: Vec<String> = rows
+                .iter()
+                .map(|k| {
+                    let scope = if k.workspace_ids.is_empty() {
+                        "the whole account".to_owned()
+                    } else {
+                        k.workspace_ids.join(",")
+                    };
+                    let state = match (k.usable, k.revoked_at_ms) {
+                        (true, _) => "usable",
+                        (false, Some(_)) => "revoked",
+                        (false, None) => "expired",
+                    };
+                    format!(
+                        "{}  {:<16} {:<13} {scope} [{state}]",
+                        k.id,
+                        render::label(&k.label),
+                        k.role
+                    )
+                })
+                .collect();
+            if human.is_empty() {
+                human.push("no keys".to_owned());
+            }
+            ctx.emit(json!({ "keys": data }), &human);
+            Ok(EXIT_OK)
+        }
+        KeysCommand::Revoke { id } => {
+            client
+                .revoke_api_key(credential.body_value(), &id)
+                .await
+                .map_err(|e| CliError::from_api(&e, None))?;
+            ctx.emit(
+                json!({ "id": id, "revoked": true }),
+                &[format!(
+                    "{id} is revoked; commands presenting it are refused."
+                )],
+            );
+            Ok(EXIT_OK)
         }
     }
-    Ok(())
 }
 
-/// Resolve the user-scoped identity token every user-level operation needs
-/// (create, list — I6: naming a principal is never enough).
-///
-/// Both paths end at the SAME token: an IdP assertion exchanged for one, or
-/// the saved operator credential exchanged for one (ADR-0034). The operator
-/// credential names its own user, so `--user` is only ever a claim to check.
-async fn user_identity(
-    client: &Client,
-    token_path: &std::path::Path,
-    user: Option<String>,
-    principal: &str,
-    idp_assertion: Option<String>,
-) -> anyhow::Result<(String, String)> {
-    match idp_assertion {
-        Some(assertion) => {
-            // clap's `requires = "user"` guarantees the pair.
-            let user = user.context("--idp-assertion requires --user")?;
-            let identity = client.identity_token(&user, principal, &assertion).await?;
-            Ok((user, identity))
-        }
-        None => {
-            let credential = tokenfile::read_operator_token(token_path)?;
-            let session = client.operator_session(&credential).await?;
-            if let Some(claimed) = &user {
-                anyhow::ensure!(
-                    claimed == &session.user_id,
-                    "--user {claimed} does not match the operator credential's user {}",
-                    session.user_id
-                );
-            }
-            Ok((session.user_id, session.identity_token))
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// The v0.1.0 tree
+// ---------------------------------------------------------------------------
 
-async fn run_ws(
-    controld: &str,
-    trust: crate::transport::TlsTrust,
-    token_path: std::path::PathBuf,
-    cmd: WsCommand,
-) -> anyhow::Result<i32> {
-    let client = Client::with_trust(controld, trust);
+async fn run_ws(ctx: &Ctx, cmd: WsCommand) -> Result<i32, CliError> {
     match cmd {
         WsCommand::Create {
             name,
@@ -548,326 +1795,301 @@ async fn run_ws(
             principal,
             idp_assertion,
         } => {
-            let (user, identity) =
-                user_identity(&client, &token_path, user, &principal, idp_assertion).await?;
-            let created = client.create_workspace(&user, &identity, &name).await?;
-            // The owner Biscuit authorizes every later call for this
-            // workspace; without saving it, attach has nothing to present.
-            tokenfile::write_token(&token_path, &created.biscuit_b64)?;
-            println!(
-                "workspace created: {} (name={name} user={user})",
-                created.workspace
-            );
-            println!("  owner biscuit saved: {} (0600)", token_path.display());
+            create(
+                ctx,
+                name,
+                Some(Claimed {
+                    user,
+                    principal,
+                    idp_assertion,
+                }),
+            )
+            .await
         }
         WsCommand::List {
             user,
             principal,
             idp_assertion,
         } => {
-            let (user, identity) =
-                user_identity(&client, &token_path, user, &principal, idp_assertion).await?;
-            let rows = client.list_workspaces(&user, &identity).await?;
-            if rows.is_empty() {
-                println!("no workspaces for {user}");
-            }
-            for ws in &rows {
-                let forks = if ws.forks == 0 {
-                    String::new()
-                } else {
-                    format!("  ({} fork(s))", ws.forks)
-                };
-                println!("{}  {}{forks}", ws.id, ws.name);
-            }
+            list(
+                ctx,
+                Some(StateFilter::All),
+                Some(Claimed {
+                    user,
+                    principal,
+                    idp_assertion,
+                }),
+            )
+            .await
         }
-        WsCommand::Attach { id } => {
-            // Attach presents the Biscuit saved by `ws create` (or by a share
-            // link): the acting principal comes from the token, never from a
-            // flag (I5/I6).
-            let presented = tokenfile::read_token(&token_path)?;
-            let attach = client.attach(&id, &presented).await?;
-            tokenfile::write_token(&token_path, &attach.biscuit_b64)?;
-            tokenfile::save_attach_state(
-                &token_path,
-                &id,
-                tokenfile::AttachState {
-                    node: attach.node.clone(),
-                    fencing_token: attach.fencing_token,
-                    principal: String::new(),
+        WsCommand::Attach { id } => attach_lease(ctx, &id).await,
+        WsCommand::Exec {
+            id,
+            cwd,
+            env,
+            stdin,
+            argv,
+        } => {
+            run_command(
+                ctx,
+                RunSpec {
+                    workspace: id,
+                    shell: None,
+                    cwd,
+                    env,
+                    stdin,
+                    argv,
                 },
-            )?;
-            println!("attached: workspace={id}");
-            println!("  node:          {}", attach.node);
-            println!("  fencing_token: {}", attach.fencing_token);
-            println!("  lease expires: {} (ms since epoch)", attach.expires_at_ms);
-            println!("  biscuit saved: {} (0600)", token_path.display());
+            )
+            .await
         }
-        WsCommand::Fork { id, snapshot, name } => {
-            let presented = tokenfile::read_token(&token_path)?;
-            let forked = client
-                .fork(&id, &presented, snapshot.as_deref(), name.as_deref())
-                .await?;
-            tokenfile::write_token(&token_path, &forked.biscuit_b64)?;
-            println!(
-                "forked: {} (name={} from={id} snapshot={} log_seq={})",
-                forked.workspace, forked.name, forked.origin_snapshot, forked.origin_log_seq
-            );
-            println!("  both histories preserved; the fork spends a workspace slot");
-            println!(
-                "  the fork's owner biscuit saved: {} (0600)",
-                token_path.display()
-            );
-        }
+        WsCommand::Fork { id, snapshot, name } => fork(ctx, id, 1, snapshot, name).await,
         WsCommand::Rewind {
             id,
             snapshot,
             preserved_name,
         } => {
-            let presented = tokenfile::read_token(&token_path)?;
-            let rewound = client
-                .rewind(&id, &presented, &snapshot, preserved_name.as_deref())
-                .await?;
-            println!(
-                "rewound: {id} now resumes from {} (log_seq={})",
-                rewound.head_snapshot, rewound.head_log_seq
+            let biscuit = ctx.biscuit(&id).await?;
+            let rewound = ctx
+                .client()
+                .rewind(&id, &biscuit, &snapshot, preserved_name.as_deref())
+                .await
+                .map_err(|e| CliError::from_api(&e, Some(&id)))?;
+            ctx.emit(
+                json!({
+                    "id": id,
+                    "head": { "snapshot": rewound.head_snapshot },
+                    "preserved_fork": { "workspace": rewound.preserved_fork, "name": rewound.preserved_fork_name },
+                }),
+                &[
+                    format!("{id} now resumes from {}.", rewound.head_snapshot),
+                    format!(
+                        "  the forward history is preserved as {} ({}).",
+                        rewound.preserved_fork, rewound.preserved_fork_name
+                    ),
+                ],
             );
-            println!(
-                "  forward history preserved as {} ({})",
-                rewound.preserved_fork, rewound.preserved_fork_name
-            );
-        }
-        WsCommand::Exec {
-            id,
-            cwd,
-            env,
-            timeout_ms,
-            api_key,
-            stdin,
-            argv,
-        } => {
-            let mut envs = std::collections::BTreeMap::new();
-            for pair in &env {
-                let (k, v) = pair
-                    .split_once('=')
-                    .with_context(|| format!("--env expects NAME=VALUE, got {pair:?}"))?;
-                envs.insert(k.to_owned(), v.to_owned());
-            }
-            // The saved Biscuit is read ONLY when no key was given, so a
-            // caller on a machine with no token file — which is every API
-            // caller — never trips over a missing one.
-            let presented;
-            let auth = match api_key.as_deref() {
-                Some(k) => crate::api::ExecAuth::ApiKey(k),
-                None => {
-                    presented = tokenfile::read_token(&token_path)?;
-                    crate::api::ExecAuth::Biscuit(&presented)
-                }
-            };
-            // Local stdin, read to EOF BEFORE the request: the exec route
-            // takes stdin as one field, not a stream.
-            let stdin_b64 = if stdin {
-                let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)
-                    .context("reading stdin for --stdin")?;
-                Some(BASE64.encode(buf))
-            } else {
-                None
-            };
-            use std::io::Write as _;
-            let spec = crate::api::ExecSpec {
-                argv: &argv,
-                cwd: cwd.as_deref(),
-                env: &envs,
-                timeout_ms,
-                stdin_b64,
-            };
-            let end = client
-                .exec(&id, auth, &spec, |fd, bytes| {
-                    // stdout to stdout and stderr to stderr, unmerged all
-                    // the way to the terminal: a caller diffing build
-                    // output against warnings cannot un-merge them, and
-                    // this is the last place they could be merged.
-                    if fd == 2 {
-                        let _ = std::io::stderr().write_all(bytes);
-                        let _ = std::io::stderr().flush();
-                    } else {
-                        let _ = std::io::stdout().write_all(bytes);
-                        let _ = std::io::stdout().flush();
-                    }
-                })
-                .await?;
-
-            if end.get("timed_out").and_then(|v| v.as_bool()) == Some(true) {
-                eprintln!("reachpad: the command TIMED OUT and was killed");
-            }
-            if end.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
-                eprintln!("reachpad: output was TRUNCATED at the entitlement cap");
-            }
-            if let Some(err) = end.get("error").and_then(|v| v.as_str()) {
-                let detail = end.get("detail").and_then(|v| v.as_str()).unwrap_or("");
-                eprintln!("reachpad: exec did not produce a result: {err} {detail}");
-                return Ok(70); // EX_SOFTWARE: not the command's code
-            }
-            // EXIT WITH THE COMMAND'S OWN CODE, so this composes in a script.
-            // A signal is NOT an exit code (§42.1: a policy and a failure must
-            // not be the same value), so a killed command reports 128+n the
-            // way a shell does rather than inventing one.
-            return Ok(match end.get("exit_code").and_then(|v| v.as_i64()) {
-                Some(code) => code as i32,
-                None => {
-                    let sig = end.get("signal").and_then(|v| v.as_str()).unwrap_or("?");
-                    eprintln!("reachpad: killed by {sig}");
-                    137
-                }
-            });
+            Ok(EXIT_OK)
         }
         WsCommand::Release {
             id,
             fencing_token,
             discard,
         } => {
-            let saved = tokenfile::load_attach_state(&token_path, &id);
-            let fencing_token = fencing_token
-                .or(saved.as_ref().map(|s| s.fencing_token))
-                .context("no --fencing-token given and no saved attach state for this workspace")?;
-            let presented = tokenfile::read_token(&token_path)?;
-            let released = client
-                .release(&id, &presented, fencing_token, discard)
-                .await?;
-            if released {
-                println!(
-                    "released: workspace={id} fencing_token={fencing_token} \
-                     (DISCARDED: everything since the last seal is gone)"
-                );
+            let workspace = ctx.workspace(id)?;
+            let held = ctx.authority(&workspace).await?;
+            let fencing_token = match fencing_token {
+                Some(t) => t,
+                None => resolve_fencing_token(ctx, &workspace, &held).await?,
+            };
+            let released = ctx
+                .client()
+                .release(&workspace, held.auth(), fencing_token, discard)
+                .await
+                .map_err(|e| CliError::from_api(&e, Some(&workspace)))?;
+            let human = if released.released {
+                format!("{workspace} stopped; everything since the last save is gone.")
             } else {
-                println!("release ordered: workspace={id} fencing_token={fencing_token}");
-                println!(
-                    "  the node seals first (disk; memory when cleanly pausable), then \
-                     stops the VM; the lease ends when it stops renewing. The next \
-                     attach resumes from that seal. Use --discard to skip the seal."
-                );
-            }
+                format!("{workspace} is saving disk and memory, then it stops.")
+            };
+            ctx.emit(
+                json!({
+                    "id": workspace,
+                    "released": released.released,
+                    "sealing": released.sealing,
+                }),
+                &[human],
+            );
+            Ok(EXIT_OK)
         }
         WsCommand::Lineage { id } => {
-            let presented = tokenfile::read_token(&token_path)?;
-            let lineage = client.lineage(&id, &presented).await?;
-            println!("workspace={id}");
+            let workspace = ctx.workspace(id)?;
+            let held = ctx.authority(&workspace).await?;
+            let lineage = ctx
+                .client()
+                .lineage(&workspace, held.auth())
+                .await
+                .map_err(|e| CliError::from_api(&e, Some(&workspace)))?;
+            let head_id = lineage.head.as_ref().map(|h| h.id.clone());
+            let mut human = vec![format!("workspace={workspace}")];
             match &lineage.head {
-                Some(head) => {
-                    println!(
-                        "  resumes from: {} (kind={}{} log_seq={})",
-                        head.id,
-                        head.kind,
-                        head.pool_id
-                            .as_ref()
-                            .map(|p| format!(" pool={p}"))
-                            .unwrap_or_default(),
-                        head.log_seq
-                    );
+                Some(head) => human.push(format!(
+                    "  resumes from: {} (kind={} log_seq={})",
+                    head.id, head.kind, head.log_seq
+                )),
+                None => {
+                    human.push("  resumes from: nothing (never saved — a fresh boot)".to_owned())
                 }
-                None => println!("  resumes from: nothing (never sealed — a fresh boot)"),
             }
-            if lineage.snapshots.is_empty() {
-                println!("  snapshots: none");
-            } else {
-                // Oldest first, head marked — this list is what `ws rewind
-                // --snapshot` is driven from.
-                println!("  snapshots (oldest first; pick one for `ws rewind --snapshot`):");
-                let head_id = lineage.head.as_ref().map(|h| h.id.as_str());
-                for s in &lineage.snapshots {
-                    println!(
-                        "    {}  kind={} log_seq={} sealed_at_ms={}{}",
-                        s.id,
-                        s.kind,
-                        s.log_seq,
-                        s.sealed_at_ms,
-                        if Some(s.id.as_str()) == head_id {
-                            "  <- head"
-                        } else {
-                            ""
-                        }
-                    );
-                }
+            for s in &lineage.snapshots {
+                human.push(format!(
+                    "    {}  kind={} log_seq={} sealed_at_ms={}{}",
+                    s.id,
+                    s.kind,
+                    s.log_seq,
+                    s.sealed_at_ms,
+                    if Some(&s.id) == head_id.as_ref() {
+                        "  <- head"
+                    } else {
+                        ""
+                    }
+                ));
             }
             if !lineage.forks.is_empty() {
-                println!("  forks: {}", lineage.forks.join(" "));
+                human.push(format!("  forks: {}", lineage.forks.join(" ")));
             }
+            ctx.emit(
+                json!({
+                    "id": workspace,
+                    "head": lineage.head.as_ref().map(|h| json!({ "snapshot": h.id, "kind": h.kind })),
+                    "snapshots": lineage.snapshots.iter().map(|s| json!({
+                        "snapshot": s.id, "kind": s.kind, "sealed_at": render::time(s.sealed_at_ms),
+                    })).collect::<Vec<_>>(),
+                    "forks": lineage.forks,
+                }),
+                &human,
+            );
+            Ok(EXIT_OK)
         }
-        WsCommand::Archive { id } => {
-            let presented = tokenfile::read_token(&token_path)?;
-            let at = client.archive(&id, &presented).await?;
-            println!("archived: workspace={id} archived_at_ms={at}");
-            println!("  no data is deleted immediately; archived state follows managed retention");
-        }
+        WsCommand::Archive { id } => archive(ctx, id).await,
         WsCommand::Token {
             id,
             user,
             principal,
             idp_assertion,
         } => {
-            let (user, identity) =
-                user_identity(&client, &token_path, user, &principal, idp_assertion).await?;
-            let (biscuit, expires_at_ms) = client.workspace_token(&id, &user, &identity).await?;
-            // Saved, because a token nobody stored is a token that has to be
-            // fetched again for the very next command.
-            tokenfile::write_token(&token_path, &biscuit)?;
-            println!("workspace token: {id} (user={user})");
-            println!("  owner biscuit saved: {} (0600)", token_path.display());
-            println!("  valid until {expires_at_ms} (ms since epoch)");
+            let (user, identity) = user_identity(
+                ctx,
+                Some(Claimed {
+                    user,
+                    principal,
+                    idp_assertion,
+                }),
+            )
+            .await?;
+            let (biscuit, expires_at_ms) = ctx
+                .client()
+                .workspace_token(&id, &user, &identity)
+                .await
+                .map_err(|e| CliError::from_api(&e, Some(&id)))?;
+            ctx.remember(&id, &biscuit, Some(expires_at_ms))?;
+            ctx.emit(
+                json!({ "id": id, "expires_at": render::time(expires_at_ms) }),
+                &[format!(
+                    "{id}: access refreshed, valid until {}.",
+                    render::rfc3339(expires_at_ms)
+                )],
+            );
+            Ok(EXIT_OK)
         }
     }
-    // Every `ws` verb but `exec` exits 0; `exec` returned the command's OWN
-    // exit code above, which is what makes it composable in a script — a
-    // wrapper that always exits 0 turns every failure into a silent success.
-    Ok(0)
 }
 
-async fn run_share(
-    controld: &str,
-    trust: crate::transport::TlsTrust,
-    token_b64: &str,
-    workspace: &str,
-    role: crate::cli::RoleArg,
-    expires_at_ms: u64,
-    grantee: &str,
-) -> anyhow::Result<()> {
-    // Server-side: the grant row + server-minted share token (§8 flow 7).
-    let client = Client::with_trust(controld, trust);
-    let share = client
-        .grant(workspace, token_b64, grantee, role.as_str(), expires_at_ms)
-        .await?;
-    println!(
-        "grant created: workspace={workspace} grantee={grantee} role={} expires_at_ms={}",
-        share.role, share.expires_at_ms
-    );
-    println!("server share token:");
-    println!("  {}", share.share_token_b64);
-
-    // Offline: the SAME narrowing computed locally with authz::attenuate —
-    // no server, no root key (§7.2: a share link IS an attenuated token;
-    // appended blocks carry only checks, so narrowing is all they can do).
-    let local = authz::TokenBytes::from_vec(
-        BASE64
-            .decode(token_b64.trim())
-            .context("local token is not valid base64")?,
-    );
-    let narrowed = authz::attenuate(&local, role.as_authz(), expires_at_ms)
-        .context("offline attenuation failed")?;
-    println!("offline attenuated token (authz::attenuate on your local token — §7.2:");
-    println!("attenuation can only narrow; no server mint is needed for narrowing):");
-    println!("  {}", BASE64.encode(narrowed.as_bytes()));
-    Ok(())
+/// The fencing token a v0.1.0 `ws release` needs: the saved one, else the one
+/// the state route reports to a caller authorized to write.
+async fn resolve_fencing_token(ctx: &Ctx, workspace: &str, held: &Held) -> Result<u64, CliError> {
+    if let Some(token) = state::load_workspace(&ctx.paths, workspace)?.fencing_token {
+        return Ok(token);
+    }
+    let status = read_status(ctx, workspace, held).await?;
+    status
+        .lease
+        .as_ref()
+        .and_then(|l| l.fencing_token)
+        .ok_or_else(|| CliError::from_code("no_active_lease", Some(workspace)))
 }
 
-async fn run_tail_command(
-    hub: &str,
-    workspace: &str,
-    token: &[u8],
-    options: TailOptions,
-) -> anyhow::Result<()> {
-    let mut session = TailSession::connect_with(hub, workspace, token, options).await?;
-    // M0 debt 5 closed: the negotiated ServerHello is consumed, not
-    // ignored — version, capabilities, incarnation, watermarks.
+/// `ws attach`: place the lease, then say where it landed.
+async fn attach_lease(ctx: &Ctx, workspace: &str) -> Result<i32, CliError> {
+    let presented = ctx.biscuit(workspace).await?;
+    let attach = ctx
+        .client()
+        .attach(workspace, &presented)
+        .await
+        .map_err(|e| CliError::from_api(&e, Some(workspace)))?;
+    ctx.remember(workspace, &attach.biscuit_b64, None)?;
+    let mut cache = state::load_workspace(&ctx.paths, workspace)?;
+    cache.node = Some(attach.node.clone());
+    cache.fencing_token = Some(attach.fencing_token);
+    state::save_workspace(&ctx.paths, workspace, &cache)?;
+    ctx.emit(
+        json!({
+            "id": workspace,
+            "lease": { "node": attach.node, "expires_at": render::time(attach.expires_at_ms) },
+        }),
+        &[
+            format!("attached: workspace={workspace}"),
+            format!("  node:          {}", attach.node),
+            format!("  fencing_token: {}", attach.fencing_token),
+        ],
+    );
+    Ok(EXIT_OK)
+}
+
+struct AttachSpec {
+    workspace: Option<String>,
+    pty: u32,
+    new: bool,
+    list: bool,
+    no_place: bool,
+    linger_ms: u64,
+    no_raw: bool,
+    wait_for_node_ms: u64,
+}
+
+async fn attach_command(ctx: &Ctx, spec: AttachSpec) -> Result<i32, CliError> {
+    let workspace = ctx.workspace(spec.workspace)?;
+    if !spec.no_place {
+        attach_lease(ctx, &workspace).await?;
+    }
+    let token = BASE64
+        .decode(ctx.biscuit(&workspace).await?.trim())
+        .map_err(|_| CliError::from_code("bad_token_encoding", Some(&workspace)))?;
+    let options = crate::attach::AttachOptions {
+        pty: spec.pty,
+        open_new: spec.new,
+        trust: ctx.trust.clone(),
+        linger: std::time::Duration::from_millis(spec.linger_ms),
+        no_raw: spec.no_raw,
+        wait_for_node: std::time::Duration::from_millis(spec.wait_for_node_ms),
+    };
+    if spec.list {
+        let roster = crate::attach::list_ptys(&ctx.hub, &workspace, &token, &options).await?;
+        match roster.as_slice() {
+            [] => println!("no live PTYs (the guest reported an empty roster)"),
+            ptys => {
+                for p in ptys {
+                    println!("pty {p}");
+                }
+            }
+        }
+        return Ok(EXIT_OK);
+    }
+    let summary = crate::attach::attach(&ctx.hub, &workspace, &token, &options).await?;
+    // stderr, so a scripted run can pipe the workspace's own output on stdout
+    // without this getting mixed in.
+    eprintln!(
+        "detached: {} byte(s) sent, {} byte(s) received in {} ms; durable through seq={}",
+        summary.bytes_sent, summary.bytes_received, summary.duration_ms, summary.durable_through,
+    );
+    Ok(EXIT_OK)
+}
+
+async fn tail_command(ctx: &Ctx, workspace: Option<String>) -> Result<i32, CliError> {
+    let workspace = ctx.workspace(workspace)?;
+    let token = BASE64
+        .decode(ctx.biscuit(&workspace).await?.trim())
+        .map_err(|_| CliError::from_code("bad_token_encoding", Some(&workspace)))?;
+    let mut session = TailSession::connect_with(
+        &ctx.hub,
+        &workspace,
+        &token,
+        TailOptions {
+            trust: ctx.trust.clone(),
+            since: None,
+        },
+    )
+    .await?;
     eprintln!(
         "tailing {workspace} (protocol v{}, hub incarnation {}, durable watermarks {}; ctrl-c to stop)",
         session.version(),
@@ -883,15 +2105,91 @@ async fn run_tail_command(
                 }
                 None => {
                     eprintln!("hub closed the stream");
-                    return Ok(());
+                    return Ok(EXIT_OK);
                 }
             },
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::signal::ctrl_c() => return Ok(EXIT_OK),
         }
     }
 }
 
-fn print_inspection(i: &inspect::Inspection) {
+async fn share(
+    ctx: &Ctx,
+    workspace: Option<String>,
+    role: cli::GrantRoleArg,
+    expires_in: u64,
+    grantee: &str,
+) -> Result<i32, CliError> {
+    let workspace = ctx.workspace(workspace)?;
+    let token_b64 = ctx.biscuit(&workspace).await?;
+    let expires_at_ms = wall_now_ms().saturating_add(expires_in);
+    let share = ctx
+        .client()
+        .grant(
+            &workspace,
+            &token_b64,
+            grantee,
+            role.as_str(),
+            expires_at_ms,
+        )
+        .await
+        .map_err(|e| CliError::from_api(&e, Some(&workspace)))?;
+    // The SAME narrowing computed locally (§7.2: a share link IS an
+    // attenuated token; appended blocks carry only checks, so narrowing is
+    // all they can do).
+    let local = authz::TokenBytes::from_vec(
+        BASE64
+            .decode(token_b64.trim())
+            .map_err(|_| CliError::from_code("bad_token_encoding", Some(&workspace)))?,
+    );
+    let narrowed = authz::attenuate(&local, role.as_authz(), expires_at_ms)
+        .map_err(|e| CliError::usage(format!("offline attenuation failed: {e}")))?;
+    ctx.emit(
+        json!({
+            "workspace": workspace,
+            "grantee": grantee,
+            "role": share.role,
+            "expires_at": render::time(share.expires_at_ms),
+            "share_token": share.share_token_b64,
+        }),
+        &[
+            format!(
+                "grant created: workspace={workspace} grantee={grantee} role={}",
+                share.role
+            ),
+            format!("server share token:\n  {}", share.share_token_b64),
+            format!(
+                "offline attenuated token (authz::attenuate, §7.2):\n  {}",
+                BASE64.encode(narrowed.as_bytes())
+            ),
+        ],
+    );
+    Ok(EXIT_OK)
+}
+
+async fn credits(ctx: &Ctx) -> Result<i32, CliError> {
+    let identity = ctx.identity().await?;
+    let balance = ctx
+        .client()
+        .credit_balance(&identity.user_id, &identity.identity_token)
+        .await
+        .map_err(|e| CliError::from_api(&e, None))?;
+    let credits = format!(
+        "{}.{:03}",
+        balance.balance_millicredits / 1_000,
+        balance.balance_millicredits % 1_000
+    );
+    ctx.emit(
+        json!({ "balance": credits, "unit": balance.unit }),
+        &[
+            format!("{credits} compute credits"),
+            "1 credit = 1 active standard-workspace minute".to_owned(),
+        ],
+    );
+    Ok(EXIT_OK)
+}
+
+fn print_inspection(i: &crate::inspect::Inspection) {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "<absent>".to_owned());
     println!("token facts (offline print — parsed, NOT verified):");
     println!("  principal: {}", show(&i.principal));
@@ -911,23 +2209,106 @@ fn print_inspection(i: &inspect::Inspection) {
 }
 
 #[cfg(test)]
-mod onboarding_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn bare_command_only_onboards_an_interactive_terminal() {
+    fn a_shell_line_is_wrapped_and_an_argv_is_not() {
         assert_eq!(
-            onboarding_action(false, false),
-            OnboardingAction::RefuseNonInteractive
+            resolve_argv("ws-1", Some("cd /repo && make".to_owned()), Vec::new()).unwrap(),
+            vec!["sh", "-lc", "cd /repo && make"]
         );
         assert_eq!(
-            onboarding_action(false, true),
-            OnboardingAction::RefuseNonInteractive
+            resolve_argv("ws-1", None, vec!["cargo".into(), "test".into()]).unwrap(),
+            vec!["cargo", "test"]
         );
+        // One argument that is not a program: refused, naming BOTH corrected
+        // forms rather than guessing which was meant.
+        let err = resolve_argv("ws-1", None, vec!["echo hi".into()]).unwrap_err();
+        assert_eq!(err.exit_code, EXIT_USAGE);
+        assert!(
+            err.message.contains("reachpad run ws-1 --"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("-s \"echo hi\""), "{}", err.message);
+        // A single program with no arguments is a program.
         assert_eq!(
-            onboarding_action(true, false),
-            OnboardingAction::SignInThenList
+            resolve_argv("ws-1", None, vec!["/bin/true".into()]).unwrap(),
+            vec!["/bin/true"]
         );
-        assert_eq!(onboarding_action(true, true), OnboardingAction::List);
+        // Nothing at all names both forms too.
+        let err = resolve_argv("ws-1", None, Vec::new()).unwrap_err();
+        assert!(err.message.contains("-s"), "{}", err.message);
+        // Both spellings at once is a question nobody should have to answer.
+        assert!(resolve_argv("ws-1", Some("x".into()), vec!["y".into()]).is_err());
+    }
+
+    /// A wait must outlast the thing it waits for: a workspace still sealing
+    /// gets the server's own bound, not the user's ten minutes.
+    #[test]
+    fn a_save_in_progress_outranks_the_users_timeout() {
+        let started = 1_000_000;
+        assert_eq!(wait_deadline(started, 1_000, "running"), started + 1_000);
+        let sealing = wait_deadline(started, 1_000, "sealing");
+        assert_eq!(
+            sealing,
+            started + SEAL_BUDGET_MS + LEASE_TTL_MS + SEAL_MARGIN_MS
+        );
+        assert!(sealing > started + 600_000, "shorter than the seal budget");
+        // A longer timeout is still honored: the extension is a floor.
+        assert_eq!(
+            wait_deadline(started, 3_600_000, "sealing"),
+            started + 3_600_000
+        );
+    }
+
+    /// The two timeouts say different things, because they mean different
+    /// things: one workspace is working, the other is not.
+    #[test]
+    fn the_two_wait_refusals_are_told_apart() {
+        let sealing =
+            CliError::from_body("still_sealing", &json!({ "waited_s": 700 }), Some("ws-1"));
+        assert!(
+            sealing.message.contains("still saving"),
+            "{}",
+            sealing.message
+        );
+        assert!(sealing.message.contains("700s"), "{}", sealing.message);
+        let gave_up = CliError::from_body(
+            "wait_timeout",
+            &json!({ "waited_s": 10, "state": "running", "target": "paused" }),
+            Some("ws-1"),
+        );
+        assert!(gave_up.message.contains("Gave up"), "{}", gave_up.message);
+        assert!(
+            gave_up.message.contains("not paused"),
+            "{}",
+            gave_up.message
+        );
+        assert_eq!(sealing.exit_code, errors::EXIT_UNAVAILABLE);
+        assert_eq!(gave_up.exit_code, errors::EXIT_UNAVAILABLE);
+    }
+
+    /// The safety property of first-run onboarding: a browser sign-in is a
+    /// side effect nobody typed, so ONLY a terminal may trigger one. A pipe
+    /// keeps the v0.1.0 usage refusal whether or not a credential exists.
+    #[test]
+    fn a_bare_reachpad_only_onboards_an_interactive_terminal() {
+        assert_eq!(onboarding_action(false, false), Onboarding::Refuse);
+        assert_eq!(onboarding_action(false, true), Onboarding::Refuse);
+        assert_eq!(onboarding_action(true, false), Onboarding::SignInThenList);
+        assert_eq!(onboarding_action(true, true), Onboarding::List);
+    }
+
+    /// A bare invocation is rendered as a listing, so `reachpad --json` on a
+    /// signed-in terminal emits the same envelope `reachpad list --json` does
+    /// rather than a second, undocumented shape.
+    #[test]
+    fn onboarding_reports_itself_as_the_list_command() {
+        assert_eq!(
+            command_name(&Command::List { state: None }),
+            "workspace.list"
+        );
     }
 }

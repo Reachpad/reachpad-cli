@@ -57,6 +57,13 @@ pub fn operator_path(token_path: &Path) -> PathBuf {
 /// Existence is enough here. An empty or unreadable file is deliberately not
 /// treated as signed out, because replacing a damaged credential without
 /// naming the damage would hide the state the user needs to repair.
+///
+/// **This asks the v0.1.1 token file, which is no longer where a sign-in is
+/// kept.** It stays as the definition of that older layout, next to the rest
+/// of this module. The live question — "is this machine signed in?" — is
+/// answered by [`crate::conf::load_credential`] against `credentials.toml`,
+/// and first-run onboarding asks it there; the ruling in the paragraph above
+/// travels with it (an unreadable credential raises, it does not re-sign-in).
 pub fn operator_token_exists(token_path: &Path) -> anyhow::Result<bool> {
     let path = operator_path(token_path);
     path.try_exists()
@@ -199,6 +206,11 @@ pub struct ConnectionConfig {
 
 /// Save the non-secret endpoint pair beside the credential. It is still 0600
 /// because a single file mode for the credential set is easier to audit.
+///
+/// v1 does not write this file — a sign-in saves `[endpoint]` in `config.toml`
+/// (`conf.rs`) instead. The writer stays so the v0.1.1 format has ONE
+/// definition next to the reader `state::migrate_v0_files` needs, and so the
+/// round-trip test below can still prove that definition.
 pub fn write_connection_config(token_path: &Path, config: &ConnectionConfig) -> anyhow::Result<()> {
     let mut json = serde_json::to_vec_pretty(config)?;
     json.push(b'\n');

@@ -34,6 +34,29 @@ pub const DURABLE_THROUGH_PREFIX: &str = "durable-through:";
 /// Server→client capability naming the hub process incarnation.
 pub const INCARNATION_CAP_PREFIX: &str = "incarnation=";
 
+/// Capability offered to say this client can be handed committed history
+/// before the live tail (hub's `REPLAY_CAP`). A hub that predates replay does
+/// not echo it, which is the ONLY way to tell a replay from a live-only
+/// stream — so its absence is a refusal, never a downgrade.
+pub const REPLAY_CAP: &str = "replay";
+
+/// Client→server capability carrying the highest seq already seen; the replay
+/// starts at `since + 1` (hub's `SINCE_CAP_PREFIX`).
+pub const SINCE_CAP_PREFIX: &str = "since=";
+
+/// Server→client capability naming the seq the hub will ACTUALLY start from,
+/// after clamping to what this workspace's own log can answer.
+pub const REPLAY_FROM_CAP_PREFIX: &str = "replay-from=";
+
+/// Read the replay start back out of a `ServerHello` capability.
+#[must_use]
+pub fn parse_replay_from(capability: &str) -> Option<u64> {
+    capability
+        .strip_prefix(REPLAY_FROM_CAP_PREFIX)?
+        .parse()
+        .ok()
+}
+
 /// Read a watermark control message (`durable-through:<N>`).
 #[must_use]
 pub fn parse_durable_through(transition: &str) -> Option<u64> {
@@ -52,6 +75,9 @@ pub struct TailEvent {
     pub type_code: u32,
     pub type_name: &'static str,
     pub summary: String,
+    /// A `notify`'s own text (ADR-0064): the agent sent it to be READ, so it
+    /// travels unescaped and unsummarized. Every other type has none.
+    pub notify_text: Option<String>,
 }
 
 impl TailEvent {
@@ -63,7 +89,15 @@ impl TailEvent {
             type_code: event.r#type,
             type_name: type_name(event.r#type),
             summary: summarize(event.r#type, &event.payload),
+            notify_text: (event.r#type == events::NOTIFY)
+                .then(|| String::from_utf8_lossy(&event.payload).into_owned()),
         }
+    }
+
+    /// What one line about this event says.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        self.notify_text.as_deref().unwrap_or(&self.summary)
     }
 }
 
@@ -217,6 +251,9 @@ pub struct TailOptions {
     /// [`TlsTrust`] `attach` and the control plane use: one trust decision
     /// per invocation, applied to every connection it opens.
     pub trust: crate::transport::TlsTrust,
+    /// Replay everything committed after this seq before the live tail.
+    /// `None` is a live-only session, which every hub understands.
+    pub since: Option<u64>,
 }
 
 /// An established tail session: handshake done, events channel open and
@@ -229,6 +266,7 @@ pub struct TailSession {
     capabilities: BTreeSet<String>,
     incarnation: Option<String>,
     watermarks: bool,
+    replay_from: Option<u64>,
     durable_through: Option<u64>,
 }
 
@@ -250,10 +288,20 @@ impl TailSession {
 
         // 1. ClientHello on ctl (Biscuit + workspace; capability strings the
         //    server does not know are ignored, never fatal — §6).
+        //
+        //    A replay is asked for with TWO strings: `replay`, which comes
+        //    back through the ordinary intersection and so proves the hub
+        //    understood, and `since=<N>`, which carries the number and is
+        //    never echoed.
+        let mut caps = vec!["live-tail".to_owned(), DURABLE_WATERMARK_CAP.to_owned()];
+        if let Some(since) = options.since {
+            caps.push(REPLAY_CAP.to_owned());
+            caps.push(format!("{SINCE_CAP_PREFIX}{since}"));
+        }
         let hello = handshake::client_hello(
             PROTOCOL_VERSION,
             PROTOCOL_VERSION,
-            ["live-tail", DURABLE_WATERMARK_CAP],
+            caps,
             token.to_vec(),
             workspace.as_bytes().to_vec(),
         );
@@ -284,6 +332,10 @@ impl TailSession {
             .find_map(|c| c.strip_prefix(INCARNATION_CAP_PREFIX))
             .map(str::to_owned);
         let watermarks = capabilities.contains(DURABLE_WATERMARK_CAP);
+        let replay_from = server
+            .capabilities
+            .iter()
+            .find_map(|c| parse_replay_from(c));
 
         // 3. Propose the events channel on ctl; wait for its ack.
         let mut channels = ChannelMap::new();
@@ -326,6 +378,7 @@ impl TailSession {
             capabilities,
             incarnation,
             watermarks,
+            replay_from,
             durable_through: None,
         })
     }
@@ -356,6 +409,21 @@ impl TailSession {
         self.watermarks
     }
 
+    /// Did the hub echo `replay`? A hub that predates replay does not, and a
+    /// client that asked for one must refuse rather than read the live tail
+    /// and call it history.
+    #[must_use]
+    pub fn supports_replay(&self) -> bool {
+        self.capabilities.contains(REPLAY_CAP)
+    }
+
+    /// The seq the hub said it would actually start replaying from, clamped
+    /// to what this workspace's own log covers.
+    #[must_use]
+    pub fn replay_from(&self) -> Option<u64> {
+        self.replay_from
+    }
+
     /// Highest `durable through` seq seen so far: everything at or below it
     /// is in the store; `None` until the first watermark arrives.
     #[must_use]
@@ -371,6 +439,19 @@ impl TailSession {
             let Some(frame) = self.transport.recv_frame().await? else {
                 return Ok(None);
             };
+            // A ctl `ChannelAck{accepted:false}` is how hub says it CLOSED
+            // this stream — a subscriber that lagged past the buffer, or a
+            // replay it could not answer contiguously (I3). v0.1.0 skipped
+            // every non-events frame, so that ack was discarded and the tail
+            // hung forever believing it was alive.
+            if frame.channel == proto::framing::channel::CTL {
+                if let Ok(ack) = codec::decode_message::<wire::ChannelAck>(&frame) {
+                    if ack.channel == u32::from(self.events_channel) && !ack.accepted {
+                        anyhow::bail!("hub closed the event stream: {}", ack.error);
+                    }
+                }
+                continue;
+            }
             if frame.channel != self.events_channel {
                 continue;
             }
@@ -471,6 +552,7 @@ mod tests {
             type_code: events::PRESENCE_JOIN,
             type_name: "presence.join",
             summary: "principal=dev-principal display=owner".into(),
+            notify_text: None,
         };
         let line = ev.to_string();
         assert!(line.contains("seq=3"), "{line}");

@@ -1,137 +1,297 @@
-//! Read-only diagnostics for the local CLI installation and account session.
+//! `reachpad doctor` — read-only diagnostics for this installation.
+//!
+//! Every check answers one question a broken install raises, in the order a
+//! command hits them: is the binary the one PATH resolves, is the endpoint
+//! safe, is the credential there and private, and does the fleet actually
+//! accept it. No check here writes or repairs anything — a diagnostic that
+//! changes state cannot be run twice to see whether something changed. (The
+//! one write that can happen during a `doctor` run is the v0.1.0 credential
+//! migration every command performs on startup, which announces itself.)
+//!
+//! No credential VALUE is ever printed: presence, file mode, and the server's
+//! answer are the whole story, and none of those require echoing a secret.
 
 use std::path::Path;
 
-use crate::api::Client;
-use crate::self_update::{install_source, InstallSource};
-use crate::{cli_auth, tokenfile, transport::TlsTrust};
+use serde_json::json;
 
+use crate::commands::Ctx;
+use crate::conf;
+use crate::errors::{CliError, EXIT_OK};
+use crate::self_update::{install_source, InstallSource};
+
+/// One line of the report. `ok: false` is a finding, not an error: doctor's
+/// job is to print all of them, so no single failed check may end the run.
+struct Check {
+    name: &'static str,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Default)]
 struct Report {
-    failures: usize,
+    checks: Vec<Check>,
 }
 
 impl Report {
-    fn ok(&self, name: &str, detail: impl std::fmt::Display) {
-        println!("[ok]   {name}: {detail}");
+    fn ok(&mut self, name: &'static str, detail: impl std::fmt::Display) {
+        self.checks.push(Check {
+            name,
+            ok: true,
+            detail: detail.to_string(),
+        });
     }
 
-    fn fail(&mut self, name: &str, detail: impl std::fmt::Display) {
-        self.failures += 1;
-        println!("[fail] {name}: {detail}");
+    fn fail(&mut self, name: &'static str, detail: impl std::fmt::Display) {
+        self.checks.push(Check {
+            name,
+            ok: false,
+            detail: detail.to_string(),
+        });
+    }
+
+    fn failures(&self) -> usize {
+        self.checks.iter().filter(|c| !c.ok).count()
     }
 }
 
-pub async fn run(
-    controld: &str,
-    hub: &str,
-    trust: TlsTrust,
-    token_path: &Path,
-) -> anyhow::Result<i32> {
-    let mut report = Report { failures: 0 };
-    let executable = std::env::current_exe();
+pub(crate) async fn run(ctx: &Ctx) -> Result<i32, CliError> {
+    let mut report = Report::default();
 
     report.ok("version", env!("CARGO_PKG_VERSION"));
-    match &executable {
+    match std::env::current_exe() {
         Ok(path) => {
-            let source = match install_source(path) {
-                InstallSource::Homebrew => "Homebrew",
-                InstallSource::Development => "Cargo development build",
-                InstallSource::Native => "native installer",
-            };
-            report.ok("binary", format!("{} ({source})", path.display()));
-            if executable_is_on_path(path) {
-                report.ok("PATH", "reachpad resolves to this binary");
+            let source = install_source(&path);
+            report.ok("binary", format!("{} ({})", path.display(), owner(source)));
+            if executable_is_on_path(&path) {
+                report.ok("path", "`reachpad` resolves to this binary");
             } else {
                 report.fail(
-                    "PATH",
+                    "path",
                     format!(
-                        "{} is not the reachpad resolved through PATH",
+                        "`reachpad` on PATH is not {} — an update would leave the \
+                         other copy in place",
                         path.display()
                     ),
                 );
             }
-            if install_source(path) == InstallSource::Native && !command_on_path("curl") {
-                report.fail("updater", "curl is required by `reachpad update`");
+            if source == InstallSource::Native && !command_on_path("curl") {
+                report.fail(
+                    "updater",
+                    "`reachpad update` needs curl, which is not on PATH",
+                );
             } else {
-                report.ok("updater", "installation source has an update path");
+                report.ok("updater", update_path(source));
             }
         }
         Err(error) => report.fail("binary", error),
     }
 
-    let endpoints_safe = match cli_auth::validate_connection_urls(controld, hub) {
-        Err(error) => {
-            report.fail("endpoints", error);
-            false
-        }
+    // The endpoint this invocation would actually use, after the saved
+    // config and every override — the one a wrong answer here would explain.
+    report.ok("endpoint", &ctx.endpoint);
+    match crate::cli_auth::validate_connection_urls(&ctx.controld, &ctx.hub) {
         Ok(()) => {
-            report.ok("control endpoint", controld);
-            report.ok("workspace endpoint", hub);
-            true
+            report.ok("control plane", &ctx.controld);
+            report.ok("workspace plane", &ctx.hub);
         }
-    };
-
-    let operator_path = tokenfile::operator_path(token_path);
-    let credential = match tokenfile::read_operator_token(token_path) {
-        Ok(credential) => {
-            match private_file(&operator_path) {
-                Ok(()) => report.ok(
-                    "credential file",
-                    format!("{} has mode 0600", operator_path.display()),
-                ),
-                Err(error) => report.fail("credential file", error),
-            }
-            Some(credential)
-        }
-        Err(error) => {
-            report.fail("saved login", error);
-            None
-        }
-    };
-
-    let connection_path = tokenfile::connection_path(token_path);
-    match tokenfile::read_connection_config(token_path) {
-        Ok(Some(saved)) => {
-            match private_file(&connection_path) {
-                Ok(()) => report.ok(
-                    "endpoint file",
-                    format!("{} has mode 0600", connection_path.display()),
-                ),
-                Err(error) => report.fail("endpoint file", error),
-            }
-            if let Err(error) = cli_auth::validate_connection_urls(&saved.controld, &saved.hub) {
-                report.fail("saved endpoints", error);
-            } else {
-                report.ok("saved endpoints", "configuration is safe");
-            }
-        }
-        Ok(None) => report.ok(
-            "endpoint file",
-            "not present; command-line endpoints are active",
-        ),
-        Err(error) => report.fail("endpoint file", error),
+        Err(error) => report.fail("endpoint safety", error),
     }
 
-    if let Some(credential) = credential.filter(|_| endpoints_safe) {
-        let client = Client::with_trust(controld, trust);
-        match client.operator_session(&credential).await {
+    // The config file is read again here rather than taken from the context:
+    // `doctor` is built with a tolerant context precisely so an unparsable
+    // file reaches THIS line and is named, instead of stopping the command.
+    // Permissions first here too, for the same reason as the credential.
+    let config_file = ctx.paths.config_file();
+    if check_mode(&mut report, "config permissions", &config_file) {
+        match conf::load_config(&ctx.paths) {
+            Ok(config) => match config.endpoint {
+                Some(saved) => report.ok("saved endpoint", saved),
+                None => report.ok(
+                    "saved endpoint",
+                    "none saved; the default or an override is in use",
+                ),
+            },
+            Err(error) => report.fail(
+                "config file",
+                format!("{}: {error:#}", config_file.display()),
+            ),
+        }
+    } else {
+        report.fail(
+            "saved endpoint",
+            "not checked: the file's permissions have to be fixed first",
+        );
+    }
+
+    // Permissions FIRST, then content. The credential reader refuses a
+    // world-readable file itself, so asking in the other order would report
+    // one broken file as two independent findings.
+    let credentials_file = ctx.paths.credentials_file();
+    let private = check_mode(&mut report, "credential permissions", &credentials_file);
+    let credential = if !private {
+        report.fail(
+            "credential",
+            "not checked: the file's permissions have to be fixed first",
+        );
+        None
+    } else {
+        match conf::load_credential(&ctx.paths, crate::commands::now_ms()) {
+            Ok(conf::Stored::Present(credential)) => {
+                report.ok("credential", "a saved sign-in is present and unexpired");
+                Some(credential)
+            }
+            Ok(conf::Stored::Missing) => {
+                report.fail("credential", "no saved sign-in; run `reachpad auth login`");
+                None
+            }
+            Ok(conf::Stored::Expired) => {
+                report.fail(
+                    "credential",
+                    "the saved sign-in has expired; run `reachpad auth login`",
+                );
+                None
+            }
+            // Unreadable is NOT the same as absent, and saying so is the
+            // point: "run login" would overwrite the evidence of whatever
+            // went wrong.
+            Err(error) => {
+                report.fail(
+                    "credential",
+                    format!("{}: {error:#}", credentials_file.display()),
+                );
+                None
+            }
+        }
+    };
+
+    // The only check that leaves the machine, and the only one that proves
+    // anything: everything above can be right while the fleet still says no.
+    match credential {
+        Some(credential) => match ctx.client().operator_session(credential.bearer()).await {
             Ok(session) => report.ok(
                 "account",
-                format!(
-                    "authenticated as user={} principal={}",
-                    session.user_id, session.principal_id
-                ),
+                format!("signed in as {} at {}", session.user_id, ctx.endpoint),
             ),
-            Err(error) => report.fail("account", error),
-        }
+            Err(error) => report.fail("account", format!("{error}")),
+        },
+        None => report.fail("account", "not checked: no usable credential"),
     }
 
-    if report.failures == 0 {
-        println!("doctor: all checks passed");
-        Ok(0)
+    let failures = report.failures();
+    let human: Vec<String> = report
+        .checks
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {}: {}",
+                if c.ok { "ok  " } else { "FAIL" },
+                c.name,
+                c.detail
+            )
+        })
+        .chain(std::iter::once(if failures == 0 {
+            "All checks passed.".to_owned()
+        } else {
+            format!("{failures} check(s) failed.")
+        }))
+        .collect();
+    ctx.emit(
+        json!({
+            "checks": report.checks.iter().map(|c| json!({
+                "name": c.name,
+                "ok": c.ok,
+                "detail": c.detail,
+            })).collect::<Vec<_>>(),
+            "failures": failures,
+        }),
+        &human,
+    );
+    // Exit 1, not a coded refusal: nothing was refused. A failing check is a
+    // finding about this machine, and 1 is what a script tests for.
+    Ok(if failures == 0 { EXIT_OK } else { 1 })
+}
+
+fn owner(source: InstallSource) -> &'static str {
+    match source {
+        InstallSource::Homebrew => "installed by Homebrew",
+        InstallSource::Development => "a cargo build in this checkout",
+        InstallSource::Native => "installed by the Reachpad installer",
+    }
+}
+
+fn update_path(source: InstallSource) -> &'static str {
+    match source {
+        InstallSource::Homebrew => "`reachpad update` defers to `brew upgrade --cask reachpad`",
+        InstallSource::Development => "`reachpad update` defers to `cargo build -p reach`",
+        InstallSource::Native => "`reachpad update` can replace this binary",
+    }
+}
+
+/// A missing file is not a permission finding: whether its absence matters
+/// was already decided by the check that looked for its CONTENT, and saying
+/// it twice would make one problem look like two.
+///
+/// Returns whether the file is safe for a later check to READ: a wrong mode
+/// is not, and an absent file trivially is.
+fn check_mode(report: &mut Report, name: &'static str, path: &Path) -> bool {
+    match private_file(path) {
+        Ok(()) => {
+            report.ok(name, format!("{} is 0600", path.display()));
+            true
+        }
+        Err(FileMode::Absent) => {
+            report.ok(name, format!("{} not present", path.display()));
+            true
+        }
+        Err(FileMode::Wrong(mode)) => {
+            report.fail(
+                name,
+                format!(
+                    "{} is {mode:04o}; anyone on this machine can read it. \
+                     Fix with `chmod 600 {}`, and treat what was in it as disclosed.",
+                    path.display(),
+                    path.display()
+                ),
+            );
+            false
+        }
+        Err(FileMode::Unreadable(error)) => {
+            report.fail(name, format!("{}: {error}", path.display()));
+            false
+        }
+    }
+}
+
+enum FileMode {
+    Absent,
+    Wrong(u32),
+    Unreadable(String),
+}
+
+#[cfg(unix)]
+fn private_file(path: &Path) -> Result<(), FileMode> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(FileMode::Absent),
+        Err(error) => return Err(FileMode::Unreadable(error.to_string())),
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode == 0o600 {
+        Ok(())
     } else {
-        println!("doctor: {} check(s) failed", report.failures);
-        Ok(1)
+        Err(FileMode::Wrong(mode))
+    }
+}
+
+#[cfg(not(unix))]
+fn private_file(path: &Path) -> Result<(), FileMode> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(FileMode::Absent),
+        Err(error) => Err(FileMode::Unreadable(error.to_string())),
     }
 }
 
@@ -149,6 +309,9 @@ fn executable_is_on_path(executable: &Path) -> bool {
     executable_is_on_paths(executable, std::env::split_paths(&path))
 }
 
+/// Both sides are canonicalized, so the common install — a symlink in
+/// `~/.local/bin` pointing at the real file — reads as the same binary
+/// rather than a second copy.
 fn executable_is_on_paths(
     executable: &Path,
     paths: impl Iterator<Item = std::path::PathBuf>,
@@ -162,29 +325,6 @@ fn executable_is_on_paths(
             .canonicalize()
             .is_ok_and(|candidate| candidate == expected)
     })
-}
-
-#[cfg(unix)]
-fn private_file(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let metadata =
-        std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode == tokenfile::FILE_MODE {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} has mode {mode:04o}; run `chmod 600 {}`",
-            path.display(),
-            path.display()
-        ))
-    }
-}
-
-#[cfg(not(unix))]
-fn private_file(_path: &Path) -> Result<(), String> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -205,6 +345,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A different binary of the same name earlier on PATH is the failure
+    /// this check exists for: `reachpad update` would update one copy while
+    /// the shell kept running the other.
+    #[test]
+    fn a_different_reachpad_on_path_is_not_this_one() {
+        let dir = std::env::temp_dir().join(format!("reach-doctor-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let running = dir.join("running-reachpad");
+        std::fs::write(&running, b"a").unwrap();
+        std::fs::write(dir.join("reachpad"), b"b").unwrap();
+
+        assert!(!executable_is_on_paths(&running, [dir.clone()].into_iter()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn credential_permission_check_requires_exactly_0600() {
@@ -215,7 +371,8 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(private_file(&path).is_ok());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(private_file(&path).is_err());
-        let _ = std::fs::remove_file(path);
+        assert!(matches!(private_file(&path), Err(FileMode::Wrong(0o644))));
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(private_file(&path), Err(FileMode::Absent)));
     }
 }
