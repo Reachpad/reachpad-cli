@@ -1,9 +1,9 @@
 //! Hand-rolled minimal HTTP/1.1 JSON client, over a tokio `TcpStream` or a
 //! `tokio-rustls` TLS stream on top of one.
 //!
-//! Deliberately not reqwest/hyper: the CLI needs exactly one verb (POST),
-//! JSON bodies with `Content-Length`, and `Connection: close` semantics —
-//! a dependency tree is not warranted for that (§10 posture). Response
+//! Deliberately not reqwest/hyper: the CLI needs a small set of JSON and form
+//! requests with `Content-Length` and `Connection: close` semantics — a
+//! dependency tree is not warranted for that (§10 posture). Response
 //! parsing handles `Content-Length` and `chunked` transfer encoding, which
 //! covers everything axum/hyper emits for the controld API.
 //!
@@ -188,6 +188,37 @@ pub async fn post_json_trust(
     send_json(base_url, "POST", path, Some(body), bearer, trust).await
 }
 
+/// POST an `application/x-www-form-urlencoded` body. WorkOS CLI Auth uses
+/// the OAuth device grant's form encoding rather than JSON; keeping it in this
+/// transport preserves the CLI's one rustls trust posture and avoids adding a
+/// second HTTP stack just for login.
+pub async fn post_form_trust(
+    base_url: &str,
+    path: &str,
+    fields: &[(&str, &str)],
+    trust: &TlsTrust,
+) -> anyhow::Result<Response> {
+    let mut payload = String::new();
+    for (index, (name, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            payload.push('&');
+        }
+        payload.push_str(&form_component(name));
+        payload.push('=');
+        payload.push_str(&form_component(value));
+    }
+    send_payload(
+        base_url,
+        "POST",
+        path,
+        payload.as_bytes(),
+        None,
+        "application/x-www-form-urlencoded",
+        trust,
+    )
+    .await
+}
+
 /// GET `path` (which may carry a query string) and parse the response. Same
 /// confidentiality rule as [`post_json_trust`]: a listing is authorized by a
 /// credential too, so plaintext off-box is refused.
@@ -220,20 +251,42 @@ async fn send_json(
     bearer: Option<&str>,
     trust: &TlsTrust,
 ) -> anyhow::Result<Response> {
-    let endpoint = parse_url(base_url)?;
-    // BEFORE the socket, and before the credential is formatted into bytes.
-    endpoint.ensure_confidential()?;
     let payload = match body {
         Some(body) => serde_json::to_vec(body).context("request body serialization")?,
         None => Vec::new(),
     };
-    let request = request_head(&endpoint, method, path, bearer, payload.len())?;
+    send_payload(
+        base_url,
+        method,
+        path,
+        &payload,
+        bearer,
+        "application/json",
+        trust,
+    )
+    .await
+}
+
+async fn send_payload(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    payload: &[u8],
+    bearer: Option<&str>,
+    content_type: &str,
+    trust: &TlsTrust,
+) -> anyhow::Result<Response> {
+    let endpoint = parse_url(base_url)?;
+    // BEFORE the socket, and before the credential is formatted into bytes.
+    endpoint.ensure_confidential()?;
+    let request =
+        request_head_with_type(&endpoint, method, path, bearer, payload.len(), content_type)?;
 
     let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
         .await
         .with_context(|| format!("connecting to {}", endpoint.authority()))?;
     match endpoint.scheme {
-        Scheme::Plaintext => exchange(tcp, request.as_bytes(), &payload).await,
+        Scheme::Plaintext => exchange(tcp, request.as_bytes(), payload).await,
         Scheme::Tls => {
             let config = trust.client_config(&[HTTP_1_1_ALPN])?;
             let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
@@ -253,7 +306,7 @@ async fn send_json(
                     trust.describe()
                 )
             })?;
-            exchange(tls, request.as_bytes(), &payload).await
+            exchange(tls, request.as_bytes(), payload).await
         }
     }
 }
@@ -267,6 +320,28 @@ fn request_head(
     bearer: Option<&str>,
     content_length: usize,
 ) -> anyhow::Result<String> {
+    request_head_with_type(
+        endpoint,
+        method,
+        path,
+        bearer,
+        content_length,
+        "application/json",
+    )
+}
+
+fn request_head_with_type(
+    endpoint: &Endpoint,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    content_length: usize,
+    content_type: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !content_type.contains(['\r', '\n']),
+        "content type contains a line break"
+    );
     let authorization = match bearer {
         Some(token) => {
             anyhow::ensure!(
@@ -280,13 +355,32 @@ fn request_head(
     Ok(format!(
         "{method} {base}{path} HTTP/1.1\r\n\
          Host: {authority}\r\n\
-         Content-Type: application/json\r\n\
+         Content-Type: {content_type}\r\n\
          {authorization}\
          Content-Length: {content_length}\r\n\
          Connection: close\r\n\r\n",
         base = endpoint.base_path,
         authority = endpoint.authority(),
     ))
+}
+
+fn form_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            b' ' => encoded.push('+'),
+            other => {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(other >> 4)]));
+                encoded.push(char::from(HEX[usize::from(other & 0x0f)]));
+            }
+        }
+    }
+    encoded
 }
 
 /// Write the request, read the whole response (we always send
@@ -700,6 +794,12 @@ mod tests {
         assert!(head.contains("Host: m1.reachpad.dev:443\r\n"));
         assert!(head.contains("Authorization: Bearer rpop1.aaa\r\n"));
         assert!(head.contains("Content-Length: 7\r\n"));
+    }
+
+    #[test]
+    fn oauth_form_encoding_cannot_change_field_boundaries() {
+        assert_eq!(form_component("client_abc"), "client_abc");
+        assert_eq!(form_component("a b&c=d/é"), "a+b%26c%3Dd%2F%C3%A9");
     }
 
     #[test]

@@ -71,6 +71,7 @@ pub struct Attach {
     pub fencing_token: u64,
     pub biscuit_b64: String,
     pub expires_at_ms: u64,
+    pub credits_remaining_millicredits: Option<u64>,
 }
 
 /// What an operator credential exchanges for (ADR-0034): the short-lived
@@ -89,6 +90,13 @@ pub struct Workspace {
     pub id: String,
     pub name: String,
     pub forks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditBalance {
+    pub balance_millicredits: u64,
+    pub unit: String,
+    pub updated_at_ms: u64,
 }
 
 /// Percent-encode everything that is not unreserved, so a user id can never
@@ -296,6 +304,24 @@ impl Client {
         })
     }
 
+    pub async fn credit_balance(
+        &self,
+        user_id: &str,
+        identity_token: &str,
+    ) -> Result<CreditBalance, ApiError> {
+        let body = self
+            .post(
+                "/v1/credits/balance",
+                json!({ "user_id": user_id, "identity_token": identity_token }),
+            )
+            .await?;
+        Ok(CreditBalance {
+            balance_millicredits: u64_at(&body, &["balance_millicredits"])?,
+            unit: str_at(&body, &["unit"])?,
+            updated_at_ms: u64_at(&body, &["updated_at_ms"])?,
+        })
+    }
+
     /// POST /v1/workspaces → (workspace id, the creator's owner Biscuit).
     ///
     /// The returned Biscuit is what every later call for this workspace
@@ -386,6 +412,7 @@ impl Client {
             fencing_token: u64_at(&body, &["fencing_token"])?,
             biscuit_b64: str_at(&body, &["biscuit"])?,
             expires_at_ms: u64_at(&body, &["lease", "expires_at_ms"])?,
+            credits_remaining_millicredits: body["credits_remaining_millicredits"].as_u64(),
         })
     }
 

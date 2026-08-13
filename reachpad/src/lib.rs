@@ -38,6 +38,7 @@
 pub mod api;
 pub mod attach;
 pub mod cli;
+pub mod cli_auth;
 pub mod commands;
 pub mod http_min;
 pub mod inspect;

@@ -7,8 +7,11 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -54,6 +57,11 @@ pub fn state_path(token_path: &Path) -> PathBuf {
     sidecar(token_path, ".state.json")
 }
 
+/// Connection configuration learned from the authenticated Reachpad exchange.
+pub fn connection_path(token_path: &Path) -> PathBuf {
+    sidecar(token_path, ".config.json")
+}
+
 fn sidecar(token_path: &Path, suffix: &str) -> PathBuf {
     let mut name = token_path
         .file_name()
@@ -71,25 +79,61 @@ pub struct AttachState {
     pub principal: String,
 }
 
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn write_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating directory {}", dir.display()))?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(FILE_MODE)
-        .open(path)
-        .with_context(|| format!("opening {} for writing", path.display()))?;
-    file.write_all(bytes)?;
-    // `mode()` applies only on create; a pre-existing file keeps its old
-    // permissions — force 0600 either way.
-    let mut perms = file.metadata()?.permissions();
-    perms.set_mode(FILE_MODE);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "token".to_owned());
+    let mut last_collision = None;
+    for _ in 0..100 {
+        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()));
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .open(&temporary);
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_collision = Some(error);
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("opening temporary file beside {}", path.display()));
+            }
+        };
+        let result = (|| -> anyhow::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)
+                .with_context(|| format!("atomically replacing {}", path.display()))?;
+            // Persist the rename itself when the filesystem supports syncing a
+            // directory. The credential is either the old complete file or
+            // the new complete file, never a truncated in-between.
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        return result;
+    }
+    Err(last_collision.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "temporary file collision",
+        )
+    }))
+    .with_context(|| format!("creating a temporary file beside {}", path.display()))
 }
 
 /// Write the Biscuit (base64) to `path`, 0600, creating parent dirs.
@@ -123,7 +167,7 @@ pub fn read_operator_token(token_path: &Path) -> anyhow::Result<String> {
     let path = operator_path(token_path);
     let raw = std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "no operator credential at {} (run `reachpad auth login --operator-token …`)",
+            "no operator credential at {} (run `reachpad auth login`)",
             path.display()
         )
     })?;
@@ -134,6 +178,34 @@ pub fn read_operator_token(token_path: &Path) -> anyhow::Result<String> {
         path.display()
     );
     Ok(token.to_owned())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectionConfig {
+    pub controld: String,
+    pub hub: String,
+}
+
+/// Save the non-secret endpoint pair beside the credential. It is still 0600
+/// because a single file mode for the credential set is easier to audit.
+pub fn write_connection_config(token_path: &Path, config: &ConnectionConfig) -> anyhow::Result<()> {
+    let mut json = serde_json::to_vec_pretty(config)?;
+    json.push(b'\n');
+    write_0600(&connection_path(token_path), &json)
+}
+
+pub fn read_connection_config(token_path: &Path) -> anyhow::Result<Option<ConnectionConfig>> {
+    let path = connection_path(token_path);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let config = serde_json::from_slice(&raw)
+        .with_context(|| format!("parsing saved connection configuration {}", path.display()))?;
+    Ok(Some(config))
 }
 
 fn read_states(token_path: &Path) -> BTreeMap<String, AttachState> {
@@ -198,6 +270,29 @@ mod tests {
         write_token(&path, "second").unwrap();
         assert_eq!(mode_of(&path), FILE_MODE, "rewrite must restore 0600");
         assert_eq!(read_token(&path).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connection_config_round_trips_atomically_at_0600() {
+        let dir = scratch_dir("connection");
+        let path = dir.join("token");
+        let config = ConnectionConfig {
+            controld: "https://m1.reachpad.dev".into(),
+            hub: "wss://m1.reachpad.dev/ws".into(),
+        };
+        write_connection_config(&path, &config).unwrap();
+        assert_eq!(read_connection_config(&path).unwrap(), Some(config));
+        assert_eq!(mode_of(&connection_path(&path)), FILE_MODE);
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(
+            leftovers, 0,
+            "an atomic write must not leave its staging file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

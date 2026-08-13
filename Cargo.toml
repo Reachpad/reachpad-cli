@@ -8,11 +8,11 @@ resolver = "2"
 members = ["reachpad", "crates/proto", "crates/authz", "crates/runtime"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 license = "UNLICENSED"
-repository = "https://github.com/Tako-Research/reachpad-cli"
+repository = "https://github.com/Reachpad/reachpad-cli"
 
 [workspace.dependencies]
 proto = { path = "crates/proto" }

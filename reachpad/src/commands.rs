@@ -37,6 +37,23 @@ pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
     // ADR-0040: `--endpoint <host>` is both planes on one host and one port.
     cli.resolve_endpoint();
 
+    // A successful WorkOS CLI login stores the authenticated endpoint pair.
+    // Explicit command-line configuration always wins; saved configuration is
+    // only the missing default that makes the next `reachpad ws list` work.
+    let token_path = cli.token_path();
+    if cli.endpoint.is_none() {
+        if let Some(saved) = tokenfile::read_connection_config(&token_path)? {
+            crate::cli_auth::validate_connection_urls(&saved.controld, &saved.hub)
+                .context("saved Reachpad connection configuration is unsafe")?;
+            if cli.controld == crate::cli::DEFAULT_CONTROLD {
+                cli.controld = saved.controld;
+            }
+            if cli.hub == crate::cli::DEFAULT_HUB {
+                cli.hub = saved.hub;
+            }
+        }
+    }
+
     tracing::info!(mode = cfg.mode().as_str(), "reachpad ready");
 
     let Some(command) = cli.command.take() else {
@@ -44,6 +61,23 @@ pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
     };
 
     match command {
+        Command::Credits => {
+            let credential = tokenfile::read_operator_token(&cli.token_path())?;
+            let client = Client::with_trust(&cli.controld, cli.trust());
+            let session = client.operator_session(&credential).await?;
+            let balance = client
+                .credit_balance(&session.user_id, &session.identity_token)
+                .await?;
+            let whole = balance.balance_millicredits / 1000;
+            let fraction = balance.balance_millicredits % 1000;
+            println!("{whole}.{fraction:03} compute credits");
+            println!("1 credit = 1 active standard-workspace minute");
+            if balance.balance_millicredits <= 50_000 {
+                eprintln!("reachpad: low compute-credit balance");
+            } else if balance.balance_millicredits <= 200_000 {
+                eprintln!("reachpad: compute-credit balance is below 200");
+            }
+        }
         Command::Ws(ws) => {
             // `ws exec` exits with the COMMAND's exit code so it composes in
             // a script; every other `ws` verb returns 0. The code travels as a
@@ -110,6 +144,13 @@ pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
                     "placed: workspace={workspace} node={} fencing_token={}",
                     placed.node, placed.fencing_token
                 );
+                if let Some(millicredits) = placed.credits_remaining_millicredits {
+                    eprintln!(
+                        "compute credits remaining: {}.{:03}",
+                        millicredits / 1000,
+                        millicredits % 1000
+                    );
+                }
             }
             let token_b64 = resolve_token(&cli)?;
             let token = BASE64
@@ -199,33 +240,78 @@ async fn run_auth(
     cmd: crate::cli::AuthCommand,
 ) -> anyhow::Result<()> {
     use crate::cli::AuthCommand;
-    let client = Client::with_trust(controld, trust);
+    let client = Client::with_trust(controld, trust.clone());
     match cmd {
-        AuthCommand::Login { operator_token } => {
-            let credential = if operator_token.trim() == "-" {
-                let mut buf = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                    .context("reading the operator credential from stdin")?;
-                buf
-            } else {
-                operator_token
-            };
-            let credential = credential.trim().to_owned();
-            // Exchange BEFORE saving: a credential that does not work is not
-            // one worth keeping on disk, and the failure names why.
-            let session = client.operator_session(&credential).await?;
-            tokenfile::write_operator_token(&token_path, &credential)?;
-            println!(
-                "logged in: user={} principal={}",
-                session.user_id, session.principal_id
-            );
+        AuthCommand::Login {
+            operator_token,
+            account_url,
+            no_browser,
+        } => {
+            if let Some(operator_token) = operator_token {
+                let credential = if operator_token.trim() == "-" {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                        .context("reading the operator credential from stdin")?;
+                    buf
+                } else {
+                    operator_token
+                };
+                let credential = credential.trim().to_owned();
+                // Exchange BEFORE saving: a credential that does not work is
+                // not one worth keeping on disk, and the failure names why.
+                let session = client.operator_session(&credential).await?;
+                tokenfile::write_operator_token(&token_path, &credential)?;
+                println!(
+                    "logged in: user={} principal={}",
+                    session.user_id, session.principal_id
+                );
+                println!(
+                    "  operator credential saved: {} (0600)",
+                    tokenfile::operator_path(&token_path).display()
+                );
+                println!(
+                    "  identity token valid until {} (ms since epoch); renew with `reachpad auth session`",
+                    session.expires_at_ms
+                );
+                return Ok(());
+            }
+
+            let device = crate::cli_auth::start_device_authorization(&account_url, &trust).await?;
+            println!("Open {}", device.verification_uri);
+            println!("Enter code: {}", device.user_code);
+            if !no_browser && crate::cli_auth::open_browser(&device.verification_uri_complete) {
+                eprintln!("Opened WorkOS sign-in in your browser.");
+            }
+            eprintln!("Waiting for WorkOS approval...");
+            let login =
+                crate::cli_auth::complete_device_authorization(&account_url, device, &trust)
+                    .await?;
+
+            // Validate the new credential against the endpoint that issued it
+            // before either value reaches disk. A forged or skewed exchange
+            // response cannot replace a known-good login.
+            let login_client = Client::with_trust(&login.controld_url, trust.clone());
+            let session = login_client.operator_session(&login.operator_token).await?;
+            tokenfile::write_operator_token(&token_path, &login.operator_token)?;
+            tokenfile::write_connection_config(
+                &token_path,
+                &tokenfile::ConnectionConfig {
+                    controld: login.controld_url,
+                    hub: login.hub_url,
+                },
+            )?;
+
+            match login.email {
+                Some(email) => println!("signed in as {email}"),
+                None => println!("signed in: user={}", session.user_id),
+            }
             println!(
                 "  operator credential saved: {} (0600)",
                 tokenfile::operator_path(&token_path).display()
             );
             println!(
-                "  identity token valid until {} (ms since epoch); renew with `reachpad auth session`",
-                session.expires_at_ms
+                "  credential valid until {} (ms since epoch)",
+                login.operator_expires_at_ms
             );
         }
         AuthCommand::Session => {

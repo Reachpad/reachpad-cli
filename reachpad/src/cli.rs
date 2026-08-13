@@ -112,6 +112,8 @@ impl Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Show the account's compute-credit balance.
+    Credits,
     /// Workspace lifecycle (create / attach / release).
     #[command(subcommand)]
     Ws(WsCommand),
@@ -170,8 +172,7 @@ pub enum Command {
         #[arg(long, default_value_t = 30_000)]
         wait_for_node_ms: u64,
     },
-    /// Present an operator credential (ADR-0034): the way a laptop gets into
-    /// the capability chain without holding a platform secret.
+    /// Sign in to Reachpad or manage the saved account session.
     #[command(subcommand)]
     Auth(AuthCommand),
     /// API keys (`rpak1.…`, ADR-0059): the credential an agent or CI runner
@@ -215,17 +216,26 @@ pub enum KeyCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
-    /// Save an operator credential and exchange it for an identity token.
+    /// Sign in through WorkOS in a browser and save the resulting credential.
     ///
-    /// Get the credential from your account page (reachpad.dev/connect,
-    /// shown once at mint), or on the controld host with
-    /// `controld mint-operator-token --user-id U --principal-id P`.
-    /// `-` reads it from stdin so it never reaches a shell history or a
-    /// process listing.
+    /// By default this uses WorkOS CLI Auth: the command prints a short code,
+    /// opens hosted AuthKit, and waits while WorkOS applies the account's
+    /// configured login, MFA and SSO policy. Reachpad never receives a
+    /// password or authentication factor.
+    ///
+    /// `--operator-token -` retains the manual recovery and automation path.
+    /// It reads the credential from stdin so it never reaches shell history
+    /// or a process listing.
     Login {
-        /// The credential (`rpop1.…`), or `-` to read it from stdin.
+        /// Recovery path: a credential (`rpop1.…`), or `-` for stdin.
         #[arg(long)]
-        operator_token: String,
+        operator_token: Option<String>,
+        /// Reachpad account service. Plain HTTP is accepted only on loopback.
+        #[arg(long, default_value = crate::cli_auth::DEFAULT_ACCOUNT_URL)]
+        account_url: String,
+        /// Print the WorkOS URL and code without trying to open a browser.
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Exchange the saved operator credential for a fresh identity token and
     /// print who it says you are. Identity tokens are short-lived (an hour);
@@ -536,6 +546,28 @@ mod tests {
         // The default is the OS trust store, and there is no third option.
         let cli = parse(&["reachpad", "ws", "list"]);
         assert_eq!(cli.trust().describe(), "the OS trust store");
+    }
+
+    #[test]
+    fn auth_login_defaults_to_workos_and_keeps_stdin_recovery() {
+        let cli = parse(&["reachpad", "auth", "login"]);
+        let Some(Command::Auth(AuthCommand::Login {
+            operator_token,
+            account_url,
+            no_browser,
+        })) = cli.command
+        else {
+            panic!("auth login should parse");
+        };
+        assert!(operator_token.is_none());
+        assert_eq!(account_url, "https://reachpad.dev");
+        assert!(!no_browser);
+
+        let cli = parse(&["reachpad", "auth", "login", "--operator-token", "-"]);
+        let Some(Command::Auth(AuthCommand::Login { operator_token, .. })) = cli.command else {
+            panic!("manual auth login should parse");
+        };
+        assert_eq!(operator_token.as_deref(), Some("-"));
     }
 
     #[test]
