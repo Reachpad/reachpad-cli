@@ -14,15 +14,31 @@ latest release from this repository, verifies its checksum against
 SHA256SUMS, and installs to `~/.local/bin/reachpad` (override with
 `REACHPAD_INSTALL_DIR`).
 
-## Connect
+## Sign in
 
-Get your credential at [reachpad.dev/connect](https://reachpad.dev/connect),
-then:
+Run the browser-based WorkOS login:
 
 ```sh
-reachpad --endpoint m1.reachpad.dev auth login --operator-token -
-reachpad --endpoint m1.reachpad.dev ws create --name scratch
-reachpad --endpoint m1.reachpad.dev attach <workspace-id>
+reachpad auth login
+```
+
+The CLI shows a short code and opens WorkOS hosted sign-in. WorkOS handles the
+account login and any required MFA or SSO. After approval, Reachpad exchanges
+the short-lived WorkOS token once and saves a user-scoped Reachpad credential
+and the production endpoint with mode 0600. No password or authentication
+factor is entered into Reachpad.
+
+On a remote machine without a usable browser, run `reachpad auth login
+--no-browser` and open the displayed URL on another device. The manual
+credential flow remains available from
+[reachpad.dev/connect](https://reachpad.dev/connect) as a recovery path.
+
+Then list, create, or attach to a workspace:
+
+```sh
+reachpad ws list
+reachpad ws create --name scratch
+reachpad attach <workspace-id>
 ```
 
 Docs: [reachpad.dev/docs/cli](https://reachpad.dev/docs/cli)
