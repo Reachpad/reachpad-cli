@@ -80,6 +80,39 @@ cargo build --release -p reach
 ./target/release/reachpad --version
 ```
 
+### Signed macOS builds
+
+The macOS binary is signed with a Developer ID certificate and notarized by
+Apple, so a download from the releases page opens without a Gatekeeper
+warning. `curl | sh` never needed it: curl sets no quarantine attribute, so
+Gatekeeper does not run on that path.
+
+The binary is signed before the tarball is built, so the checksum in
+SHA256SUMS covers the signed artifact — reverse the order and the install
+script would verify the wrong one and blame the download.
+
+A bare executable cannot be stapled (stapling needs a bundle, `.dmg` or
+`.pkg`), so Gatekeeper resolves the notarization ticket online. A first run
+on a machine that cannot reach Apple therefore fails the way an unnotarized
+binary does. If that becomes a real complaint, ship a stapled `.pkg`
+alongside the tarball.
+
+Six repository secrets, and the release fails loudly rather than shipping
+something Gatekeeper will refuse if any is missing:
+
+| Secret | What it is |
+|---|---|
+| `APPLE_CERT_P12_BASE64` | `base64` of the exported **Developer ID Application** certificate and key. Not "Mac App Distribution" — that one is App Store only and will not satisfy Gatekeeper here. |
+| `APPLE_CERT_PASSWORD` | The password set when exporting that `.p12`. |
+| `APPLE_SIGNING_IDENTITY` | The identity string, e.g. `Developer ID Application: Tako Research (TEAMID)` — `security find-identity -v -p codesigning` prints it. |
+| `APPLE_API_KEY_P8_BASE64` | `base64` of an App Store Connect API key (`.p8`). Preferred over an Apple ID and app-specific password, which break whenever someone's password or 2FA changes. |
+| `APPLE_API_KEY_ID` | That key's ID. |
+| `APPLE_API_ISSUER_ID` | The issuer ID from App Store Connect → Users and Access → Integrations. |
+
+The certificate is generated once from the Apple Developer account and is
+not in this repository or the private one; the workflow imports it into a
+throwaway keychain and deletes it with the runner.
+
 The snapshot is synced from a private monorepo on every release, so file an
 issue rather than a PR for changes; a PR here would be overwritten by the
 next sync (the sync script and its header in `Cargo.toml` say the same).

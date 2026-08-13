@@ -40,6 +40,96 @@ jobs:
           fi
       - name: build
         run: cargo build --release -p reach --target ${{ matrix.target }}
+
+      # Building on a macOS runner already gets an AD-HOC signature from the
+      # linker, which is why `curl | sh` works: curl sets no quarantine
+      # attribute, so Gatekeeper never runs. A browser download does set one,
+      # and an ad-hoc signature is not a Developer ID, so the same tarball
+      # fetched from the releases page is refused with "the developer cannot
+      # be verified". That is what this signs away.
+      #
+      # This runs BEFORE `package`, and it has to: signing rewrites the
+      # binary, so a tarball built first would ship the unsigned one, and
+      # SHA256SUMS would still verify — install.sh would confirm the checksum
+      # of the wrong artifact and the failure would name the download.
+      - name: sign for Gatekeeper (Developer ID + hardened runtime)
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Fail loudly rather than shipping something Gatekeeper will refuse:
+          # a release that is quietly unsigned is discovered by a customer.
+          for v in CERT_P12_BASE64 CERT_PASSWORD SIGNING_IDENTITY; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v is not set — see README 'Signed macOS builds'." >&2
+              exit 1
+            fi
+          done
+          # A throwaway keychain, so nothing is left behind on a shared runner
+          # and no login keychain is touched.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Without this codesign blocks on a GUI prompt no one can answer and
+          # the job hangs until it times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          # `--options runtime` is the hardened runtime, and notarization
+          # REJECTS a submission without it — with an error that does not say
+          # so plainly. `--timestamp` is likewise required.
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN" \
+            --sign "$SIGNING_IDENTITY" \
+            "target/${{ matrix.target }}/release/reachpad"
+          codesign --verify --strict --verbose=2 \
+            "target/${{ matrix.target }}/release/reachpad"
+
+      # notarytool takes .zip, .pkg or .dmg — NOT the .tar.gz we ship — so the
+      # binary is zipped only to be submitted. What ships is still the tarball
+      # containing the same signed binary; the ticket is bound to the code
+      # signature, not to the container it was submitted in.
+      #
+      # A bare executable cannot be STAPLED (stapling needs a bundle, .dmg or
+      # .pkg), so Gatekeeper looks the ticket up online. That is correct but
+      # network-dependent: a first run on a machine with no route to Apple
+      # fails the same way an unnotarized binary does. Ship a stapled .pkg if
+      # that ever becomes a real complaint.
+      - name: notarize
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for v in API_KEY_P8_BASE64 API_KEY_ID API_ISSUER_ID; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v is not set — see README 'Signed macOS builds'." >&2
+              exit 1
+            fi
+          done
+          echo "$API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/key.p8"
+          ditto -c -k "target/${{ matrix.target }}/release/reachpad" \
+            "$RUNNER_TEMP/notarize.zip"
+          # --wait so a rejection fails the release rather than being found
+          # later by whoever downloads it.
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/key.p8" \
+            --key-id "$API_KEY_ID" \
+            --issuer "$API_ISSUER_ID" \
+            --wait
+          rm -f "$RUNNER_TEMP/key.p8"
+
       - name: package
         run: |
           cd target/${{ matrix.target }}/release
