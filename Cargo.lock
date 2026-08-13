@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "authz"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "biscuit-auth",
  "blake3",
@@ -336,6 +336,15 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
@@ -1296,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "proptest",
@@ -1500,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "reach"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "authz",
@@ -1509,6 +1518,7 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "clap_complete",
  "futures",
  "prost 0.13.5",
  "proto",
@@ -1581,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.19",
  "tracing",

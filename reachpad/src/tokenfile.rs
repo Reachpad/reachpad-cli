@@ -52,6 +52,17 @@ pub fn operator_path(token_path: &Path) -> PathBuf {
     sidecar(token_path, ".operator")
 }
 
+/// Whether this credential set already has an operator credential.
+///
+/// Existence is enough here. An empty or unreadable file is deliberately not
+/// treated as signed out, because replacing a damaged credential without
+/// naming the damage would hide the state the user needs to repair.
+pub fn operator_token_exists(token_path: &Path) -> anyhow::Result<bool> {
+    let path = operator_path(token_path);
+    path.try_exists()
+        .with_context(|| format!("checking operator credential {}", path.display()))
+}
+
 /// Sidecar path for attach state, next to the token file.
 pub fn state_path(token_path: &Path) -> PathBuf {
     sidecar(token_path, ".state.json")
@@ -303,6 +314,23 @@ mod tests {
         assert!(read_token(&path).is_err(), "missing file");
         write_token(&path, "   ").unwrap();
         assert!(read_token(&path).is_err(), "blank token");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operator_token_existence_distinguishes_first_run_from_damage() {
+        let dir = scratch_dir("operator-exists");
+        let path = dir.join("token");
+        assert!(!operator_token_exists(&path).unwrap());
+
+        write_operator_token(&path, "rpop1.id.secret").unwrap();
+        assert!(operator_token_exists(&path).unwrap());
+
+        std::fs::write(operator_path(&path), []).unwrap();
+        assert!(
+            operator_token_exists(&path).unwrap(),
+            "an empty credential is damaged, not a new installation"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

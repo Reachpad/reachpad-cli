@@ -34,14 +34,18 @@
 //! - [`attach`] — the interactive PTY session (ADR-0033): raw mode, resize,
 //!   ctrl-c passthrough, clean detach. The felt test of the whole system.
 //! - [`commands`] — command dispatch; all printing lives here.
+//! - [`doctor`] — local installation, credential, and connectivity checks.
+//! - [`self_update`] — package-manager-aware native updates.
 
 pub mod api;
 pub mod attach;
 pub mod cli;
 pub mod cli_auth;
 pub mod commands;
+pub mod doctor;
 pub mod http_min;
 pub mod inspect;
+pub mod self_update;
 pub mod tail;
 pub mod tokenfile;
 pub mod transport;
