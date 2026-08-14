@@ -54,10 +54,20 @@ test("each platform package declares the os/cpu npm selects it by", () => {
     // Yarn Berry zips packages into its cache, and an executable inside a zip
     // cannot be exec'd.
     assert.equal(pkg.preferUnplugged, true, `${platform.dir} preferUnplugged`);
-    // A published binary that says which repo built it is the provenance
-    // claim npm attaches; a missing one fails the publish AFTER the
-    // attestation is logged, which is a bad place to find out.
-    assert.match(pkg.repository.url, /Reachpad\/reachpad-cli/);
+  }
+});
+
+test("every package names the repo npm signs provenance against", () => {
+  // npm signs provenance on every OIDC publish and REFUSES the upload when
+  // package.json does not name the repository it was built from. That
+  // rejection arrives after the tarball is built and the attestation is
+  // already in the transparency log, which is a confusing place to learn it.
+  // All five, not just the platform ones: @reachpad/cli is published last, so
+  // a missing field there fails after four packages are already public.
+  for (const dir of PACKAGE_DIRS) {
+    const pkg = manifest(dir);
+    assert.match(pkg.repository?.url ?? "", /Reachpad\/reachpad-cli/, `${dir} repository.url`);
+    assert.equal(pkg.publishConfig?.access, "public", `${dir} publishConfig.access`);
   }
 });
 
