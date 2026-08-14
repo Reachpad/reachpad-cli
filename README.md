@@ -11,16 +11,26 @@ With Homebrew on Apple silicon macOS or x86_64/arm64 Linux:
 brew install reachpad/tap/reachpad
 ```
 
+With npm, anywhere Node 18+ runs:
+
+```sh
+npm install -g @reachpad/cli
+```
+
 Or with the checksum-verifying installer:
 
 ```sh
 curl -fsSL https://reachpad.dev/install | sh
 ```
 
-Linux x86_64/arm64 (musl, static) and macOS arm64. The script fetches the
-latest release from this repository, verifies its checksum against
+Linux x86_64/arm64 (musl, static) and macOS arm64/x86_64. The script fetches
+the latest release from this repository, verifies its checksum against
 SHA256SUMS, and installs to `~/.local/bin/reachpad` (override with
 `REACHPAD_INSTALL_DIR`).
+
+All three deliver the same binary. `@reachpad/cli` is a launcher around it, not
+a second implementation — see [`npm/README.md`](npm/README.md), which also
+explains the macOS quarantine problem npm sidesteps.
 
 ## Get started
 
@@ -60,8 +70,10 @@ reachpad completions fish
 ```
 
 `reachpad update` respects how Reachpad was installed: Homebrew installs are
-directed to `brew upgrade reachpad`, while installer-managed binaries
-are updated in place after the release checksum is verified.
+directed to `brew upgrade reachpad` and npm installs to `npm install -g
+@reachpad/cli@latest`, while installer-managed binaries are updated in place
+after the release checksum is verified. Whoever installed the binary owns it —
+a second writer is how a working install becomes a broken one.
 
 Docs: [reachpad.dev/docs/cli](https://reachpad.dev/docs/cli)
 

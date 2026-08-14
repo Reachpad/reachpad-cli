@@ -12,3 +12,12 @@ checks:
     run: shellcheck install.sh && sh -n install.sh
     required_for_publish: true
     watch: false
+  # The npm distribution. No build and no network: it checks that the four
+  # descriptions of the same platform list still agree (release.yml's matrix,
+  # npm/prepare.mjs, the launcher's lookup table, and @reachpad/cli's optional
+  # dependencies), and runs the launcher as a real child process for the three
+  # things a wrapper can silently break — exit codes, signals, and the tty.
+  npm:
+    run: node --test npm/test/*.test.mjs
+    required_for_publish: true
+    watch: false

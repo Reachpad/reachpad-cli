@@ -1,2 +1,4 @@
 /target
 *.profraw
+npm/*/bin/reachpad
+npm/node_modules

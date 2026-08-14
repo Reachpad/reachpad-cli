@@ -17,5 +17,22 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo build --workspace
-      - run: cargo test --workspace
+      # --locked here so the lock is checked on every PR, not first discovered
+      # at release time. It is also what makes CI agree with the greentree
+      # `test` check, which has always passed --locked: without it CI was green
+      # on a tree the repo's own gate refused.
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+
+  # The npm distribution. No build, no network, no credentials — it is four
+  # descriptions of the same platform list, checked against each other, plus
+  # the launcher run as a real child process. The one that matters most is the
+  # cross-check against release.yml's build matrix: a target added there and
+  # not here publishes tarballs that `npm install` can never reach.
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: node --test npm/test/*.test.mjs

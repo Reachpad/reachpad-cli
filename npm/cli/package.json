@@ -1,0 +1,47 @@
+{
+  "name": "@reachpad/cli",
+  "version": "0.0.0-dev",
+  "description": "Run coding agents in durable cloud workspaces. The Reachpad CLI, installable with npm.",
+  "license": "UNLICENSED",
+  "homepage": "https://reachpad.dev/docs/cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Reachpad/reachpad-cli.git",
+    "directory": "npm/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/Reachpad/reachpad-cli/issues"
+  },
+  "bin": {
+    "reachpad": "bin/reachpad.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "keywords": [
+    "reachpad",
+    "cli",
+    "coding-agents",
+    "development-environment",
+    "cloud-development-environment",
+    "sandbox",
+    "agent-infrastructure"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {
+    "@reachpad/cli-darwin-arm64": "0.0.0-dev",
+    "@reachpad/cli-darwin-x64": "0.0.0-dev",
+    "@reachpad/cli-linux-arm64": "0.0.0-dev",
+    "@reachpad/cli-linux-x64": "0.0.0-dev"
+  },
+  "scripts": {
+    "test": "node --test ../test/*.test.mjs"
+  }
+}
