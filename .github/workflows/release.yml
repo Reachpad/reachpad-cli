@@ -223,7 +223,19 @@ jobs:
             name=$(node -p "require('./npm/$dir/package.json').name")
             if npm view "$name@$version" version >/dev/null 2>&1; then
               echo "$name@$version is already on npm; leaving it alone"
-            else
-              npm publish "npm/$dir"
+              continue
             fi
+            if npm publish "npm/$dir"; then
+              continue
+            fi
+            # A publish can fail for ordinary reasons, but there is exactly one
+            # that is guaranteed to happen once and reads as an unrelated auth
+            # error when it does: npm Trusted Publishing can only be configured
+            # on a package that ALREADY EXISTS, so the first version of each of
+            # these five has to be pushed by hand. Say so here rather than
+            # leaving ENEEDAUTH next to a green release.
+            if ! npm view "$name" version >/dev/null 2>&1; then
+              echo "::error title=$name has never been published::OIDC cannot publish a package that does not exist yet. Publish each of the five once by hand, then configure the trusted publisher for each at npmjs.com (Settings -> Trusted Publisher -> GitHub Actions; org Reachpad, repo reachpad-cli, workflow release.yml, environment blank). The commands are in npm/README.md. Re-running this tag afterwards is safe: publishes already done are skipped."
+            fi
+            exit 1
           done
