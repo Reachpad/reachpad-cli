@@ -5,6 +5,12 @@
 #
 # Tags arrive from the source-of-truth sync (the private reachpad-infra repo
 # pushes a snapshot and its cli-v* tag together).
+#
+# Three things leave this workflow: a GitHub release, five npm packages, and
+# nothing else. The npm packages carry these same binaries — see npm/README.md
+# for why that install path exists at all (short version: npm never stamps
+# com.apple.quarantine, so an ad-hoc signed binary installed that way does not
+# meet Gatekeeper).
 name: release
 on:
   push:
@@ -21,6 +27,10 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
+            runner: macos-14
+          # Cross-compiled from the same arm64 runner: the macOS SDK carries
+          # both slices, so this needs a target, not a second machine.
+          - target: x86_64-apple-darwin
             runner: macos-14
     runs-on: ${{ matrix.runner }}
     steps:
@@ -40,6 +50,75 @@ jobs:
           fi
       - name: build
         run: cargo build --release -p reach --target ${{ matrix.target }}
+
+      # --- macOS: Developer ID signature + notarization ---------------------
+      #
+      # Without this the binary is only ad-hoc signed (the linker's own
+      # signature). Ad-hoc is enough to EXECUTE on Apple silicon, which is why
+      # `brew install` and the curl installer work today — neither stamps
+      # com.apple.quarantine. It is NOT enough for anything that does stamp it:
+      # a browser download from the releases page hits "Apple could not verify
+      # reachpad is free of malware", and no amount of packaging fixes that.
+      # Only a Developer ID signature that Apple has notarized clears it.
+      #
+      # The step is skipped, loudly, when the secrets are absent, because the
+      # alternative is a release that silently ships unsigned binaries under a
+      # workflow that claims to sign them. Set up (once):
+      #
+      #   MACOS_CERTIFICATE      base64 of the Developer ID Application .p12
+      #   MACOS_CERTIFICATE_PWD  its export password
+      #   MACOS_SIGN_IDENTITY    e.g. "Developer ID Application: … (TEAMID)"
+      #   MACOS_NOTARY_KEY       base64 of the App Store Connect .p8 key
+      #   MACOS_NOTARY_KEY_ID    the key id
+      #   MACOS_NOTARY_ISSUER    the issuer uuid
+      - name: sign and notarize (macOS, when the signing secrets exist)
+        if: runner.os == 'macOS'
+        env:
+          CERT: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          BINARY: target/${{ matrix.target }}/release/reachpad
+        run: |
+          if [ -z "$CERT" ]; then
+            echo "::warning title=Unsigned macOS binary::MACOS_CERTIFICATE is not set. This release ships an ad-hoc signed binary: it runs from brew, npm and the curl installer, but a browser download will be blocked by Gatekeeper. See the comment in .github/workflows/release.yml."
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/build.keychain"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PWD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # --options runtime is what notarization requires; --timestamp is
+          # what keeps the signature valid after the certificate expires.
+          codesign --force --timestamp --options runtime \
+            --sign "$IDENTITY" "$BINARY"
+          codesign --verify --strict --verbose=2 "$BINARY"
+
+          # notarytool takes an archive, not a bare executable.
+          echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k "$BINARY" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER" \
+            --wait --timeout 30m
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+          # A bare Mach-O cannot be stapled — the ticket has nowhere to live.
+          # Gatekeeper falls back to an online notarization check instead,
+          # which is why this workflow does not attempt `stapler staple`.
+          echo "signed and notarized: $(codesign -dv --verbose=4 "$BINARY" 2>&1 | grep -i '^Authority' | head -1)"
+
       - name: package
         run: |
           cd target/${{ matrix.target }}/release
@@ -67,3 +146,50 @@ jobs:
             *.tar.gz
             SHA256SUMS
           fail_on_unmatched_files: true
+
+  # The same binaries, on npm. Separate job so a registry outage cannot lose
+  # the GitHub release, and `needs: publish` so npm never advertises a version
+  # whose release page does not exist yet.
+  npm:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Trusted Publishing: the whole mechanism
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", registry-url: "https://registry.npmjs.org" }
+      # Node 22 ships npm 10, which predates OIDC publishing entirely. A floor
+      # rather than @latest, so a future npm cannot change a release out from
+      # under us on an unrelated day.
+      - name: npm new enough to speak OIDC
+        run: npm install -g npm@^11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: the release's own checksums, not the artifacts' word for it
+        run: |
+          cd artifacts && cat *.sha256 > SHA256SUMS && ls -l
+      - name: stamp the tag's version and stage the binaries
+        run: |
+          version="${GITHUB_REF_NAME#cli-v}"
+          node npm/prepare.mjs --version "$version" --artifacts artifacts
+      - run: node --test npm/test/*.test.mjs
+      # Idempotent on purpose: five publishes in a row, and the fourth failing
+      # must leave a re-runnable tag rather than a half-published version that
+      # npm then refuses to accept again. The platform packages go FIRST —
+      # @reachpad/cli names them as optional dependencies, and a main package
+      # published before them is one npm resolves to nothing for a while.
+      - name: publish
+        run: |
+          version=$(node -p "require('./npm/cli/package.json').version")
+          for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64 cli; do
+            name=$(node -p "require('./npm/$dir/package.json').name")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already on npm; leaving it alone"
+            else
+              npm publish "npm/$dir"
+            fi
+          done

@@ -1,0 +1,32 @@
+{
+  "name": "@reachpad/cli-darwin-arm64",
+  "version": "0.0.0-dev",
+  "description": "The reachpad CLI binary for macOS on Apple silicon. Installed automatically by @reachpad/cli; do not depend on it directly.",
+  "license": "UNLICENSED",
+  "homepage": "https://reachpad.dev/docs/cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Reachpad/reachpad-cli.git",
+    "directory": "npm/darwin-arm64"
+  },
+  "bugs": {
+    "url": "https://github.com/Reachpad/reachpad-cli/issues"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "preferUnplugged": true,
+  "reachpadTarget": "aarch64-apple-darwin"
+}

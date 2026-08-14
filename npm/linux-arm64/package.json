@@ -1,0 +1,32 @@
+{
+  "name": "@reachpad/cli-linux-arm64",
+  "version": "0.0.0-dev",
+  "description": "The reachpad CLI binary for Linux on arm64. Installed automatically by @reachpad/cli; do not depend on it directly.",
+  "license": "UNLICENSED",
+  "homepage": "https://reachpad.dev/docs/cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Reachpad/reachpad-cli.git",
+    "directory": "npm/linux-arm64"
+  },
+  "bugs": {
+    "url": "https://github.com/Reachpad/reachpad-cli/issues"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "preferUnplugged": true,
+  "reachpadTarget": "aarch64-unknown-linux-musl"
+}
