@@ -48,8 +48,16 @@ jobs:
           else
             sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
           fi
+      # --locked is the difference between "built from this source" and "built
+      # from this source and these exact dependency versions". Without it cargo
+      # re-resolves on the runner, so the committed lock describes nothing that
+      # was ever built, two builds of ONE tag can differ, and a transitive
+      # dependency that publishes a semver-compatible release between them is
+      # picked up with nobody deciding to. That is the hole the provenance
+      # claim at the top of this file must not have. It fails loudly if the
+      # lock and the manifest ever disagree again, which is the point.
       - name: build
-        run: cargo build --release -p reach --target ${{ matrix.target }}
+        run: cargo build --release --locked -p reach --target ${{ matrix.target }}
 
       # --- macOS: Developer ID signature + notarization ---------------------
       #
