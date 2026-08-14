@@ -139,6 +139,12 @@ jobs:
           merge-multiple: true
       - name: combined checksum file
         run: cat *.sha256 > SHA256SUMS
+      # The body carries the macOS quarantine note on purpose. Downloading a
+      # tarball from THIS page in a browser is the one install path that
+      # stamps com.apple.quarantine, and until the binaries are notarized it
+      # is also the one that meets Gatekeeper. Someone who hits "Apple could
+      # not verify reachpad is free of malware" with no explanation next to
+      # the download concludes the binary is malware, not that it is unsigned.
       - name: create release
         uses: softprops/action-gh-release@v2
         with:
@@ -146,6 +152,34 @@ jobs:
             *.tar.gz
             SHA256SUMS
           fail_on_unmatched_files: true
+          body: |
+            ## Install
+
+            ```sh
+            brew install reachpad/tap/reachpad     # macOS, Linux
+            npm install -g @reachpad/cli           # anywhere Node 18+ runs
+            curl -fsSL https://reachpad.dev/install | sh
+            ```
+
+            All three deliver the binaries below, and none of them hits the
+            macOS warning described next.
+
+            ## Downloading a tarball here, on macOS
+
+            These binaries are ad-hoc signed, not yet Developer ID signed and
+            notarized. A **browser** download tags the file with
+            `com.apple.quarantine`, and macOS then refuses it with "Apple
+            could not verify reachpad is free of malware". The file is fine —
+            it is unsigned, not unsafe — and any of the three commands above
+            avoids the tag entirely. If you want this exact tarball anyway:
+
+            ```sh
+            shasum -a 256 -c SHA256SUMS --ignore-missing
+            xattr -d com.apple.quarantine reachpad
+            ```
+
+            Verify the checksum first, as above; that is the check the
+            signature would otherwise be doing for you.
 
   # The same binaries, on npm. Separate job so a registry outage cannot lose
   # the GitHub release, and `needs: publish` so npm never advertises a version
