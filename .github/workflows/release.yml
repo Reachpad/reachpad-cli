@@ -79,6 +79,10 @@ jobs:
       #   MACOS_NOTARY_KEY       base64 of the App Store Connect .p8 key
       #   MACOS_NOTARY_KEY_ID    the key id
       #   MACOS_NOTARY_ISSUER    the issuer uuid
+      #
+      # .github/MACOS-SIGNING.md is the runbook that produces all six — on
+      # Linux, with openssl, no Mac involved — and says what this does and
+      # does not fix before you spend $99 on it.
       - name: sign and notarize (macOS, when the signing secrets exist)
         if: runner.os == 'macOS'
         env:
@@ -90,9 +94,31 @@ jobs:
           NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
           BINARY: target/${{ matrix.target }}/release/reachpad
         run: |
-          if [ -z "$CERT" ]; then
-            echo "::warning title=Unsigned macOS binary::MACOS_CERTIFICATE is not set. This release ships an ad-hoc signed binary: it runs from brew, npm and the curl installer, but a browser download will be blocked by Gatekeeper. See the comment in .github/workflows/release.yml."
+          # All six or none. Signing with a certificate and then failing to
+          # notarize is the WORST outcome available here: it produces a
+          # Developer ID binary that Gatekeeper still refuses, and it refuses
+          # it with the same dialog as the unsigned one — so the release looks
+          # signed, the secrets look configured, and the symptom is unchanged.
+          missing=""
+          for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PWD MACOS_SIGN_IDENTITY \
+                      MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER; do
+            case "$name" in
+              MACOS_CERTIFICATE)     value="$CERT" ;;
+              MACOS_CERTIFICATE_PWD) value="$CERT_PWD" ;;
+              MACOS_SIGN_IDENTITY)   value="$IDENTITY" ;;
+              MACOS_NOTARY_KEY)      value="$NOTARY_KEY" ;;
+              MACOS_NOTARY_KEY_ID)   value="$NOTARY_KEY_ID" ;;
+              MACOS_NOTARY_ISSUER)   value="$NOTARY_ISSUER" ;;
+            esac
+            [ -n "$value" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ] && [ -z "$CERT$CERT_PWD$IDENTITY$NOTARY_KEY$NOTARY_KEY_ID$NOTARY_ISSUER" ]; then
+            echo "::warning title=Unsigned macOS binary::None of the MACOS_* signing secrets are set. This release ships an ad-hoc signed binary: it runs from brew, npm and the curl installer, but a browser download from the releases page will be blocked by Gatekeeper. See the comment in .github/workflows/release.yml."
             exit 0
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error title=Signing is half-configured::Missing:$missing. Signing without notarizing produces a binary Gatekeeper still refuses, with the same dialog as an unsigned one — so this fails instead of shipping something that looks fixed."
+            exit 1
           fi
           keychain="$RUNNER_TEMP/build.keychain"
           password="$(uuidgen)"
@@ -111,6 +137,22 @@ jobs:
           codesign --force --timestamp --options runtime \
             --sign "$IDENTITY" "$BINARY"
           codesign --verify --strict --verbose=2 "$BINARY"
+
+          # A POST-CONDITION, not a formality. `codesign --sign` accepts an
+          # identity string that resolves to the wrong certificate, and
+          # --verify then passes happily against it: an ad-hoc or a plain
+          # "Apple Development" signature verifies fine and is refused by
+          # Gatekeeper exactly like no signature at all. The only thing that
+          # clears quarantine is a Developer ID Application authority, so that
+          # is what gets asserted before this release is allowed to continue.
+          authority="$(codesign -dv --verbose=4 "$BINARY" 2>&1 | grep '^Authority=' | head -1)"
+          case "$authority" in
+            *"Developer ID Application"*) echo "signed: $authority" ;;
+            *)
+              echo "::error title=Wrong signing certificate::MACOS_SIGN_IDENTITY resolved to ${authority:-no authority at all}, not a Developer ID Application certificate. Gatekeeper refuses that the same way it refuses an unsigned binary."
+              exit 1
+              ;;
+          esac
 
           # notarytool takes an archive, not a bare executable.
           echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
