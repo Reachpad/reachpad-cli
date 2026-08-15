@@ -19,6 +19,27 @@ permissions:
   contents: write
 jobs:
   build:
+    # The signing key lives HERE, not in repository secrets, and the
+    # difference is the whole security posture of this workflow.
+    #
+    # A repository secret is readable by any workflow in the repository, on
+    # any branch, including one added in a push by anybody with write access.
+    # For an ordinary token that is a bad day; for an Apple Developer ID key
+    # it is an attacker signing malware that macOS trusts as us, which is the
+    # failure that ends a software company's reputation and cannot be undone
+    # by rotating anything — every binary ever signed has to be re-released.
+    #
+    # An environment secret is readable only by a job that names the
+    # environment, and only after the environment's rules pass. Ours are:
+    # deployments allowed from `cli-v*` TAGS only (not from any branch), and
+    # a required human reviewer. So the key is reachable exclusively by a
+    # tagged release that a person approved, and never by a workflow someone
+    # pushed to a branch.
+    #
+    # This gates the Linux legs too. That is deliberate: nothing in a release
+    # should ship without the same approval, and one click per release is not
+    # a cost worth engineering around.
+    environment: release-signing
     strategy:
       matrix:
         include:

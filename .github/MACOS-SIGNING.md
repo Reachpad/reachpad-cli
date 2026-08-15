@@ -36,10 +36,32 @@ enroll the org separately and re-sign. That costs nothing here, because these
 are bare binaries with no bundle identity and no update rules keyed to a team
 ID. **Start individual.**
 
+## Where the private key is allowed to exist
+
+Generate it on a machine **you** control — a laptop, not a shared devbox and
+not a box that runs coding agents with shell access. `openssl` is the only
+requirement, so this is thirty seconds anywhere.
+
+The key is the crown jewel of this whole arrangement. Anything holding it can
+sign code that macOS trusts as us; that is a different class of secret from a
+token, because the damage is done to *users* rather than to our
+infrastructure, and it is not repaired by rotation — every binary ever signed
+with the leaked key has to be re-signed and re-released, and users who already
+installed one have no way to know.
+
+Three places it will exist, and that should be all three:
+
+1. Your laptop, briefly, while you build the `.p12`.
+2. An encrypted backup in a password manager.
+3. The `release-signing` environment secret, used by tagged releases only.
+
+It should NOT end up in a repository, a scratch directory, a chat transcript,
+or an agent's working tree.
+
 ## Producing the six secrets
 
-All of this runs on Linux; a Mac is not required at any point. `openssl` is
-enough, and it avoids the Keychain Access dance entirely.
+All of this runs on Linux or macOS; the Apple developer portal is the only
+part that needs a browser, and Keychain Access is never involved.
 
 ### 1. Certificate → `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PWD`, `MACOS_SIGN_IDENTITY`
 
@@ -83,20 +105,43 @@ base64 -w0 AuthKey_XXXXXXXXXX.p8   # -> MACOS_NOTARY_KEY
 `MACOS_NOTARY_ISSUER` is the Issuer ID shown above the key list — a UUID,
 shared by every key in the account.
 
-### 3. Install them
+### 3. Install them — into the ENVIRONMENT, never the repository
 
 ```sh
-gh secret set MACOS_CERTIFICATE     --repo Reachpad/reachpad-cli < cert.b64
-gh secret set MACOS_CERTIFICATE_PWD --repo Reachpad/reachpad-cli
-gh secret set MACOS_SIGN_IDENTITY   --repo Reachpad/reachpad-cli
-gh secret set MACOS_NOTARY_KEY      --repo Reachpad/reachpad-cli < key.b64
-gh secret set MACOS_NOTARY_KEY_ID   --repo Reachpad/reachpad-cli
-gh secret set MACOS_NOTARY_ISSUER   --repo Reachpad/reachpad-cli
+E="--repo Reachpad/reachpad-cli --env release-signing"
+gh secret set MACOS_CERTIFICATE     $E < cert.b64
+gh secret set MACOS_CERTIFICATE_PWD $E < pwd.txt
+gh secret set MACOS_SIGN_IDENTITY   $E < identity.txt
+gh secret set MACOS_NOTARY_KEY      $E < key.b64
+gh secret set MACOS_NOTARY_KEY_ID   $E < keyid.txt
+gh secret set MACOS_NOTARY_ISSUER   $E < issuer.txt
 ```
 
-Then shred the local copies: `shred -u devid.key devid.p12 cert.b64 key.b64
-AuthKey_*.p8`. The `.p8` is the one that cannot be re-downloaded — if you lose
-it, revoke the key and make another.
+`--env release-signing` is not optional and not a detail. A **repository**
+secret is readable by any workflow in the repository, on any branch, including
+one added by anyone with write access — and this repository is public with two
+admins and no branch protection on `main`. An **environment** secret is
+reachable only by a job naming that environment, after its rules pass: ours
+allow deployment from `cli-v*` tags only, with a required human reviewer.
+
+Read from files, not from arguments: a value passed on a command line is
+visible in `ps` to every other process on the machine, and lands in shell
+history.
+
+Back the `.p12` up **before** deleting anything — an encrypted note in a
+password manager, not a file on a work machine. Apple caps how many Developer
+ID Application certificates an account may hold, so "just make another" is not
+free, and revoking one invalidates signatures made with it.
+
+Then destroy the local copies:
+
+```sh
+shred -u devid.key devid.p12 cert.b64 key.b64 pwd.txt identity.txt \
+        keyid.txt issuer.txt AuthKey_*.p8
+```
+
+The `.p8` cannot be re-downloaded. If it is lost, revoke that key in App Store
+Connect and generate another; unlike the certificate, notary keys are cheap.
 
 The next `cli-v*` tag signs and notarizes. The workflow asserts afterwards that
 the signing authority really is a Developer ID Application certificate, because
@@ -124,3 +169,40 @@ Developer ID certificates last five years; the Apple Developer Program
 membership is annual and the certificate stops being usable if the membership
 lapses. `--timestamp` is passed at signing time, so binaries already released
 keep verifying after the certificate expires. Only new signings break.
+
+## If the key leaks
+
+Assume it leaked if the `.p12` or its password appeared anywhere in the "not
+allowed" list above, or if a release was signed that nobody approved — the
+environment's reviewer requirement exists so that second one is answerable.
+
+1. **Revoke the certificate** at developer.apple.com. This invalidates
+   signatures made with it, including on binaries already installed.
+2. **Delete the environment secrets** so no further release can use it:
+   `gh secret delete MACOS_CERTIFICATE --repo Reachpad/reachpad-cli --env release-signing`
+   and the other five.
+3. **Check what was signed with it**: every `cli-v*` release since the key was
+   installed, and whether each has an approval in the environment's deployment
+   history. GitHub records who approved each one.
+4. **Issue a new certificate, re-sign, re-release** every version still being
+   downloaded. Publish what happened — a revoked signature makes existing
+   installs fail to pass Gatekeeper, and users deserve to know why before
+   they hit it.
+
+Notarization tickets are Apple's record, not ours; Apple can revoke those
+separately if the binary is found to be malicious.
+
+## Letting users check us
+
+Once signing is live, publish the expected authority so anyone can verify a
+download came from us rather than from whoever else might have the key:
+
+```sh
+codesign -dv --verbose=4 $(which reachpad) 2>&1 | grep Authority
+# Authority=Developer ID Application: <name> (<TEAMID>)
+# Authority=Developer ID Certification Authority
+# Authority=Apple Root CA
+```
+
+A team ID printed in the README is a check a user can actually perform, and it
+is what makes a stolen-certificate build detectable by someone other than us.
