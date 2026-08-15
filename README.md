@@ -92,6 +92,18 @@ cargo build --release -p reach
 ./target/release/reachpad --version
 ```
 
+Every release tarball also carries a signed build-provenance attestation, so
+the chain is checkable without trusting us:
+
+```sh
+gh attestation verify reachpad-<target>.tar.gz --repo Reachpad/reachpad-cli
+```
+
+That proves the bytes came out of this repository's release workflow at the
+commit the tag names. It rests on no key of ours — the signing identity is a
+short-lived credential minted for that one workflow run, and the record is in
+a public transparency log.
+
 The snapshot is synced from a private monorepo on every release, so file an
 issue rather than a PR for changes; a PR here would be overwritten by the
 next sync (the sync script and its header in `Cargo.toml` say the same).

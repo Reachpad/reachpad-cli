@@ -204,12 +204,36 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write # the OIDC claim the attestation is signed against
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
       - name: combined checksum file
         run: cat *.sha256 > SHA256SUMS
+
+      # Build provenance: a signed, publicly verifiable statement that these
+      # exact bytes came out of THIS workflow, at THIS commit, in THIS repo.
+      #
+      # This is the half of the problem Apple cannot solve for us. A Developer
+      # ID signature says "Reachpad signed this"; it says nothing about what
+      # was signed or where it came from, and it depends on a private key that
+      # somebody could steal. This depends on no key at all — the signing
+      # identity is a short-lived OIDC credential GitHub mints for this run,
+      # and the record goes into a public transparency log, so a forged
+      # attestation would have to be forged in public.
+      #
+      # It also covers Linux, which has no Gatekeeper and therefore no reason
+      # anyone would ever have signed those tarballs.
+      #
+      #   gh attestation verify reachpad-<target>.tar.gz --repo Reachpad/reachpad-cli
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "*.tar.gz"
       # The body carries the macOS quarantine note on purpose. Downloading a
       # tarball from THIS page in a browser is the one install path that
       # stamps com.apple.quarantine, and until the binaries are notarized it
@@ -251,6 +275,17 @@ jobs:
 
             Verify the checksum first, as above; that is the check the
             signature would otherwise be doing for you.
+
+            ## Verifying where these came from
+
+            Every tarball carries a signed build-provenance attestation: proof
+            that these exact bytes came out of this repository's release
+            workflow, at the commit this tag names. It needs no key of ours —
+            the record lives in a public transparency log.
+
+            ```sh
+            gh attestation verify reachpad-<target>.tar.gz --repo Reachpad/reachpad-cli
+            ```
 
   # The same binaries, on npm. Separate job so a registry outage cannot lose
   # the GitHub release, and `needs: publish` so npm never advertises a version
