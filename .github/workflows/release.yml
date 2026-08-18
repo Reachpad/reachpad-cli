@@ -312,11 +312,19 @@ jobs:
       - name: the release's own checksums, not the artifacts' word for it
         run: |
           cd artifacts && cat *.sha256 > SHA256SUMS && ls -l
+      # BEFORE prepare.mjs, not after. One of these tests asserts that every
+      # manifest still reads 0.0.0-dev -- that the repo carries no real version
+      # and the tag is the only source. prepare.mjs's whole job is to stamp the
+      # real version into those manifests, so running the suite afterwards
+      # asserts the opposite of what prepare.mjs just did and fails by
+      # construction, on every tag, forever. cli-v0.4.0 is where that was
+      # noticed: the job died here, two steps before the publish that was the
+      # point, and took the "has never been published" diagnostic below with it.
+      - run: node --test npm/test/*.test.mjs
       - name: stamp the tag's version and stage the binaries
         run: |
           version="${GITHUB_REF_NAME#cli-v}"
           node npm/prepare.mjs --version "$version" --artifacts artifacts
-      - run: node --test npm/test/*.test.mjs
       # Idempotent on purpose: five publishes in a row, and the fourth failing
       # must leave a re-runnable tag rather than a half-published version that
       # npm then refuses to accept again. The platform packages go FIRST —
