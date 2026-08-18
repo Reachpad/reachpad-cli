@@ -6,8 +6,9 @@ use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use authz::{
-    attenuate, generate_root, mint, mint_harness, mint_node_token, verify, verify_node_token,
-    Error, KeyPair, Op, PublicKey, Role, TokenBytes,
+    attenuate, generate_root, mint, mint_harness, mint_node_token, mint_workspace_handle, verify,
+    verify_node_token, verify_workspace_handle, Error, GuestOp, KeyPair, Op, PublicKey, Role,
+    TokenBytes,
 };
 use biscuit_auth::builder::BlockBuilder;
 use biscuit_auth::{Biscuit, UnverifiedBiscuit};
@@ -862,6 +863,512 @@ fn n_shape_gate_and_datalog_budget_apply_to_node_tokens() {
             });
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// (g) workspace-handle audience (ADR-0076, design §6)
+//
+// The third audience: the credential a guest holds. It mirrors the (n) set
+// above — separation checked in every direction, never attenuated, every field
+// read from the authority block — and adds the property the node audience has
+// no analogue for: a **positive operation allowlist**, so the set of things a
+// guest can ask for is a closed enum rather than a prose list of things it
+// must not do.
+// ---------------------------------------------------------------------------
+
+const GEN: u64 = 7;
+
+fn assert_handle_denied(result: Result<authz::VerifiedHandle, Error>, context: &str) {
+    match result {
+        Err(Error::Denied(_)) => {}
+        other => panic!("expected Denied for {context}, got {other:?}"),
+    }
+}
+
+/// Datalog for a handle-shaped authority block, so a test can mint one this
+/// crate would never emit (a narrowed allowlist, a missing fact, two of one).
+/// `ops` is the set literal for the block's own op check.
+fn raw_handle_source(ops: &str) -> String {
+    format!(
+        "audience(\"guest\");\nworkspace(\"{WS}\");\nowner_principal(\"{ALICE}\");\n\
+         generation({GEN});\nfencing_token({FENCE});\nexp({EXP});\n\
+         check if time($t), $t < {EXP};\ncheck if op($o), {ops}.contains($o);"
+    )
+}
+
+fn handle() -> TokenBytes {
+    mint_workspace_handle(&root(), WS, ALICE, GEN, FENCE, EXP).unwrap()
+}
+
+#[test]
+fn g_handle_attests_workspace_owner_generation_and_instance() {
+    let token = handle();
+
+    let v = verify_workspace_handle(&token, &root_pub(), WS, GuestOp::ListLinks, NOW).unwrap();
+    assert_eq!(v.workspace, WS);
+    // The handle acts as the workspace OWNER, never as whoever started the VM
+    // (design §6 ruling) — attribution and billing follow this field.
+    assert_eq!(v.owner_principal, ALICE);
+    assert_eq!(v.generation, GEN);
+    assert_eq!(v.fencing_token, FENCE);
+
+    // Workspace binding and expiry bind exactly as they do everywhere else.
+    assert_handle_denied(
+        verify_workspace_handle(&token, &root_pub(), OTHER_WS, GuestOp::ListLinks, NOW),
+        "handle, wrong workspace",
+    );
+    // Expiry binds at exactly the same instant it always did — and answers
+    // its OWN variant (creds milestone C3, ADR-0080). The bound did not move;
+    // only its classification did, because a handle lives five minutes by
+    // design and its holder's remedy is *ask for a fresh one*, which is a
+    // different action from the one every other refusal here calls for. It is
+    // reachable only after the signature chain and the audience verify, so it
+    // is no oracle — and the wrong-workspace case above still asserts
+    // `Denied`, which is what stops the two being merged in the other
+    // direction.
+    match verify_workspace_handle(&token, &root_pub(), WS, GuestOp::ListLinks, EXP) {
+        Err(Error::HandleExpired { exp_ms, now_ms }) => {
+            assert_eq!(exp_ms, EXP, "the refusal names the expiry it read");
+            assert_eq!(now_ms, EXP, "and the time it was judged against");
+        }
+        other => panic!("expected HandleExpired for a handle at expiry, got {other:?}"),
+    }
+    verify_workspace_handle(&token, &root_pub(), WS, GuestOp::ListLinks, EXP - 1).unwrap();
+
+    // A handle from a different root is not ours.
+    let foreign = mint_workspace_handle(&generate_root(999), WS, ALICE, GEN, FENCE, EXP).unwrap();
+    assert!(matches!(
+        verify_workspace_handle(&foreign, &root_pub(), WS, GuestOp::ListLinks, NOW),
+        Err(Error::Token(_))
+    ));
+
+    // Counters outside the datalog integer domain are refused at mint, each
+    // naming its own field.
+    assert!(matches!(
+        mint_workspace_handle(&root(), WS, ALICE, u64::MAX, FENCE, EXP),
+        Err(Error::GenerationOutOfRange(_))
+    ));
+    assert!(matches!(
+        mint_workspace_handle(&root(), WS, ALICE, GEN, u64::MAX, EXP),
+        Err(Error::FencingOutOfRange(_))
+    ));
+    assert!(matches!(
+        mint_workspace_handle(&root(), WS, ALICE, GEN, FENCE, u64::MAX),
+        Err(Error::TimeOutOfRange(_))
+    ));
+}
+
+/// Audience separation, checked in all THREE directions and explicitly. Each
+/// verifier accepts its own token (the positive control) and refuses both
+/// others by naming the audience, not by tripping over some downstream check.
+#[test]
+fn g_audience_separation_is_checked_three_ways() {
+    let user_token = mint(&root(), ALICE, WS, Role::Owner, EXP).unwrap();
+    let node_token = mint_node_token(&root(), NODE, WS, FENCE, EXP).unwrap();
+    let handle_token = handle();
+
+    // Positive controls: each verifier accepts its own.
+    verify(&user_token, &root_pub(), WS, &Op::Read, NOW).unwrap();
+    verify_node_token(&node_token, &root_pub(), WS, NOW).unwrap();
+    verify_workspace_handle(&handle_token, &root_pub(), WS, GuestOp::ListLinks, NOW).unwrap();
+
+    // 1. The user verifier refuses a handle, for every op, on the audience.
+    for op in [
+        Op::Read,
+        Op::Write,
+        Op::Admin,
+        Op::MirrorSync,
+        Op::AppendOwnEvents {
+            principal: ALICE.into(),
+        },
+    ] {
+        match verify(&handle_token, &root_pub(), WS, &op, NOW) {
+            Err(Error::Denied(msg)) => assert!(
+                msg.contains("audience"),
+                "the refusal must name the audience, not be incidental: {msg}"
+            ),
+            other => panic!("a handle must not authorize {op:?}, got {other:?}"),
+        }
+    }
+
+    // 2. The node verifier refuses a handle: it attests no lease generation of
+    //    its own, whatever integer it happens to carry.
+    match verify_node_token(&handle_token, &root_pub(), WS, NOW) {
+        Err(Error::Denied(msg)) => assert!(msg.contains("audience"), "{msg}"),
+        other => panic!("a handle is not a node token, got {other:?}"),
+    }
+
+    // 3. The guest verifier refuses a user token AND a node token.
+    for (label, foreign) in [
+        ("user token", user_token.clone()),
+        (
+            "harness token",
+            mint_harness(&root(), ALICE, WS, EXP).unwrap(),
+        ),
+        ("node token", node_token.clone()),
+    ] {
+        match verify_workspace_handle(&foreign, &root_pub(), WS, GuestOp::ListLinks, NOW) {
+            Err(Error::Denied(msg)) => assert!(
+                msg.contains("audience"),
+                "the refusal must name the audience for a {label}: {msg}"
+            ),
+            other => panic!("a {label} is not a workspace handle, got {other:?}"),
+        }
+    }
+
+    // A share link is refused too — named on the single-block rule, which runs
+    // before signature verification (ADR-0014) and is just as much a handle
+    // rule, so the refusal is still explicit rather than incidental.
+    let share_link = attenuate(&user_token, Role::Viewer, EXP).unwrap();
+    assert_handle_denied(
+        verify_workspace_handle(&share_link, &root_pub(), WS, GuestOp::ListLinks, NOW),
+        "share link presented as a workspace handle",
+    );
+
+    // And a token minted for a fourth audience is refused by all three.
+    let other_audience = mint_raw_authority(&format!(
+        "audience(\"gateway\");\nworkspace(\"{WS}\");\nowner_principal(\"{ALICE}\");\n\
+         generation({GEN});\nfencing_token({FENCE});\nexp({EXP});\n\
+         check if time($t), $t < {EXP};"
+    ));
+    assert_handle_denied(
+        verify_workspace_handle(&other_audience, &root_pub(), WS, GuestOp::ListLinks, NOW),
+        "fourth audience presented as a handle",
+    );
+    assert_node_denied(
+        verify_node_token(&other_audience, &root_pub(), WS, NOW),
+        "fourth audience presented as a node token",
+    );
+    assert_denied(
+        verify(&other_audience, &root_pub(), WS, &Op::Read, NOW),
+        "fourth audience presented as a user token",
+    );
+}
+
+/// A handle at a user route authorizes nothing — the regression pin on the
+/// invariant the whole design leans on. `authorize_verified` refuses any
+/// audience-bearing token *before* it authorizes anything, so this holds for
+/// `Op::Write` even though a handle carries no `role` fact that could have
+/// allowed it. Incidental refusal is not a contract; this one is.
+#[test]
+fn g_a_handle_authorizes_nothing_at_a_user_route() {
+    let token = handle();
+    assert_denied(
+        verify(&token, &root_pub(), WS, &Op::Write, NOW),
+        "handle presented for Op::Write at a user route",
+    );
+    // Not even for its own workspace's owner principal.
+    assert_denied(
+        verify(
+            &token,
+            &root_pub(),
+            WS,
+            &Op::AppendOwnEvents {
+                principal: ALICE.into(),
+            },
+            NOW,
+        ),
+        "handle appending events as the owner it names",
+    );
+}
+
+/// The allowlist is **positive and exhaustive**: every [`GuestOp`] variant gets
+/// a verdict here, and the `match` below has no `_` arm, so a variant added to
+/// the enum without deciding what the guest audience does with it fails to
+/// compile. (Demonstrated once: adding a fourth variant makes this file fail
+/// with `non-exhaustive patterns`.)
+#[test]
+fn g_the_guest_allowlist_is_positive_and_exhaustive() {
+    let token = handle();
+
+    for op in GuestOp::ALL {
+        let allowed = match op {
+            GuestOp::ListLinks => true,
+            GuestOp::Spawn => true,
+            GuestOp::RequestLink => true,
+            GuestOp::UseCredential => true,
+        };
+        let result = verify_workspace_handle(&token, &root_pub(), WS, op, NOW);
+        assert_eq!(
+            result.is_ok(),
+            allowed,
+            "{op:?} verdict changed: got {result:?}"
+        );
+    }
+
+    // The allowlist is enforced twice. Belt: it is carried in the minted
+    // authority block, so it travels with the token rather than living only in
+    // the verifier (`mint_harness`'s shape).
+    let minted = UnverifiedBiscuit::from(token.as_bytes())
+        .unwrap()
+        .print_block_source(0)
+        .unwrap();
+    // biscuit prints a set literal sorted, so build the expectation the same
+    // way rather than pinning the enum's declaration order.
+    let mut names: Vec<&str> = GuestOp::ALL.iter().map(|op| op.name()).collect();
+    names.sort_unstable();
+    let literal = names
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(
+        minted.contains(&format!("check if op($o), [{literal}].contains($o)")),
+        "the minted authority block must carry the allowlist itself:\n{minted}"
+    );
+
+    // Braces: the block half is load-bearing on its own — a handle whose
+    // authority block lists only `list_links` refuses the others even
+    // though the verifier's own match would admit them.
+    let narrowed = mint_raw_authority(&raw_handle_source(r#"["list_links"]"#));
+    verify_workspace_handle(&narrowed, &root_pub(), WS, GuestOp::ListLinks, NOW).unwrap();
+    for op in [GuestOp::Spawn, GuestOp::RequestLink, GuestOp::UseCredential] {
+        assert_handle_denied(
+            verify_workspace_handle(&narrowed, &root_pub(), WS, op, NOW),
+            &format!("{op:?} against a block that allowlists only list_links"),
+        );
+    }
+
+    // Negative control for the pair: with the full allowlist in the block, the
+    // same calls all pass — so the refusals above are the block's check
+    // firing, not something else about a raw-minted handle.
+    let full = mint_raw_authority(&raw_handle_source(
+        r#"["list_links", "spawn", "request_link", "use_credential"]"#,
+    ));
+    for op in GuestOp::ALL {
+        verify_workspace_handle(&full, &root_pub(), WS, op, NOW)
+            .unwrap_or_else(|e| panic!("{op:?} must pass the full allowlist: {e}"));
+    }
+}
+
+/// **The op set lives in the token bytes, so a handle minted before C4 refuses
+/// `use_credential` — and that is the mechanism, not a bug.**
+///
+/// Every handle in the fleet at the moment controld gains this op carries the
+/// three-op literal in its own authority block. A verifier that learned the
+/// fourth op does not widen them: the block's `check if op($o), [...]` still
+/// runs and still fails. The consequence is operational and belongs in the
+/// deploy note rather than in a comment nobody reads — a guest cannot spend a
+/// brokered credential until its node's refresher has re-minted, which is at
+/// most one `HANDLE_TTL_MS` after the controld deploy.
+///
+/// The same handle keeps working for the three ops it was minted with, which
+/// is what makes this a delay rather than an outage.
+#[test]
+fn g_a_handle_minted_before_use_credential_existed_refuses_it() {
+    let pre_c4 = mint_raw_authority(&raw_handle_source(
+        r#"["list_links", "spawn", "request_link"]"#,
+    ));
+    assert_handle_denied(
+        verify_workspace_handle(&pre_c4, &root_pub(), WS, GuestOp::UseCredential, NOW),
+        "a pre-C4 handle presented for use_credential",
+    );
+    for op in [GuestOp::ListLinks, GuestOp::Spawn, GuestOp::RequestLink] {
+        verify_workspace_handle(&pre_c4, &root_pub(), WS, op, NOW)
+            .unwrap_or_else(|e| panic!("a pre-C4 handle must still authorize {op:?}: {e}"));
+    }
+    // And the re-mint is the whole remedy: the same workspace, minted now,
+    // authorizes the new op immediately.
+    verify_workspace_handle(&handle(), &root_pub(), WS, GuestOp::UseCredential, NOW)
+        .expect("a freshly minted handle carries the four-op allowlist");
+}
+
+/// Attenuation of a handle is REFUSED, not merely unused — asserted, not
+/// assumed (ADR-0021's rule, inherited by ADR-0076 because a handle declares
+/// an audience).
+#[test]
+fn g_handles_are_never_attenuated() {
+    let token = handle();
+
+    match attenuate(&token, Role::Viewer, EXP) {
+        Err(Error::Denied(msg)) => assert!(msg.contains("attenuat"), "{msg}"),
+        other => panic!("attenuating a workspace handle must error, got {other:?}"),
+    }
+
+    // Going around `attenuate` does not help: a handle carrying ANY appended
+    // block is refused, checks-only or not.
+    let appended = append_raw_block(&token, r#"check if workspace($w);"#);
+    assert_handle_denied(
+        verify_workspace_handle(&appended, &root_pub(), WS, GuestOp::ListLinks, NOW),
+        "handle with an appended check-only block",
+    );
+    let padded = append_empty_block(&token);
+    assert_handle_denied(
+        verify_workspace_handle(&padded, &root_pub(), WS, GuestOp::ListLinks, NOW),
+        "handle with an empty appended block",
+    );
+}
+
+/// `generation` and `fencing_token` are read from the **authority block only**.
+/// An appended block claiming different numbers does not change them — the
+/// handle is refused outright, which is strictly stronger than ignoring the
+/// claim.
+#[test]
+fn g_generation_and_fencing_come_from_the_authority_block_only() {
+    let token = handle();
+
+    let forged = append_raw_block(
+        &token,
+        &format!("generation({});\nfencing_token({});", GEN + 1000, FENCE + 1),
+    );
+    assert_handle_denied(
+        verify_workspace_handle(&forged, &root_pub(), WS, GuestOp::ListLinks, NOW),
+        "handle with a forged appended generation",
+    );
+
+    // Two of a counter are as meaningless as none, in either direction.
+    for (label, source) in [
+        (
+            "two generations",
+            format!(
+                "audience(\"guest\");\nworkspace(\"{WS}\");\nowner_principal(\"{ALICE}\");\n\
+                 generation({GEN});\ngeneration({});\nfencing_token({FENCE});\nexp({EXP});\n\
+                 check if time($t), $t < {EXP};",
+                GEN + 1
+            ),
+        ),
+        (
+            "no generation",
+            format!(
+                "audience(\"guest\");\nworkspace(\"{WS}\");\nowner_principal(\"{ALICE}\");\n\
+                 fencing_token({FENCE});\nexp({EXP});\ncheck if time($t), $t < {EXP};"
+            ),
+        ),
+        (
+            "no fencing token",
+            format!(
+                "audience(\"guest\");\nworkspace(\"{WS}\");\nowner_principal(\"{ALICE}\");\n\
+                 generation({GEN});\nexp({EXP});\ncheck if time($t), $t < {EXP};"
+            ),
+        ),
+        (
+            "no owner principal",
+            format!(
+                "audience(\"guest\");\nworkspace(\"{WS}\");\ngeneration({GEN});\n\
+                 fencing_token({FENCE});\nexp({EXP});\ncheck if time($t), $t < {EXP};"
+            ),
+        ),
+        (
+            "negative generation",
+            format!(
+                "audience(\"guest\");\nworkspace(\"{WS}\");\nowner_principal(\"{ALICE}\");\n\
+                 generation(-1);\nfencing_token({FENCE});\nexp({EXP});\n\
+                 check if time($t), $t < {EXP};"
+            ),
+        ),
+    ] {
+        assert_handle_denied(
+            verify_workspace_handle(
+                &mint_raw_authority(&source),
+                &root_pub(),
+                WS,
+                GuestOp::ListLinks,
+                NOW,
+            ),
+            &format!("handle with {label}"),
+        );
+    }
+}
+
+/// The handle's authority block fits the statement ceiling with room to spare,
+/// and the ADR-0014 hardening covers this path too.
+#[test]
+fn g_shape_gate_and_statement_budget_apply_to_handles() {
+    // 6 facts + 2 checks = 8, against MAX_AUTHORITY_STATEMENTS = 16. Counted,
+    // not assumed: the block is the widest this crate mints.
+    let token = handle();
+    let source = UnverifiedBiscuit::from(token.as_bytes())
+        .unwrap()
+        .print_block_source(0)
+        .unwrap();
+    let statements = source.split(';').filter(|s| !s.trim().is_empty()).count();
+    assert_eq!(statements, 8, "handle authority block:\n{source}");
+    assert!(statements <= 16, "authority statement ceiling");
+
+    // Enormous token: refused before it is parsed.
+    let mut giant = token.clone().into_vec();
+    giant.resize(64 * 1024, 0);
+    assert_handle_denied(
+        verify_workspace_handle(
+            &TokenBytes::from_vec(giant),
+            &root_pub(),
+            WS,
+            GuestOp::ListLinks,
+            NOW,
+        ),
+        "64 KiB handle",
+    );
+
+    // Oversized authority datalog: refused after the signature says it is
+    // ours, before any authorizer exists.
+    let bloated = mint_raw_authority(&format!(
+        "audience(\"guest\");\nworkspace(\"{}\");\nowner_principal(\"{ALICE}\");\n\
+         generation({GEN});\nfencing_token({FENCE});\nexp({EXP});\n\
+         check if time($t), $t < {EXP};",
+        "w".repeat(1100)
+    ));
+    assert_handle_denied(
+        verify_workspace_handle(&bloated, &root_pub(), WS, GuestOp::ListLinks, NOW),
+        "handle with a 1 KiB+ authority block",
+    );
+
+    // Too many authority statements.
+    let mut padded = raw_handle_source(r#"["list_links", "spawn", "request_link"]"#);
+    for i in 0..20 {
+        padded.push_str(&format!("\npad({i});"));
+    }
+    assert_handle_denied(
+        verify_workspace_handle(
+            &mint_raw_authority(&padded),
+            &root_pub(),
+            WS,
+            GuestOp::ListLinks,
+            NOW,
+        ),
+        "handle with 28 authority statements",
+    );
+
+    // And the other failure mode (ADR-0014's first half): a shared datalog
+    // budget so tight that honest handles are denied under load.
+    let threads = std::thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(4)
+        .clamp(2, 8);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let token = token.clone();
+            scope.spawn(move || {
+                for _ in 0..60 {
+                    let v =
+                        verify_workspace_handle(&token, &root_pub(), WS, GuestOp::ListLinks, NOW)
+                            .expect("a legitimate handle must never be denied");
+                    assert_eq!(v.generation, GEN);
+                }
+            });
+        }
+    });
+}
+
+/// Untrusted strings stay strings on this path too: a workspace id or owner
+/// principal full of datalog syntax is a value, never syntax.
+#[test]
+fn g_injection_in_handle_strings_is_inert() {
+    let evil_ws = r#"ws") or true or workspace("x"#;
+    let evil_owner = r#"eve") or true; audience("node"#;
+    let token = mint_workspace_handle(&root(), evil_ws, evil_owner, GEN, FENCE, EXP).unwrap();
+
+    let v = verify_workspace_handle(&token, &root_pub(), evil_ws, GuestOp::Spawn, NOW).unwrap();
+    assert_eq!(v.workspace, evil_ws);
+    assert_eq!(v.owner_principal, evil_owner);
+    assert_handle_denied(
+        verify_workspace_handle(&token, &root_pub(), WS, GuestOp::Spawn, NOW),
+        "evil workspace does not match a normal one",
+    );
+    // The smuggled `audience("node")` is a substring of a string, not a fact.
+    assert_node_denied(
+        verify_node_token(&token, &root_pub(), evil_ws, NOW),
+        "handle with an injection-shaped owner principal, as a node token",
+    );
 }
 
 // ---------------------------------------------------------------------------

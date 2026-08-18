@@ -30,8 +30,14 @@ pub struct ExecSpec<'a> {
 pub enum ExecItem<'a> {
     /// Output as it arrives. `fd` is 1 or 2, never merged.
     Out { fd: u8, bytes: &'a [u8] },
-    /// The workspace was paused and this command woke it, so the delay is a
-    /// resume rather than a hang.
+    /// This command found the workspace down and woke it, so the delay is a
+    /// boot rather than a hang.
+    ///
+    /// `reason` is the server's word for what it is doing — `starting`
+    /// (nothing to restore), `restoring` (a disk-only head) or `resuming` (a
+    /// `disk+mem` head, the mid-thought case). It is rendered verbatim, so a
+    /// server that learns a new one needs no CLI release; the CLI only owns
+    /// the sentence around it.
     Waiting { reason: &'a str },
 }
 
@@ -249,8 +255,49 @@ pub struct Status {
     pub forks: u64,
     pub idle_pause_seconds: u64,
     pub limits: Limits,
+    /// The workspace's own block-device size, and what a workspace created
+    /// right now would get (WP-CP.3). `None` against a fleet that predates
+    /// the field — absent, not zero, because "0 bytes" is a lie and a `?` is
+    /// not.
+    pub device: Option<DeviceSize>,
+    /// How much of that device is still writable, as the GUEST last measured
+    /// it (WP-CP.4). `None` whenever the fleet does not report it — which is
+    /// every fleet today, see [`GuestDisk`].
+    pub guest_disk: Option<GuestDisk>,
     pub created_at_ms: u64,
     pub archived_at_ms: Option<u64>,
+}
+
+/// Free space inside the workspace's filesystem, measured by the guest.
+///
+/// # Why this is an option that is currently always `None`
+///
+/// The figure exists: workspaced runs `statvfs` on the two-second status
+/// cadence and puts it on `GuestStatus`, and the node has it in hand. What
+/// does not exist is a path from the node's heartbeat to this read-only route
+/// — controld would have to persist the sample on the lease row, which means
+/// two nullable columns, a migration, and a write on the heartbeat's hot path
+/// for a value that is a *sample* rather than reconstructible state (§4.1).
+/// WP-CP.4 scoped that out rather than doing it badly; the client half ships
+/// now so that the day the fleet reports it, no CLI release is needed.
+///
+/// The client's posture until then is the one trap 41 asks for: **say
+/// nothing.** No guessed number, no "0 bytes free", no `?` — the line simply
+/// is not printed, and `status --json` carries `null`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestDisk {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Two disk sizes that must be read together: a workspace keeps the size it
+/// was created with, and nothing grows it in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceSize {
+    /// This workspace's device.
+    pub workspace_bytes: u64,
+    /// What a workspace created now is stamped with.
+    pub new_workspace_bytes: u64,
 }
 
 /// What a release did: `released` ended the lease now (a discard), `sealing`
@@ -670,6 +717,33 @@ impl Client {
             forks: body["forks"].as_u64().unwrap_or(0),
             idle_pause_seconds: body["idle_pause_seconds"].as_u64().unwrap_or(0),
             limits: limits_of(&body["limits"]).unwrap_or_default(),
+            // Both halves or neither (trap 41 posture): a fleet that reports
+            // one and not the other is one this client cannot describe
+            // honestly, so it says nothing rather than inventing the missing
+            // number.
+            device: match (
+                body["device_bytes"]["workspace"].as_u64(),
+                body["device_bytes"]["new_workspace"].as_u64(),
+            ) {
+                (Some(workspace_bytes), Some(new_workspace_bytes)) => Some(DeviceSize {
+                    workspace_bytes,
+                    new_workspace_bytes,
+                }),
+                _ => None,
+            },
+            // Both halves or neither, for the same reason as `device` above:
+            // a free figure with no total cannot be rendered as a fraction,
+            // and a total with no free says nothing at all.
+            guest_disk: match (
+                body["guest_disk"]["free_bytes"].as_u64(),
+                body["guest_disk"]["total_bytes"].as_u64(),
+            ) {
+                (Some(free_bytes), Some(total_bytes)) => Some(GuestDisk {
+                    free_bytes,
+                    total_bytes,
+                }),
+                _ => None,
+            },
             created_at_ms: ws["created_at_ms"].as_u64().unwrap_or(0),
             archived_at_ms: ws["archived_at_ms"].as_u64(),
         })

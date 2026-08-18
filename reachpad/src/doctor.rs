@@ -63,7 +63,14 @@ pub(crate) async fn run(ctx: &Ctx) -> Result<i32, CliError> {
         Ok(path) => {
             let source = install_source(&path);
             report.ok("binary", format!("{} ({})", path.display(), owner(source)));
-            if executable_is_on_path(&path) {
+            // An npm install is EXPECTED not to be the file on PATH: what npm
+            // links into a bin directory is its own launcher, which then
+            // execs this binary out of `node_modules`. Comparing the two
+            // failed that check on every healthy npm install — a red line on
+            // a working machine, which teaches people to ignore doctor.
+            if source == InstallSource::Npm {
+                report.ok("path", "`reachpad` is npm's launcher for this binary");
+            } else if executable_is_on_path(&path) {
                 report.ok("path", "`reachpad` resolves to this binary");
             } else {
                 report.fail(
@@ -215,6 +222,8 @@ pub(crate) async fn run(ctx: &Ctx) -> Result<i32, CliError> {
 fn owner(source: InstallSource) -> &'static str {
     match source {
         InstallSource::Homebrew => "installed by Homebrew",
+        InstallSource::HomebrewCask => "installed by Homebrew as a cask the tap no longer ships",
+        InstallSource::Npm => "installed by npm",
         InstallSource::Development => "a cargo build in this checkout",
         InstallSource::Native => "installed by the Reachpad installer",
     }
@@ -222,7 +231,11 @@ fn owner(source: InstallSource) -> &'static str {
 
 fn update_path(source: InstallSource) -> &'static str {
     match source {
-        InstallSource::Homebrew => "`reachpad update` defers to `brew upgrade --cask reachpad`",
+        InstallSource::Homebrew => "`reachpad update` defers to `brew upgrade reachpad`",
+        InstallSource::HomebrewCask => {
+            "`reachpad update` prints the cask-to-formula migration: the tap ships a formula now"
+        }
+        InstallSource::Npm => "`reachpad update` defers to `npm install -g @reachpad/cli@latest`",
         InstallSource::Development => "`reachpad update` defers to `cargo build -p reach`",
         InstallSource::Native => "`reachpad update` can replace this binary",
     }

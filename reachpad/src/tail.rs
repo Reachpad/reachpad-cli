@@ -131,6 +131,9 @@ pub fn type_name(code: u32) -> &'static str {
         events::EXEC_RAN => "exec.ran",
         events::NOTIFY => "notify",
         events::PREVIEW => "preview",
+        events::CREDS_RESOLVED => "creds.resolved",
+        events::CREDS_REVOKE_ACKED => "creds.revoke_acked",
+        events::LINK_REQUESTED => "link.requested",
         _ => "unknown", // append-only registry: newer peers are fine (§6)
     }
 }
@@ -505,6 +508,8 @@ mod tests {
         assert_eq!(type_name(events::PTY_OUT), "pty.out");
         assert_eq!(type_name(events::GRANT_CHANGED), "grant.changed");
         assert_eq!(type_name(events::AUTHZ_DENIED), "authz.denied");
+        assert_eq!(type_name(events::CREDS_RESOLVED), "creds.resolved");
+        assert_eq!(type_name(events::CREDS_REVOKE_ACKED), "creds.revoke_acked");
         assert_eq!(type_name(10_000), "unknown");
     }
 

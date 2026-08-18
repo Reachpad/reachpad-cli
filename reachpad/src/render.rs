@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use crate::api::{Head, Limits, Parent, Status, Workspace};
+use crate::api::{DeviceSize, GuestDisk, Head, Limits, Parent, Status, Workspace};
 
 /// Epoch milliseconds as RFC 3339 UTC — the only timestamp spelling on this
 /// surface. `0` means "not set", which renders as JSON null.
@@ -135,6 +135,25 @@ pub fn status_json(status: &Status) -> Value {
         "forks": status.forks,
         "idle_pause_seconds": status.idle_pause_seconds,
         "limits": limits_json(&status.limits),
+        // WP-CP.4, null against a fleet that does not report it. A machine
+        // caller can tell "no such field" from a number; it must never be
+        // handed a zero it would read as an empty disk.
+        "guest_disk": match &status.guest_disk {
+            None => Value::Null,
+            Some(g) => json!({
+                "free_bytes": g.free_bytes,
+                "total_bytes": g.total_bytes,
+            }),
+        },
+        // Null against a fleet that does not report it (WP-CP.3): a script
+        // that keys on this can tell "no such field" from a number.
+        "disk": match &status.device {
+            None => Value::Null,
+            Some(d) => json!({
+                "device_bytes": d.workspace_bytes,
+                "new_workspace_device_bytes": d.new_workspace_bytes,
+            }),
+        },
         "created_at": time(status.created_at_ms),
         "archived_at": status.archived_at_ms.map_or(Value::Null, time),
     })
@@ -173,8 +192,83 @@ pub fn status_lines(status: &Status, now_ms: u64) -> Vec<String> {
         "  saves: {}   forks: {}   idle pause: {}s",
         status.snapshots, status.forks, status.idle_pause_seconds
     ));
+    if let Some(d) = &status.device {
+        out.push(disk_line(d));
+    }
+    // WP-CP.4: the condition, visible BEFORE it bites. Its own line rather
+    // than a clause on the disk line, because the two are different facts
+    // from different sources — the size is a row in Postgres, the free space
+    // is the guest's own `statvfs` — and a fleet can report either without
+    // the other.
+    if let Some(g) = &status.guest_disk {
+        out.push(free_line(g));
+    }
     out.push(limits_line(&status.limits));
     out
+}
+
+/// Binary units, the units a `df` inside the guest will agree with. Whole
+/// numbers where the value is a whole number of units (a 20 GiB disk is not
+/// "20.0 GiB", and 4.5 GiB is not "4 GiB").
+pub fn gib(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= GIB {
+        let whole = bytes / GIB;
+        let tenths = (bytes % GIB) * 10 / GIB;
+        if tenths == 0 {
+            format!("{whole} GiB")
+        } else {
+            format!("{whole}.{tenths} GiB")
+        }
+    } else {
+        format!("{} MiB", bytes.div_ceil(MIB))
+    }
+}
+
+/// The disk line, and the one sentence that stops "disks are 20 GB now" from
+/// being read as fleet-wide (WP-CP.3).
+///
+/// A workspace keeps the size it was created with: there is no in-place grow
+/// anywhere in the platform, because the ext4 superblock lives inside the
+/// workspace's own image and was written once. So when this workspace is
+/// smaller than what a new one gets, the CLI says both numbers and says what
+/// the difference means — the alternative is a customer reading a release
+/// note and looking at a disk that disagrees with it.
+pub fn disk_line(d: &DeviceSize) -> String {
+    if d.workspace_bytes >= d.new_workspace_bytes {
+        format!("  disk:      {}", gib(d.workspace_bytes))
+    } else {
+        format!(
+            "  disk:      {} — new workspaces get {}; existing disks are not grown, so a \
+             bigger one means `reachpad create` (a fork inherits this size)",
+            gib(d.workspace_bytes),
+            gib(d.new_workspace_bytes)
+        )
+    }
+}
+
+/// The free-space line (WP-CP.4), and a warning when the workspace is close
+/// enough to full that the next build is the one that finds out.
+///
+/// The threshold mirrors `workspaced::disk::is_full` — the guest's own
+/// judgement, restated here because this line is rendered from figures rather
+/// than from the guest's verdict. They must move together: a `status` that
+/// looks calm right up to the moment a build fails with `workspace_disk_full`
+/// is the confusion this work package exists to end, one step earlier.
+pub fn free_line(g: &GuestDisk) -> String {
+    const FLOOR: u64 = 64 * 1024 * 1024;
+    let full = g.total_bytes > 0 && g.free_bytes <= FLOOR.max(g.total_bytes / 100);
+    format!(
+        "  free:      {} of {}{}",
+        gib(g.free_bytes),
+        gib(g.total_bytes),
+        if full {
+            " — this workspace is out of room; commands will start failing"
+        } else {
+            ""
+        }
+    )
 }
 
 pub fn limits_line(limits: &Limits) -> String {
@@ -242,5 +336,162 @@ mod tests {
         assert_eq!(v["archived_at"], Value::Null);
         // No `_ms` field survives the rendering layer.
         assert!(!v.to_string().contains("_ms"), "{v}");
+    }
+
+    /// A `Status` with nothing interesting in it but the disk (WP-CP.3).
+    fn status_with(device: Option<DeviceSize>) -> Status {
+        status_with_free(device, None)
+    }
+
+    /// …and the same with WP-CP.4's guest measurement.
+    fn status_with_free(device: Option<DeviceSize>, guest_disk: Option<GuestDisk>) -> Status {
+        Status {
+            id: "ws-601".into(),
+            name: "demo".into(),
+            state: "paused".into(),
+            lease: None,
+            head: None,
+            parent: None,
+            snapshots: 0,
+            forks: 0,
+            idle_pause_seconds: 900,
+            limits: Limits::default(),
+            device,
+            guest_disk,
+            created_at_ms: 1_755_108_131_000,
+            archived_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn sizes_read_in_the_units_a_guest_df_will_agree_with() {
+        assert_eq!(gib(20 * 1024 * 1024 * 1024), "20 GiB");
+        assert_eq!(gib(4 * 1024 * 1024 * 1024), "4 GiB");
+        // Not a whole number of GiB, and not rounded into one.
+        assert_eq!(gib(4 * 1024 * 1024 * 1024 + 512 * 1024 * 1024), "4.5 GiB");
+        assert_eq!(gib(256 * 1024 * 1024), "256 MiB");
+    }
+
+    #[test]
+    fn a_workspace_smaller_than_the_current_default_is_told_why() {
+        // The 4 GiB workspace: it must not read a 20 GiB release note and
+        // conclude the platform lied to it. Both numbers, and what the
+        // difference means.
+        let line = disk_line(&DeviceSize {
+            workspace_bytes: 4 * 1024 * 1024 * 1024,
+            new_workspace_bytes: 20 * 1024 * 1024 * 1024,
+        });
+        assert!(line.contains("4 GiB"), "{line}");
+        assert!(line.contains("20 GiB"), "{line}");
+        assert!(line.contains("not grown"), "{line}");
+        assert!(line.contains("reachpad create"), "{line}");
+
+        // The 20 GiB workspace: one number, no lecture. A sentence every
+        // customer sees on every status read is noise, and noise is how the
+        // sentence that matters stops being read.
+        let line = disk_line(&DeviceSize {
+            workspace_bytes: 20 * 1024 * 1024 * 1024,
+            new_workspace_bytes: 20 * 1024 * 1024 * 1024,
+        });
+        assert_eq!(line, "  disk:      20 GiB");
+    }
+
+    #[test]
+    fn a_fleet_that_does_not_report_the_disk_is_not_given_one() {
+        // Trap 41: absent is absent. An older controld reports no device
+        // size at all, and the CLI must not turn that into "0 bytes" or into
+        // the number it wishes were true.
+        let status = status_with(None);
+        assert_eq!(status_json(&status)["disk"], Value::Null);
+        let lines = status_lines(&status, 1_755_108_131_000);
+        assert!(
+            !lines.iter().any(|l| l.contains("disk:")),
+            "no disk line at all: {lines:?}"
+        );
+
+        let status = status_with(Some(DeviceSize {
+            workspace_bytes: 20 * 1024 * 1024 * 1024,
+            new_workspace_bytes: 20 * 1024 * 1024 * 1024,
+        }));
+        let v = status_json(&status);
+        assert_eq!(v["disk"]["device_bytes"], json!(20 * 1024 * 1024 * 1024u64));
+        assert_eq!(
+            v["disk"]["new_workspace_device_bytes"],
+            json!(20 * 1024 * 1024 * 1024u64)
+        );
+        let lines = status_lines(&status, 1_755_108_131_000);
+        assert!(
+            lines.iter().any(|l| l.contains("disk:      20 GiB")),
+            "{lines:?}"
+        );
+    }
+
+    // -- WP-CP.4: free space, and the fleet that does not report it --------
+
+    const GIB_U: u64 = 1024 * 1024 * 1024;
+
+    /// The point of the line: a filling workspace is visible in `status`
+    /// BEFORE a build discovers it.
+    #[test]
+    fn free_space_is_shown_with_the_size_it_is_free_of() {
+        let line = free_line(&GuestDisk {
+            free_bytes: 18 * GIB_U,
+            total_bytes: 20 * GIB_U,
+        });
+        assert!(line.contains("18 GiB"), "{line}");
+        assert!(line.contains("20 GiB"), "{line}");
+        assert!(
+            !line.contains("out of room"),
+            "18 GiB free is not a warning: {line}"
+        );
+    }
+
+    /// The warning fires on the same threshold the guest judges an exec by
+    /// (`workspaced::disk::is_full`: the greater of 64 MiB and 1%). If these
+    /// two drift, `status` reads calm right up to the command that fails.
+    #[test]
+    fn a_workspace_at_the_guests_own_threshold_is_warned_about() {
+        let warned = free_line(&GuestDisk {
+            free_bytes: 200 * 1024 * 1024,
+            total_bytes: 20 * GIB_U,
+        });
+        assert!(warned.contains("out of room"), "{warned}");
+        // …and one byte the other side of it is not.
+        let calm = free_line(&GuestDisk {
+            free_bytes: 220 * 1024 * 1024,
+            total_bytes: 20 * GIB_U,
+        });
+        assert!(!calm.contains("out of room"), "{calm}");
+    }
+
+    /// **The trap-41 posture, and the control for the two tests above.** A
+    /// fleet that reports no measurement produces no line and a JSON `null` —
+    /// never a zero, which a script would read as an empty disk, and never a
+    /// `?`. This is today's every fleet, so it is the case that must be right.
+    #[test]
+    fn negative_control_a_fleet_that_reports_no_free_space_says_nothing() {
+        let status = status_with_free(None, None);
+        let lines = status_lines(&status, 1_755_108_131_000);
+        assert!(
+            !lines.iter().any(|l| l.contains("free:")),
+            "a free line was printed for a fleet that reported nothing: {lines:?}"
+        );
+        assert_eq!(status_json(&status)["guest_disk"], Value::Null);
+
+        // …and with a measurement, both surfaces carry it.
+        let reported = status_with_free(
+            None,
+            Some(GuestDisk {
+                free_bytes: 3 * GIB_U,
+                total_bytes: 20 * GIB_U,
+            }),
+        );
+        assert!(status_lines(&reported, 1_755_108_131_000)
+            .iter()
+            .any(|l| l.contains("free:      3 GiB of 20 GiB")));
+        assert_eq!(
+            status_json(&reported)["guest_disk"]["free_bytes"],
+            json!(3 * GIB_U)
+        );
     }
 }

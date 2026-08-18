@@ -53,6 +53,36 @@ message Manifest {
                                 // before this decode with an empty signature,
                                 // which `restore_memory` refuses by name
                                 // rather than mistaking for corruption.
+
+  // ---- ADR-0096: snapshot ⇄ artifact identity (set iff KIND_DISK_MEM) ----
+  //
+  // A memory image is only meaningful beside the artifacts it was captured
+  // against, and NEITHER of them is inside the snapshot. The guest rootfs is
+  // a shared host file every VM opens read-only, and the guest's RAM size
+  // comes back out of the vmstate file — so rebuilding the image in place, or
+  // changing the node's `--mem-mib`, silently repoints a restore at different
+  // artifacts. That is the 2026-08-15 incident: an in-place rootfs rebuild
+  // shifted every inode by one, a warm resume reopened the new image under
+  // the old guest's dentry cache, and every userland binary answered
+  // `Exec format error`.
+  //
+  // Same discipline as `host_cpu_sig` (field 8), same three cases at restore:
+  // absent = unknown provenance = refuse the memory half; different = refuse;
+  // equal = load. Refusal is never fatal — it is a COLD BOOT from the disk
+  // half, which is intact.
+  //
+  // Appended at `v=1` for field 8's reason, and legacy manifests need no
+  // compatibility path: a `DISK_MEM` manifest with no identity cold-boots
+  // (owner ruling 2026-08-16 — existing workspaces are expendable).
+  bytes  rootfs_digest     = 9;  // sha256 of the rootfs image the sealing
+                                 // guest was booted from (raw 32 bytes).
+  uint64 mem_mib           = 10; // the guest RAM size the image was captured
+                                 // at. Restore takes the size from the
+                                 // vmstate file, so a node whose configured
+                                 // size has moved would otherwise resume a
+                                 // guest at the OLD size while its cgroup cap
+                                 // sits at the new one, with nothing
+                                 // detecting the split.
 }
 
 // ---- §6 handshake / capability negotiation ------------------------------
@@ -137,4 +167,15 @@ message ExecRan {
   // the only moment anything knows, so a later usage question is a read
   // rather than a migration (the deferred-billing hedge, ADR-0059 §12(e)).
   bool   caused_resume = 12;
+  // WHAT it woke it from: `already_running`, `starting`, `restoring` or
+  // `resuming` (`controld::execbroker::BootKind`).
+  //
+  // `caused_resume` above could not answer this and was reported as a resume
+  // for all three, including a workspace that had never started and had no
+  // snapshot to restore. Added ALONGSIDE rather than replacing field 12: this
+  // message lands in the durable log I1 protects, events already sealed there
+  // carry only the boolean, and a reader that dropped field 12 would lose the
+  // audit answer for every exec written before this. Empty on those events,
+  // which is how a reader tells "before the split" from `already_running`.
+  string boot_kind     = 13;
 }

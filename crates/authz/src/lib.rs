@@ -1,7 +1,7 @@
 //! authz — Biscuit capability tokens (INFRA_SPEC §7.2, I6).
 //!
-//! Two token **audiences** live here, and every verifier demands the one it
-//! expects (ADR-0021).
+//! Three token **audiences** live here, and every verifier demands the one it
+//! expects (ADR-0021, ADR-0076).
 //!
 //! **User-facing** ([`mint`], [`mint_harness`], [`attenuate`], [`verify`]).
 //! Every workspace operation is authorized by a chain rooted in a grant. The
@@ -22,6 +22,48 @@
 //! check if time($t), $t < <ms>;
 //! ```
 //!
+//! **Workspace handles** ([`mint_workspace_handle`], [`verify_workspace_handle`],
+//! ADR-0076). The credential a *guest* holds: it names the workspace it runs
+//! in, the owner principal everything in that guest acts as, the workspace's
+//! `authz_generation` at mint time, and the current VM instance's fencing
+//! token:
+//!
+//! ```datalog
+//! audience("guest"); workspace("<id>"); owner_principal("<id>");
+//! generation(<u64>); fencing_token(<u64>); exp(<ms>);
+//! check if time($t), $t < <ms>;
+//! check if op($o),
+//!   ["list_links", "spawn", "request_link", "use_credential"].contains($o);
+//! ```
+//!
+//! **The op set is inside the token bytes, so widening it needs a re-mint.**
+//! `use_credential` (creds milestone C4) is the fourth op, and every handle
+//! minted before it existed carries the three-op literal in its authority
+//! block: such a handle is refused for `UseCredential` by its OWN check, even
+//! against a verifier that knows the op. That is the allowlist working, and it
+//! self-heals — handles live minutes (`controld::edges::HANDLE_TTL_MS`) and the
+//! node's refresher re-mints them, so the fleet converges within one TTL of
+//! the controld deploy. Pinned by
+//! `invariants::g_a_handle_minted_before_use_credential_existed_refuses_it`.
+//!
+//! A handle authorizes a **positive allowlist** of guest operations
+//! ([`GuestOp`]) and nothing else. "Nothing else" is a mechanism, not a prose
+//! promise: the op vocabulary is a closed enum matched exhaustively by
+//! [`verify_workspace_handle`] (no `_` arm, so a new variant cannot be added
+//! without deciding its verdict), *and* the same allowlist is carried as a
+//! check in the minted authority block, so a caller that went around the
+//! verifier still gets nothing. Lifecycle and destructive operations (archive,
+//! release, rewind, cross-workspace exec or fork) are outside the allowlist by
+//! construction — they have no [`GuestOp`] to name them.
+//!
+//! The generation and the fencing token are the freshness half. Neither is
+//! trusted by the token holder: a verifier compares them against the rows
+//! (`workspaces.authz_generation`, the live lease) and re-mints when they no
+//! longer match. Instance binding is what makes a handle resident in an
+//! inherited or restored memory image dead on arrival — resume, fork and
+//! rewind all rotate the instance's fencing token (the node-fencing pattern,
+//! ADR-0006/ADR-0021).
+//!
 //! A fencing token is deliberately **not** a user-facing fact (§7.2; the
 //! amendment proposing it was rejected — ADR-0015). Authorization and fencing
 //! have opposite lifecycles: a grant changes rarely and is meant to be
@@ -33,24 +75,30 @@
 //! issued to one node for one generation, is never shared, and is never
 //! attenuated.
 //!
-//! The separation is checked **both ways, explicitly** — never incidentally:
-//! [`verify`] refuses a token carrying any `audience` fact (a node token is
-//! not a workspace capability and authorizes nothing), and
-//! [`verify_node_token`] refuses a token that does not carry
-//! `audience("node")` (a user-facing token, however privileged, proves no
-//! lease generation). Both refusals happen before the request is authorized at
-//! all, so the error names the audience rather than some downstream symptom.
+//! The separation is checked **in every direction, explicitly** — never
+//! incidentally: [`verify`] refuses a token carrying any `audience` fact (a
+//! node token or a workspace handle is not a workspace capability and
+//! authorizes nothing), [`verify_node_token`] refuses anything that does not
+//! carry `audience("node")` (a user-facing token, however privileged, proves
+//! no lease generation), and [`verify_workspace_handle`] refuses anything that
+//! does not carry `audience("guest")` (neither a user token nor a node token
+//! is a guest handle). Every refusal happens before the request is authorized
+//! at all, so the error names the audience rather than some downstream symptom.
 //!
-//! Attenuation (the sharing mechanism — a share link IS an attenuated token)
-//! appends blocks that contain **only checks**, never facts the authorizer
-//! trusts. In biscuit v2+ datalog semantics, the authorizer's rules and
-//! checks only match facts from the authority block and the authorizer
-//! itself; facts added by appended blocks are untrusted (invisible to the
-//! authorizer and to earlier blocks). Since appended blocks can therefore
+//! Attenuation appends blocks that contain **only checks**, never facts the
+//! authorizer trusts. It narrows an existing token's own role and expiry
+//! offline; it is *not* how a workspace is shared with another person —
+//! appended blocks cannot rebind `principal`, so a share is server-minted for
+//! the grantee's own principal instead (ADR-0075, superseding "a share link IS
+//! an attenuated token"). In biscuit v2+ datalog semantics, the authorizer's
+//! rules and checks only match facts from the authority block and the
+//! authorizer itself; facts added by appended blocks are untrusted (invisible
+//! to the authorizer and to earlier blocks). Since appended blocks can therefore
 //! only ADD constraints, attenuation can only narrow — widening is
 //! structurally impossible. The tests in `tests/invariants.rs` pin this.
-//! Node tokens take no part in this: [`attenuate`] *refuses* them, and
-//! [`verify_node_token`] accepts a single authority block only.
+//! Audience-bearing tokens take no part in it: [`attenuate`] *refuses* them,
+//! and [`verify_node_token`] / [`verify_workspace_handle`] each accept a
+//! single authority block only.
 //!
 //! That "appended blocks are checks only" contract is not just documentation:
 //! [`verify`] *enforces* it structurally before it evaluates any datalog (see
@@ -160,7 +208,8 @@ const MAX_BLOCKS: usize = 16;
 /// crate emits) prints ~330 bytes; `attenuate` blocks ~100.
 const MAX_BLOCK_SOURCE_BYTES: usize = 1024;
 
-/// Statement ceiling for the authority block: 5 facts + 3 checks today, and
+/// Statement ceiling for the authority block: 6 facts + 2 checks at the
+/// widest today ([`mint_workspace_handle`]; `mint_harness` is 4 + 3), and
 /// unescaped quotes in a hostile principal string can split a printed fact
 /// into a couple of apparent statements (see [`top_level_statements`]).
 const MAX_AUTHORITY_STATEMENTS: usize = 16;
@@ -262,7 +311,7 @@ fn check_verified_token_shape(biscuit: &Biscuit) -> Result<(), Error> {
 /// public key, so it cannot know whether the authority block is genuinely
 /// ours. That is fine, because this only ever makes [`attenuate`] *refuse*.
 /// The authoritative audience checks are the signature-verified ones in
-/// [`verify`] and [`verify_node_token`].
+/// [`verify`], [`verify_node_token`] and [`verify_workspace_handle`].
 fn authority_declares_an_audience(unverified: &UnverifiedBiscuit) -> bool {
     unverified
         .print_block_source(0)
@@ -353,20 +402,28 @@ pub use biscuit_auth::{KeyPair, PrivateKey, PublicKey};
 ///
 /// * v1 — user-facing `principal`/`workspace`/`role`/`exp` + expiry check.
 ///
-/// The node audience (ADR-0021) is a *separate* token kind
-/// (`audience`/`node`/`workspace`/`fencing_token`/`exp` + expiry check), not a
-/// change to the layout above, so it does not bump this. A v2 that added
-/// `fencing_token` to the user-facing authority block was implemented and then
-/// rejected (ADR-0015); the version returns to 1 with it.
+/// The node audience (ADR-0021) and the guest audience (ADR-0076) are
+/// *separate* token kinds, not changes to the layout above, so neither bumps
+/// this. A v2 that added `fencing_token` to the user-facing authority block
+/// was implemented and then rejected (ADR-0015); the version returns to 1
+/// with it.
 pub const TOKEN_SCHEME_VERSION: u32 = 1;
 
 /// Value of the `audience` authority fact in a node-scoped token (ADR-0021).
 ///
 /// User-facing tokens carry no `audience` fact at all — §7.2's fact set is
 /// frozen at `principal`/`workspace`/`role`/`exp` — so "has an audience" and
-/// "is not a workspace capability" are the same statement, checked in both
-/// directions by [`verify`] and [`verify_node_token`].
+/// "is not a workspace capability" are the same statement, checked in every
+/// direction by [`verify`], [`verify_node_token`] and
+/// [`verify_workspace_handle`].
 const NODE_AUDIENCE: &str = "node";
+
+/// Value of the `audience` authority fact in a workspace handle (ADR-0076):
+/// the credential a guest holds. Sibling of [`NODE_AUDIENCE`], and the same
+/// bargain — declaring an audience is what makes [`verify`] refuse it for
+/// free, so a handle that leaks out of a guest authorizes no workspace
+/// capability at any user route.
+const GUEST_AUDIENCE: &str = "guest";
 
 /// Domain-separation context for deriving dev/test root keys from a seed.
 const ROOT_KEY_CONTEXT: &str = "reachpad.dev 2026-07 authz root key v1";
@@ -394,9 +451,30 @@ pub enum Error {
     /// user-facing tokens carry no fencing token at all (ADR-0015).
     #[error("fencing token out of range for datalog int: {0}")]
     FencingOutOfRange(u64),
+    /// An authorization generation did not fit the datalog integer domain
+    /// (same story as [`Error::FencingOutOfRange`]: `authz_generation` is a
+    /// BIGINT, so a real workspace cannot reach this). Only
+    /// [`mint_workspace_handle`] can raise it.
+    #[error("authorization generation out of range for datalog int: {0}")]
+    GenerationOutOfRange(u64),
     /// An unknown role string was encountered.
     #[error("unknown role: {0:?}")]
     UnknownRole(String),
+    /// A **workspace handle** (ADR-0076) verified and is simply past its
+    /// `exp`. Its own variant, and only for handles, because of what a guest
+    /// does next: a handle expires every [five minutes]
+    /// (`controld::edges::HANDLE_TTL_MS`) by design and the holder's correct
+    /// response is *ask the node for a fresh one*, which is a different
+    /// action from the one a forged, foreign-audience or wrong-workspace
+    /// token calls for. Folded into [`Error::Denied`] — where every other
+    /// failed check lives — the two are one 403 and an agent mid-turn
+    /// concludes its key is bad and stops (creds milestone C3, WP3.2 risk 1).
+    ///
+    /// Only reachable **after** the signature chain verifies, so it is no
+    /// oracle: a caller who cannot produce a token this fleet minted never
+    /// sees it.
+    #[error("workspace handle expired at {exp_ms} (now {now_ms})")]
+    HandleExpired { exp_ms: u64, now_ms: u64 },
 }
 
 /// Roles, ordered `owner > collaborator > viewer` (§7.4). `Harness` is the
@@ -492,6 +570,100 @@ impl Op {
     }
 }
 
+/// An operation a **workspace handle** can request (ADR-0076), checked by
+/// [`verify_workspace_handle`].
+///
+/// Deliberately a *separate* vocabulary from [`Op`], not extra [`Op`]
+/// variants: [`Op`]'s names populate the `role_op` table that every
+/// user-facing authorizer installs, and [`authorize_verified`]'s effective-role
+/// ladder assumes that table's op sets stay strictly nested. Widening it for
+/// operations no role should ever have would be a change to every verifier in
+/// the fleet to express a restriction. A closed enum verified in one place
+/// costs nothing anywhere else.
+///
+/// The whole enum **is** the allowlist: an operation with no variant here
+/// cannot be asked for at all, which is why archive/release/rewind and
+/// cross-workspace exec or fork are absent rather than listed as forbidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GuestOp {
+    /// List the credential links of the guest's own workspace.
+    ListLinks,
+    /// Create a child workspace of the guest's own workspace.
+    Spawn,
+    /// Ask for a credential to be linked into the guest's own workspace
+    /// (a request — approval is the account owner's, not the guest's).
+    RequestLink,
+    /// **Spend** one of the guest's own workspace's brokered credentials
+    /// through a use-point (creds milestone C4, design §5).
+    ///
+    /// The op a guest presents to the LLM/git/derived use-points, which pass
+    /// the handle through to controld's `POST /svc/v1/creds/resolve`. It is
+    /// the narrowest possible widening of the audience: it names no
+    /// credential, authorizes nothing by itself, and the value it eventually
+    /// reaches is decided by the `share ∧ link` rows re-read on that request
+    /// — the handle is one of three factors, never the authority (§6:
+    /// "tokens authenticate; rows authorize").
+    ///
+    /// Note where it is NOT presented: no route on controld's `/v1` router
+    /// accepts it, because that router is what hub forwards verbatim from
+    /// 443. The only door is the mTLS service plane, which a guest cannot
+    /// reach at all — it can only ask a use-point to ask on its behalf.
+    UseCredential,
+}
+
+impl GuestOp {
+    /// Every variant, so callers (and the allowlist test) can enumerate the
+    /// vocabulary instead of restating it. Drift is fail-closed: a variant
+    /// missing from here is left out of the minted block's allowlist, so it is
+    /// refused rather than quietly permitted.
+    pub const ALL: [GuestOp; 4] = [
+        GuestOp::ListLinks,
+        GuestOp::Spawn,
+        GuestOp::RequestLink,
+        GuestOp::UseCredential,
+    ];
+
+    /// The operation's datalog name, as used in `op(<name>)`.
+    ///
+    /// Exhaustive by construction (no `_` arm): a new variant does not compile
+    /// until it has been named.
+    pub const fn name(self) -> &'static str {
+        match self {
+            GuestOp::ListLinks => "list_links",
+            GuestOp::Spawn => "spawn",
+            GuestOp::RequestLink => "request_link",
+            GuestOp::UseCredential => "use_credential",
+        }
+    }
+
+    /// **The positive allowlist.** Does the guest audience authorize this
+    /// operation at all?
+    ///
+    /// Exhaustive by construction, and the *only* place the answer is written:
+    /// [`mint_workspace_handle`] builds the authority block's op check from
+    /// it, and [`verify_workspace_handle`] consults it before any datalog
+    /// runs. Adding a variant fails to compile until its verdict is decided —
+    /// which is the mechanism a prose "never" list is not.
+    const fn allowed(self) -> bool {
+        match self {
+            GuestOp::ListLinks => true,
+            GuestOp::Spawn => true,
+            GuestOp::RequestLink => true,
+            GuestOp::UseCredential => true,
+        }
+    }
+
+    /// The allowed op names, in [`GuestOp::ALL`] order — the set literal the
+    /// minted authority block carries.
+    fn allowed_names() -> Vec<&'static str> {
+        GuestOp::ALL
+            .iter()
+            .filter(|op| op.allowed())
+            .map(|op| op.name())
+            .collect()
+    }
+}
+
 /// Serialized Biscuit token bytes (the biscuit wire format, which embeds its
 /// own schema version — I11).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -555,6 +727,31 @@ pub struct VerifiedNode {
     pub fencing_token: u64,
 }
 
+/// The outcome of a successful [`verify_workspace_handle`] (ADR-0076).
+///
+/// Every field is read from the **authority block only** — a handle has no
+/// other block, and one that does is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedHandle {
+    /// The workspace the guest is running in.
+    pub workspace: String,
+    /// The principal everything inside that guest acts as: the workspace's
+    /// **owner**, never the person who happened to start it (design §6
+    /// ruling). Attribution and billing follow this field.
+    pub owner_principal: String,
+    /// The workspace's `authz_generation` at mint time. The caller compares it
+    /// against the row and re-mints when it has moved; a handle never proves
+    /// its own freshness.
+    pub generation: u64,
+    /// The fencing token of the VM instance this handle was minted for (I2,
+    /// ADR-0006). Resume, fork and rewind all rotate it, so a handle recovered
+    /// from an inherited memory image names a generation that is no longer
+    /// live. As with [`VerifiedNode::fencing_token`], the comparison is the
+    /// caller's: this crate reports what the token attests, never whether it
+    /// is current.
+    pub fencing_token: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Root key handling
 // ---------------------------------------------------------------------------
@@ -604,6 +801,10 @@ fn to_datalog_ms(ms: u64) -> Result<i64, Error> {
 
 fn to_datalog_fencing(token: u64) -> Result<i64, Error> {
     i64::try_from(token).map_err(|_| Error::FencingOutOfRange(token))
+}
+
+fn to_datalog_generation(generation: u64) -> Result<i64, Error> {
+    i64::try_from(generation).map_err(|_| Error::GenerationOutOfRange(generation))
 }
 
 fn str_params(pairs: &[(&str, &str)]) -> HashMap<String, Term> {
@@ -737,6 +938,60 @@ pub fn mint_harness(
     Ok(TokenBytes(token.to_vec()?))
 }
 
+/// Mint a **workspace handle** (ADR-0076): the credential a guest holds.
+///
+/// The authority block carries `audience("guest")` plus `workspace`,
+/// `owner_principal`, `generation`, `fencing_token` and `exp`, the usual
+/// time-binding check, and — following [`mint_harness`]'s belt-and-braces
+/// shape — the guest allowlist as a check *in the block itself*, so the
+/// restriction travels with the token rather than living only in the verifier.
+///
+/// It carries no `principal` and no `role`: it is not a workspace capability
+/// and authorizes nothing through [`verify`], which refuses it on the
+/// audience. Everything inside the guest acts as the workspace's **owner**
+/// principal (design §6 ruling), which is what `owner_principal` names.
+///
+/// Like a node token it is never attenuated ([`attenuate`] refuses it, and
+/// [`verify_workspace_handle`] accepts a single authority block only), and it
+/// is short-lived: freshness is the caller's comparison of `generation`
+/// against the workspace row and of `fencing_token` against the live lease,
+/// not something the token can assert about itself.
+pub fn mint_workspace_handle(
+    root: &KeyPair,
+    workspace: &str,
+    owner_principal: &str,
+    generation: u64,
+    fencing_token: u64,
+    exp_ms: u64,
+) -> Result<TokenBytes, Error> {
+    let exp = to_datalog_ms(exp_ms)?;
+    // Integers, not strings: no injection surface.
+    let gen_int = to_datalog_generation(generation)?;
+    let fencing = to_datalog_fencing(fencing_token)?;
+    let ops = ops_set_literal(&GuestOp::allowed_names());
+    let mut builder = Biscuit::builder();
+    // Untrusted strings (workspace, owner principal) go in as parameters,
+    // never as datalog source — same rule as `mint`.
+    let source = format!(
+        "audience({{audience}});\n\
+         workspace({{workspace}});\n\
+         owner_principal({{owner_principal}});\n\
+         generation({gen_int});\n\
+         fencing_token({fencing});\n\
+         exp({exp});\n\
+         check if time($t), $t < {exp};\n\
+         check if op($o), {ops}.contains($o);"
+    );
+    let params = str_params(&[
+        ("audience", GUEST_AUDIENCE),
+        ("workspace", workspace),
+        ("owner_principal", owner_principal),
+    ]);
+    builder.add_code_with_params(&source, params, HashMap::new())?;
+    let token = builder.build(root)?;
+    Ok(TokenBytes(token.to_vec()?))
+}
+
 // ---------------------------------------------------------------------------
 // Attenuation
 // ---------------------------------------------------------------------------
@@ -744,8 +999,11 @@ pub fn mint_harness(
 /// Append an attenuation block narrowing the token to `narrower_role`'s op
 /// set and to `earlier_exp_ms`.
 ///
-/// This is offline (§7.2): no root key and no server round-trip — a share
-/// link IS this. The appended block contains **only checks**; by biscuit
+/// This is offline (§7.2): no root key and no server round-trip. It narrows a
+/// token the caller already holds; it does **not** hand a workspace to someone
+/// else, because an appended block cannot rebind `principal` — a share is
+/// minted server-side for the grantee's own principal instead (ADR-0075).
+/// The appended block contains **only checks**; by biscuit
 /// scoping semantics the verifier never trusts facts from appended blocks,
 /// so any chain of `attenuate` calls (or hand-crafted appended blocks) can
 /// only shrink what the token authorizes:
@@ -758,12 +1016,14 @@ pub fn mint_harness(
 /// The authority block is untouched, so `principal`, `workspace`, `role` and
 /// `exp` are carried through exactly as minted.
 ///
-/// **Node tokens are refused here** (ADR-0021), not merely never attenuated in
-/// practice: the sharing story of §7.2 is exclusively about user-facing
-/// tokens, and a node token names one node at one lease generation, so a
-/// narrowed copy of it is meaningless. The refusal is [`Error::Denied`] and is
-/// belt-and-braces only — [`verify_node_token`] independently rejects any node
-/// token that carries an appended block, however it was appended.
+/// **Audience-bearing tokens are refused here** (ADR-0021, ADR-0076), not
+/// merely never attenuated in practice: narrowing is exclusively about
+/// user-facing tokens, and a node token names one node at one lease
+/// generation while a workspace handle names one VM instance at one
+/// authorization generation, so a narrowed copy of either is meaningless. The
+/// refusal is [`Error::Denied`] and is belt-and-braces only —
+/// [`verify_node_token`] and [`verify_workspace_handle`] each independently
+/// reject any token that carries an appended block, however it was appended.
 ///
 /// The checks-only shape emitted here is the shape [`verify`] enforces
 /// ([`check_appended_block_shapes`]); appending anything else produces a token
@@ -777,8 +1037,8 @@ pub fn attenuate(
     let unverified = UnverifiedBiscuit::from(token.as_bytes())?;
     if authority_declares_an_audience(&unverified) {
         return Err(Error::Denied(
-            "node-scoped tokens are never attenuated (ADR-0021): they are issued to \
-             one node for one lease generation and are never shared"
+            "audience-bearing tokens are never attenuated (ADR-0021, ADR-0076): each is \
+             issued to one holder for one generation and is never shared"
                 .to_owned(),
         ));
     }
@@ -1055,28 +1315,30 @@ fn query_authority_audience(biscuit: &Biscuit, budget: &Budget) -> Result<Option
     }
 }
 
-/// Read the attested lease generation (I2, ADR-0006) from a node token's
-/// authority block. Required: a node token without one proves nothing, so its
-/// absence is [`Error::Denied`], never a `None` a caller might treat as
-/// permissive.
-fn query_authority_fencing_token(
+/// Read a single mandatory non-negative integer fact (an attested lease
+/// generation, an attested authorization generation) out of the authority
+/// block.
+///
+/// Required, never optional: a token that omits the counter it exists to
+/// attest proves nothing, so its absence is [`Error::Denied`] rather than a
+/// `None` some caller might read as permissive. Same {authority, authorizer}
+/// query scope as [`query_authority_str`].
+fn query_authority_u64(
     authorizer: &mut Authorizer,
+    predicate: &str,
     budget: &Budget,
 ) -> Result<u64, Error> {
-    let mut tokens: Vec<IntFact> =
-        authorizer.query_with_limits("data($f) <- fencing_token($f)", budget.limits())?;
-    if tokens.len() != 1 {
+    let query = format!("data($v) <- {predicate}($v)");
+    let mut found: Vec<IntFact> = authorizer.query_with_limits(query.as_str(), budget.limits())?;
+    if found.len() != 1 {
         return Err(Error::Denied(format!(
-            "node token must carry exactly one authority fencing_token fact, found {}",
-            tokens.len()
+            "token must carry exactly one authority {predicate} fact, found {}",
+            found.len()
         )));
     }
-    let raw = tokens.remove(0).0;
-    u64::try_from(raw).map_err(|_| {
-        Error::Denied(format!(
-            "authority fencing token must be non-negative: {raw}"
-        ))
-    })
+    let raw = found.remove(0).0;
+    u64::try_from(raw)
+        .map_err(|_| Error::Denied(format!("authority {predicate} must be non-negative: {raw}")))
 }
 
 /// Verify a **node-scoped** token (ADR-0021) against the root public key at
@@ -1166,11 +1428,154 @@ pub fn verify_node_token(
 
     let node = query_authority_str(&mut authorizer, "node", &budget)?;
     let workspace = query_authority_str(&mut authorizer, "workspace", &budget)?;
-    let fencing_token = query_authority_fencing_token(&mut authorizer, &budget)?;
+    let fencing_token = query_authority_u64(&mut authorizer, "fencing_token", &budget)?;
 
     Ok(VerifiedNode {
         node,
         workspace,
+        fencing_token,
+    })
+}
+
+/// Verify a **workspace handle** (ADR-0076) against the root public key at
+/// time `now_ms` (injected — I12), for one guest operation, and return what it
+/// attests.
+///
+/// This is the credential a guest holds. It is refused unless it is exactly
+/// what [`mint_workspace_handle`] produces:
+///
+/// * `requested_op` must be in the guest allowlist (see [`GuestOp`]) — checked
+///   first, by exhaustive match, before any datalog runs, and again by the
+///   authority block's own op check;
+/// * `audience("guest")` must be present — a user-facing token, however
+///   privileged, and a node token, however current, are both refused here
+///   explicitly;
+/// * the token must be a **single authority block** — handles are never
+///   attenuated, so an appended block means the token is not ours, whoever
+///   appended it and whatever it says;
+/// * `owner_principal`, `generation` and `fencing_token` must each be present
+///   exactly once, `workspace` must match `expected_workspace`, and `exp` must
+///   be in the future — a past `exp` is [`Error::HandleExpired`] and not
+///   [`Error::Denied`], because the holder's remedy (ask for a fresh handle)
+///   differs from every other refusal's (stop).
+///
+/// Success is **not** freshness. `generation` and `fencing_token` are reported,
+/// never judged: the caller compares them against `workspaces.authz_generation`
+/// and the live lease, exactly as hub compares a node token's generation
+/// against its own high-water mark. A verifier that skipped that comparison
+/// would honour a handle from a workspace whose shares were cut an hour ago.
+///
+/// Cost is bounded exactly as [`verify`]'s is (ADR-0014): size before parsing,
+/// shape before any datalog, and all datalog runs share one
+/// [`DATALOG_BUDGET`] deadline.
+pub fn verify_workspace_handle(
+    token: &TokenBytes,
+    root_public: &PublicKey,
+    expected_workspace: &str,
+    requested_op: GuestOp,
+    now_ms: u64,
+) -> Result<VerifiedHandle, Error> {
+    let now = to_datalog_ms(now_ms)?;
+
+    // The positive allowlist, before anything is parsed: an operation outside
+    // it is refused here whatever the token says. The authority block carries
+    // the same list as a check, so a future caller that reached the datalog
+    // without coming through this arm is refused there too.
+    if !requested_op.allowed() {
+        return Err(Error::Denied(format!(
+            "the {GUEST_AUDIENCE:?} audience does not authorize {requested_op:?}: its \
+             operation set is a positive allowlist"
+        )));
+    }
+
+    if token.as_bytes().len() > MAX_TOKEN_BYTES {
+        return Err(Error::Denied(format!(
+            "token is {} bytes, limit is {MAX_TOKEN_BYTES}",
+            token.as_bytes().len()
+        )));
+    }
+    let unverified = UnverifiedBiscuit::from(token.as_bytes())?;
+    if unverified.block_count() != 1 {
+        return Err(Error::Denied(format!(
+            "a workspace handle is a single authority block and is never attenuated \
+             (ADR-0076); this one has {} blocks",
+            unverified.block_count()
+        )));
+    }
+
+    let biscuit = unverified
+        .verify(*root_public)
+        .map_err(berror::Token::Format)?;
+    check_verified_token_shape(&biscuit)?;
+
+    let budget = Budget::start();
+
+    // Audience separation, explicit and first (see `authorize_verified` and
+    // `verify_node_token` for the other two faces of this check).
+    match query_authority_audience(&biscuit, &budget)? {
+        Some(audience) if audience == GUEST_AUDIENCE => {}
+        Some(audience) => {
+            return Err(Error::Denied(format!(
+                "token is minted for the {audience:?} audience, not {GUEST_AUDIENCE:?}"
+            )))
+        }
+        None => {
+            return Err(Error::Denied(
+                "token carries no audience fact: a user-facing token is a workspace \
+                 capability, not a guest handle"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    let mut authorizer = biscuit.authorizer()?;
+
+    // EXPIRY IS READ BEFORE THE DATALOG RUNS, so that "this handle is five
+    // minutes old" is a different answer from "this token is not ours".
+    //
+    // The authority block's own `check if exp($e), time($t), $t < $e` still
+    // runs below and is still what enforces the bound — this is a
+    // CLASSIFICATION, not the check. It has to be here rather than after
+    // `authorize_with_limits`, because a failed check aborts authorization
+    // and biscuit reports it as one `FailedLogic` string among several; that
+    // string is not a stable interface to match on.
+    //
+    // Everything above has already verified the signature chain and the
+    // audience, so nothing that is not a handle this fleet minted reaches
+    // this line (see [`Error::HandleExpired`]).
+    let exp_ms = query_authority_u64(&mut authorizer, "exp", &budget)?;
+    if now_ms >= exp_ms {
+        return Err(Error::HandleExpired { exp_ms, now_ms });
+    }
+
+    let mut source = String::new();
+    source.push_str(&format!("time({now});\n"));
+    // Op names are 'static constants from GuestOp::name(), safe to inline.
+    source.push_str(&format!("op(\"{}\");\n", requested_op.name()));
+    source.push_str("check if workspace({expected_workspace});\n");
+    source.push_str("check if exp($e), time($t), $t < $e;\n");
+    source.push_str("allow if true;");
+    authorizer.add_code_with_params(
+        &source,
+        str_params(&[("expected_workspace", expected_workspace)]),
+        HashMap::new(),
+    )?;
+    match authorizer.authorize_with_limits(budget.limits()) {
+        Ok(_) => {}
+        Err(berror::Token::FailedLogic(logic)) => return Err(Error::Denied(logic.to_string())),
+        Err(berror::Token::RunLimit(limit)) => return Err(Error::Denied(limit.to_string())),
+        Err(other) => return Err(Error::Token(other)),
+    }
+
+    let workspace = query_authority_str(&mut authorizer, "workspace", &budget)?;
+    let owner_principal = query_authority_str(&mut authorizer, "owner_principal", &budget)?;
+    let generation = query_authority_u64(&mut authorizer, "generation", &budget)?;
+    let fencing_token = query_authority_u64(&mut authorizer, "fencing_token", &budget)?;
+
+    Ok(VerifiedHandle {
+        workspace,
+        owner_principal,
+        generation,
         fencing_token,
     })
 }

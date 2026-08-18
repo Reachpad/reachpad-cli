@@ -376,7 +376,6 @@ fn command_name(command: &Command) -> &'static str {
         Command::Keys(KeysCommand::Revoke { .. }) => "keys.revoke",
         Command::Attach { .. } => "workspace.attach",
         Command::Tail { .. } => "workspace.events",
-        Command::Share { .. } => "workspace.share",
         Command::Credits => "account.credits",
         Command::Doctor => "cli.doctor",
         Command::Update => "cli.update",
@@ -476,12 +475,6 @@ async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
             .await
         }
         Command::Tail { workspace } => tail_command(ctx, workspace).await,
-        Command::Share {
-            workspace,
-            role,
-            expires_in,
-            grantee,
-        } => share(ctx, workspace, role, expires_in, &grantee).await,
         Command::Credits => credits(ctx).await,
         Command::Token(TokenCommand::Inspect) => {
             let workspace = self_or_any(ctx)?;
@@ -806,6 +799,12 @@ async fn compose_status(ctx: &Ctx, workspace: &str, held: &Held) -> Result<api::
         forks: lineage.forks.len() as u64,
         idle_pause_seconds: 0,
         limits: api::Limits::default(),
+        // An older fleet reports no device size on any route this fallback
+        // reads, and a composed status must not invent one (WP-CP.3).
+        device: None,
+        // Nor free space (WP-CP.4): this fallback reads lineage and the
+        // account listing, and neither carries a guest measurement.
+        guest_disk: None,
         created_at_ms: 0,
         archived_at_ms: None,
     };
@@ -1257,6 +1256,15 @@ async fn run_command(ctx: &Ctx, spec: RunSpec) -> Result<i32, CliError> {
     if end.get("error").and_then(Value::as_str).is_some() {
         return Err(CliError::from_exec_end(&end, Some(&workspace)));
     }
+    // WP-CP.4, the ADVISORY arm: the workspace's disk is full and the command
+    // succeeded anyway. Its zero stands — a script piping this must not see a
+    // failure for a command that worked — but the user is told now rather than
+    // at the next build, which is the whole point of noticing early.
+    if !json {
+        if let Some(sentence) = CliError::workspace_condition(&end, Some(&workspace)) {
+            eprintln!("reachpad: warning — {sentence}");
+        }
+    }
     // EXIT WITH THE COMMAND'S OWN CODE, so this composes in a script. A
     // signal is not an exit code (§42.1: a policy and a failure must not be
     // the same value), so a killed command reports 128+n the way a shell does
@@ -1280,6 +1288,11 @@ async fn run_command(ctx: &Ctx, spec: RunSpec) -> Result<i32, CliError> {
             // The prose caller is told on stderr; the machine caller is told
             // here, or it parses a cut-off log as a complete one.
             "truncated": end.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+            // WP-CP.4: null when the workspace was healthy. A machine caller
+            // that keys on this can tell "the build failed" from "the build
+            // failed on a workspace that had run out of room", which is the
+            // distinction the whole path exists to make.
+            "workspace_condition": end.get("workspace_condition").cloned().unwrap_or(Value::Null),
         }),
         &[],
     );
@@ -2113,59 +2126,14 @@ async fn tail_command(ctx: &Ctx, workspace: Option<String>) -> Result<i32, CliEr
     }
 }
 
-async fn share(
-    ctx: &Ctx,
-    workspace: Option<String>,
-    role: cli::GrantRoleArg,
-    expires_in: u64,
-    grantee: &str,
-) -> Result<i32, CliError> {
-    let workspace = ctx.workspace(workspace)?;
-    let token_b64 = ctx.biscuit(&workspace).await?;
-    let expires_at_ms = wall_now_ms().saturating_add(expires_in);
-    let share = ctx
-        .client()
-        .grant(
-            &workspace,
-            &token_b64,
-            grantee,
-            role.as_str(),
-            expires_at_ms,
-        )
-        .await
-        .map_err(|e| CliError::from_api(&e, Some(&workspace)))?;
-    // The SAME narrowing computed locally (§7.2: a share link IS an
-    // attenuated token; appended blocks carry only checks, so narrowing is
-    // all they can do).
-    let local = authz::TokenBytes::from_vec(
-        BASE64
-            .decode(token_b64.trim())
-            .map_err(|_| CliError::from_code("bad_token_encoding", Some(&workspace)))?,
-    );
-    let narrowed = authz::attenuate(&local, role.as_authz(), expires_at_ms)
-        .map_err(|e| CliError::usage(format!("offline attenuation failed: {e}")))?;
-    ctx.emit(
-        json!({
-            "workspace": workspace,
-            "grantee": grantee,
-            "role": share.role,
-            "expires_at": render::time(share.expires_at_ms),
-            "share_token": share.share_token_b64,
-        }),
-        &[
-            format!(
-                "grant created: workspace={workspace} grantee={grantee} role={}",
-                share.role
-            ),
-            format!("server share token:\n  {}", share.share_token_b64),
-            format!(
-                "offline attenuated token (authz::attenuate, §7.2):\n  {}",
-                BASE64.encode(narrowed.as_bytes())
-            ),
-        ],
-    );
-    Ok(EXIT_OK)
-}
+// `share()` lived here (ADR-0075). It posted `POST /v1/grants` and then
+// printed the same narrowing recomputed offline with `authz::attenuate`,
+// presenting the two as equivalent ways to hand a workspace to someone. They
+// were never equivalent: an appended block cannot rebind `principal`, so the
+// offline half handed out the OWNER's own authority — a bearer credential the
+// server never saw, attributed to the wrong person, and cuttable by nothing.
+// `Client::grant` stays (`bins/reach/tests/no_privileged_interface.rs` proves
+// I6 through it), and the server surface it calls is unchanged.
 
 async fn credits(ctx: &Ctx) -> Result<i32, CliError> {
     let identity = ctx.identity().await?;

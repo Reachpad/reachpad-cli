@@ -354,6 +354,131 @@ pub const TABLE: &[Row] = &[
         retriable: Retriable::No,
     },
     Row {
+        // The sharing toggle, refused from either direction (design §4 rule 2):
+        // sharing a workspace that holds a link to a connection whose sharing
+        // is off, or linking such a connection into an already-shared
+        // workspace. Wrong state, not a bad request — the command is well
+        // formed and would succeed once the toggle moves.
+        code: "sharing_disabled",
+        selector: None,
+        sentence: "A connection linked to this workspace is not marked shareable, so the workspace cannot be shared. Turn sharing on for that connection, or unlink it, and try again.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // viewer × exposed, refused from either direction (design §7). A
+        // viewer can read what the workspace can read, so a connection whose
+        // value is visible inside the workspace cannot coexist with one.
+        code: "viewer_exposed_conflict",
+        selector: None,
+        sentence: "A viewer cannot be added while a connection whose value is visible inside the workspace is linked to it. Share with `--role collaborator` instead, or unlink that connection first.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The same connection is already linked to this workspace. Wrong
+        // state, not a bad request: at most one LIVE link per pair, and the
+        // existing one already grants what this asked for.
+        code: "link_already_live",
+        selector: None,
+        sentence: "That connection is already linked to this workspace, so there is nothing to add.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // "No such connection" and "not your connection" are ONE answer, so
+        // this sentence must fit both without saying which — an id that is not
+        // yours must not be distinguishable from one that does not exist.
+        code: "connection_not_found",
+        selector: None,
+        sentence: "No connection or secret by that name on this account.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "share_not_found",
+        selector: None,
+        sentence: "No share by that id on this workspace. It may already have been revoked.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "link_not_found",
+        selector: None,
+        sentence: "No link by that id on this workspace. It may already have been revoked.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // Every edge change takes an idempotency key, because the callers that
+        // make them are agents and agents retry.
+        code: "idempotency_key_required",
+        selector: None,
+        sentence: "This change needs an `Idempotency-Key` header of at most 255 characters, so a retry cannot apply it twice.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The same key, a different request. Answering from the stored
+        // response would return another request's answer, so it is refused.
+        code: "idempotency_key_conflict",
+        selector: None,
+        sentence: "That idempotency key was already used for a different request. Use a new key for a new change.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // Claimed, never completed: something died between the change and the
+        // record of it, so whether it applied is unknown. Retrying the same
+        // key would be a guess.
+        code: "idempotency_key_in_flight",
+        selector: None,
+        sentence: "An earlier attempt with that idempotency key never finished, so whether it applied is unknown. Check the current state and use a new key.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The workspace's access changed, or the machine it runs on was
+        // replaced, since the guest's handle was issued.
+        code: "handle_stale",
+        selector: None,
+        sentence: "This workspace credential was issued before the workspace's access last changed, so it is no longer current. Ask for a new one.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // A workspace credential names the machine the workspace is running
+        // on, so there is nothing to issue one against. Same wording shape as
+        // `no_active_lease`, which is the same fact for a different verb.
+        code: "workspace_not_running",
+        selector: None,
+        sentence: "{workspace} is not running, so there is no live machine to issue a workspace credential for. `reachpad run {workspace} -- <command>` starts it.",
+        numbers: None,
+        next_command: Some("reachpad run {workspace} -- <command>"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
         code: "workspace_not_of_user",
         selector: None,
         sentence: "One of the workspaces named for this key is not on this account. `reachpad list` shows the ones that are.",
@@ -362,7 +487,85 @@ pub const TABLE: &[Row] = &[
         exit_code: EXIT_NO_SUCH_WORKSPACE,
         retriable: Retriable::No,
     },
+    // ---- spawn and link requests (design §7, ADR-0081) -------------------
+    Row {
+        // A spawn named a connection the parent workspace does not hold a
+        // live link to — including one this account owns but never linked
+        // here, and one that was linked and has been cut. ONE sentence for
+        // all of them, because the server gives one answer: distinguishing
+        // them would let a caller inside a guest enumerate the account's
+        // locker.
+        code: "link_not_held",
+        selector: None,
+        sentence: "That workspace cannot pass down a connection it does not have. `reachpad connections list {workspace}` shows what it can.",
+        numbers: None,
+        next_command: Some("reachpad connections list {workspace}"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // `--with` takes connections or the word `parent`.
+        code: "bad_with",
+        selector: None,
+        sentence: "`--with` takes a list of connections, or the word `parent` to pass down everything the workspace holds.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "invalid_connection_name",
+        selector: None,
+        sentence: "That is not a usable connection name.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // Agent prose, bounded at the boundary: the reason lands in a
+        // person's inbox.
+        code: "reason_too_long",
+        selector: None,
+        sentence: "That reason is too long to put in front of the person who has to read it. Shorten it and ask again.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "invalid_decision",
+        selector: None,
+        sentence: "A request is answered `approve` or `deny`.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // Two people answered one request. Wrong state, not a bad request:
+        // the answer already exists and the body carries it.
+        code: "link_request_decided",
+        selector: None,
+        sentence: "That request has already been answered.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
     // ---- no such thing ---------------------------------------------------
+    Row {
+        // "No such request" and "not a request on a workspace you own" are
+        // ONE answer: the id is read before the caller is authorized, so this
+        // sentence must fit both without saying which.
+        code: "link_request_not_found",
+        selector: None,
+        sentence: "No credential request by that id.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
     Row {
         code: "workspace_not_found",
         selector: None,
@@ -592,6 +795,30 @@ pub const TABLE: &[Row] = &[
         exit_code: EXIT_UNAVAILABLE,
         retriable: Retriable::Yes,
     },
+    // ---- the model gateway, which is a SECOND upstream behind the same
+    // front door (ADR-0083). Its two failures are deliberately distinct: one
+    // says the fleet has no gateway, the other says the gateway it has is
+    // down. Collapsing them would leave an operator reading a journal unable
+    // to tell a missing deploy from a crashed one.
+    Row {
+        code: "llm_upstream_unavailable",
+        selector: None,
+        sentence: "reachpad's model gateway is not answering right now. Try again.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "llm_use_point_not_configured",
+        selector: None,
+        sentence: "This fleet does not run model calls for you — it has no gateway deployed. \
+                   Use your own provider key in this workspace instead.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
     Row {
         code: "internal",
         selector: None,
@@ -615,6 +842,17 @@ pub const TABLE: &[Row] = &[
         code: "control_request_too_large",
         selector: None,
         sentence: "That request is too large for reachpad's front door — `--stdin` carries about 1 MiB.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The model gateway's own cap, which is thirty-two times the control
+        // plane's: a prompt is not a control request (ADR-0083).
+        code: "llm_request_too_large",
+        selector: None,
+        sentence: "That model request is too large for reachpad's front door — it carries about 32 MiB. Send less context.",
         numbers: None,
         next_command: None,
         exit_code: EXIT_USAGE,
@@ -743,6 +981,28 @@ pub const TABLE: &[Row] = &[
         numbers: None,
         next_command: Some("reachpad events {workspace}"),
         exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
+    // ---- the WORKSPACE ran out of room, not the command ------------------
+    Row {
+        // WP-CP.4. Emitted by the node on `exec.end` when the guest's own
+        // `statvfs` says the filesystem the command was working on is full AND
+        // the command did not succeed. Before this existed the user read a
+        // linker SIGBUS or rustc's "No space left on device" and went looking
+        // for a toolchain bug.
+        //
+        // `EXIT_LIMIT` (6), the same class as `entitlement_limit`, because it
+        // is the same kind of answer: the platform gave you an amount of
+        // something and you have reached it. It is NOT `EXIT_WRONG_STATE` —
+        // nothing is wrong with the workspace's state, it is simply full.
+        code: "workspace_disk_full",
+        selector: None,
+        sentence: "{workspace} ran out of disk while this command was running, so what \
+                   it reported may be a symptom rather than the cause. Free some space, \
+                   or start a bigger workspace — an existing disk is never grown.",
+        numbers: Some("{disk_path} has {disk_free_h} free of {disk_total_h}."),
+        next_command: Some("reachpad run {workspace} -- df -h"),
+        exit_code: EXIT_LIMIT,
         retriable: Retriable::No,
     },
 ];
@@ -886,6 +1146,21 @@ impl CliError {
         })
     }
 
+    /// The **advisory** reading of an `exec.end` (WP-CP.4): the sentence for a
+    /// workspace condition that did NOT cause this command to fail.
+    ///
+    /// Separate from [`CliError::from_exec_end`] on purpose. That one turns a
+    /// frame into a failure and an exit code; this one only borrows the
+    /// sentence, because the command succeeded and its zero is the answer the
+    /// caller gets. Returns `None` when the frame carries no condition, which
+    /// is every frame from a healthy workspace and every frame from a guest
+    /// that predates the capability.
+    #[must_use]
+    pub fn workspace_condition(end: &Value, workspace: Option<&str>) -> Option<String> {
+        let code = end.get("workspace_condition").and_then(Value::as_str)?;
+        CliError::render(code, end, None, workspace).map(|e| e.message)
+    }
+
     /// A code with no row: the server's own words, and no claim about what it
     /// means beyond the exit code the caller decided.
     fn unnamed(code: &str, detail: Option<&str>, status: Option<u16>, exit_code: i32) -> CliError {
@@ -987,6 +1262,16 @@ fn field(name: &str, body: &Value, workspace: Option<&str>) -> Option<String> {
     if name == "retry_after_s" {
         let ms = body.get("retry_after_ms")?.as_u64()?;
         return Some(ms.div_ceil(1000).to_string());
+    }
+    // `{disk_free_h}` renders the body's `disk_free_bytes` in the units a
+    // `df` inside the guest agrees with. The server keeps sending bytes (I13:
+    // the number comes from the wire, and a byte count is the fact); turning
+    // 214748364 into "204 MiB" is presentation, and presentation is the
+    // client's. Absent the byte field, the whole `numbers` clause disappears
+    // rather than rendering a blank — same rule as every other substitution.
+    if let Some(stem) = name.strip_suffix("_h") {
+        let bytes = body.get(format!("{stem}_bytes"))?.as_u64()?;
+        return Some(crate::render::gib(bytes));
     }
     match body.get(name)? {
         Value::String(s) => Some(s.clone()),
@@ -1236,5 +1521,95 @@ mod tests {
             assert_eq!(err.exit_code, EXIT_CREDENTIAL, "{code}");
             assert_eq!(err.next_command.as_deref(), Some(SIGN_IN), "{code}");
         }
+    }
+
+    // -- WP-CP.4: the workspace ran out of room --------------------------
+
+    /// The frame the node sends when a command FAILED on a full disk: one
+    /// sentence naming the workspace, the two figures in units a `df` agrees
+    /// with, and exit 6.
+    #[test]
+    fn a_failed_command_on_a_full_disk_names_the_disk_and_exits_six() {
+        let end = json!({
+            "ev": "exec.end",
+            "exit_code": 101,
+            "error": "workspace_disk_full",
+            "workspace_condition": "workspace_disk_full",
+            "disk_path": "/mnt",
+            "disk_free_bytes": 4096u64,
+            "disk_total_bytes": 20u64 * 1024 * 1024 * 1024,
+        });
+        let err = CliError::from_exec_end(&end, Some("ws-77"));
+        assert_eq!(err.exit_code, EXIT_LIMIT);
+        assert_eq!(err.code, "workspace_disk_full");
+        assert!(err.message.contains("ws-77"), "{}", err.message);
+        assert!(err.message.contains("ran out of disk"), "{}", err.message);
+        // The numbers come off the WIRE (I13) and are rendered in binary
+        // units: a user comparing this with `df` inside the guest must not
+        // have to convert anything.
+        assert!(err.message.contains("/mnt"), "{}", err.message);
+        assert!(err.message.contains("20 GiB"), "{}", err.message);
+        assert_eq!(
+            err.next_command.as_deref(),
+            Some("reachpad run ws-77 -- df -h")
+        );
+        assert!(!err.retriable, "the disk does not empty itself");
+    }
+
+    /// The numbers clause DISAPPEARS rather than rendering blanks when the
+    /// server did not send the figures — the table's standing rule, checked
+    /// here because this row is the first with a derived `_h` substitution
+    /// and a derived field is exactly where a silent empty string would hide.
+    #[test]
+    fn the_disk_figures_vanish_together_when_the_server_sends_none() {
+        let err = CliError::from_exec_end(
+            &json!({"ev": "exec.end", "exit_code": 1, "error": "workspace_disk_full"}),
+            Some("ws-77"),
+        );
+        assert_eq!(err.exit_code, EXIT_LIMIT);
+        assert!(err.message.contains("ran out of disk"), "{}", err.message);
+        assert!(
+            !err.message.contains("free of"),
+            "a numbers clause rendered with no numbers: {}",
+            err.message
+        );
+    }
+
+    /// **The advisory arm.** A command that SUCCEEDED on a full disk carries
+    /// the condition but no `error`, so `from_exec_end` must never be reached
+    /// and the sentence is borrowed instead. This is what keeps `reachpad run`
+    /// exiting 0 for a command that worked.
+    #[test]
+    fn a_successful_command_on_a_full_disk_yields_a_sentence_and_no_failure() {
+        let end = json!({
+            "ev": "exec.end",
+            "exit_code": 0,
+            "workspace_condition": "workspace_disk_full",
+            "disk_path": "/tmp",
+            "disk_free_bytes": 1024u64,
+            "disk_total_bytes": 1024u64 * 1024 * 1024,
+        });
+        assert!(
+            end.get("error").is_none(),
+            "the node must not set `error` for a command that succeeded"
+        );
+        let sentence = CliError::workspace_condition(&end, Some("ws-77"))
+            .expect("the condition has a row and therefore a sentence");
+        assert!(sentence.contains("ws-77"), "{sentence}");
+        assert!(sentence.contains("/tmp"), "{sentence}");
+    }
+
+    /// **NEGATIVE CONTROL (b) at the CLI edge.** A healthy workspace whose
+    /// command failed carries no condition, so there is no sentence to print
+    /// and `from_exec_end` is never called: the caller sees exit 101 and
+    /// nothing about disks.
+    #[test]
+    fn negative_control_a_failed_command_on_a_healthy_workspace_says_nothing_about_disks() {
+        let end = json!({"ev": "exec.end", "exit_code": 101});
+        assert_eq!(CliError::workspace_condition(&end, Some("ws-77")), None);
+        assert!(
+            end.get("error").is_none(),
+            "no error key means `reachpad run` exits with the command's own code"
+        );
     }
 }

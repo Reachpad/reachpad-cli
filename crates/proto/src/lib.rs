@@ -86,6 +86,63 @@ pub mod events {
     /// the guest, so showing a file grants no authority reading one would.
     pub const PREVIEW: u32 = 18;
 
+    /// One credential decrypted by controld, on either of the two mTLS read
+    /// paths (ADR-0078, ADR-0082). Appended 2026-08-14 under §4.2's "agents
+    /// MAY add types" rule.
+    ///
+    /// - `POST /node/v1/creds/resolve` — an `exposed`-class value handed to
+    ///   the node that holds the workspace's lease; the summary names the peer
+    ///   node and the fencing token.
+    /// - `POST /svc/v1/creds/resolve` — a `brokered`-class value handed to an
+    ///   enrolled use-point; the summary names the **service identity**, which
+    ///   design §5 requires of every decrypt audit event.
+    ///
+    /// Distinct from [`SECRET_USED`] on purpose. This records a *decrypt*: the
+    /// platform reading a value back out of the locker, attributed to the
+    /// platform principal, with the peer and the authorization generation in
+    /// the summary. `secret.used` records a *use* at the use-point, attributed
+    /// to the acting principal — it counts uses, not brokerings (design §6).
+    /// Collapsing the two would make "who read this credential" unanswerable,
+    /// because the answer has two very different shapes.
+    ///
+    /// The payload carries the credential id, never the value and never the
+    /// owner-chosen name.
+    pub const CREDS_RESOLVED: u32 = 19;
+
+    /// A node reported that its guest no longer holds one `exposed`-class
+    /// credential it was ordered to drop (ADR-0078, `POST
+    /// /node/v1/creds/ack`, design §7 revoke step 3). Appended 2026-08-16
+    /// under §4.2's "agents MAY add types" rule.
+    ///
+    /// This is the event that makes a revocation TRUE rather than merely
+    /// ordered. The cut itself is already recorded — `link.changed revoked`
+    /// on [`GRANT_CHANGED`] — but a cut row says only that controld stopped
+    /// authorizing a value; for the exposed class the value is a file inside
+    /// a running guest, and nothing about the cut removes it. The pair is the
+    /// audit trail an operator actually needs: "cut at T, gone from the guest
+    /// at T+n", or a conspicuous absence of the second half.
+    ///
+    /// The summary carries the credential id, the peer node, the fencing
+    /// token and the generation acked — never the value, and never the
+    /// owner-chosen `name`.
+    pub const CREDS_REVOKE_ACKED: u32 = 20;
+
+    /// A guest asked for a credential its workspace does not hold, and — on
+    /// the same type — the person's answer (ADR-0081, design §7). Appended
+    /// 2026-08-16 under §4.2's "agents MAY add types" rule.
+    ///
+    /// Three summaries, one type: `link.requested`, `link.request_denied`,
+    /// `link.request_approved`. Deliberately NOT [`GRANT_CHANGED`] — nothing
+    /// about authorization changes when an agent asks, and an ask in the
+    /// stream that means "an edge moved" would make the audit trail say
+    /// something false. An approval emits BOTH: this type for the answer, and
+    /// `GRANT_CHANGED` for the link it created.
+    ///
+    /// The summary carries the request id and the owner's own name for the
+    /// connection — never the agent's prose, which is untrusted text that
+    /// every future reader of a log line would render as the system's words.
+    pub const LINK_REQUESTED: u32 = 21;
+
     /// Types that are never thinned by retention (§4.2).
     pub const NEVER_THINNED: &[u32] = &[SECRET_USED, GRANT_CHANGED, LEASE_ACQUIRED, LEASE_RELEASED];
 }

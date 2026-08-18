@@ -348,17 +348,15 @@ pub enum Command {
     /// v0.1.0: the event tail, before it was `events`.
     #[command(hide = true)]
     Tail { workspace: Option<String> },
-    /// v0.1.0: a server grant plus the offline attenuation of it (§7.2).
-    #[command(hide = true)]
-    Share {
-        workspace: Option<String>,
-        #[arg(long, value_enum)]
-        role: GrantRoleArg,
-        #[arg(long, value_parser = parse_duration_ms)]
-        expires_in: u64,
-        #[arg(long, default_value = "dev-principal")]
-        grantee: String,
-    },
+    // `share` lived here until ADR-0075. It posted a grant AND printed the
+    // same narrowing recomputed offline with `authz::attenuate` — the second
+    // half being the mechanism ADR-0075 closes as a way to share a workspace,
+    // because an appended block cannot rebind `principal`, so what it handed
+    // out was the OWNER's authority under a narrower role: invisible to the
+    // server, attributable to the wrong person, and unrevocable. Sharing is
+    // now a server-minted row (`POST /v1/workspaces/:id/shares`) and the CLI
+    // noun for it is deliberately absent until ADR-0069 §1's grammar question
+    // is settled (ADR-0077) — an agent reaches the route directly.
     /// v0.1.0: the compute-credit balance, now part of `auth whoami`.
     #[command(hide = true)]
     Credits,
@@ -578,29 +576,15 @@ pub fn bucket(state: &str) -> &'static str {
     }
 }
 
-/// Grantable roles (§7.4: `owner` is not grantable).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum GrantRoleArg {
-    Viewer,
-    Collaborator,
-}
+// `GrantRoleArg` (viewer｜collaborator) went with the `share` verb. Nothing in
+// the CLI names a grantable role any more, and the rule it encoded now lives
+// where it is enforced: controld refuses `owner` and `harness` at the share
+// routes with `400 invalid_role` (ADR-0074), which is the only place a direct
+// API caller passes through.
 
-impl GrantRoleArg {
-    pub fn as_authz(self) -> authz::Role {
-        match self {
-            GrantRoleArg::Viewer => authz::Role::Viewer,
-            GrantRoleArg::Collaborator => authz::Role::Collaborator,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        self.as_authz().as_str()
-    }
-}
-
-/// Roles a KEY may hold — a different set from the grantable ones. `owner` is
-/// mintable (the server's `KEY_ROLES` allows it) and is what a key needs to
-/// archive; it is not *grantable*, which is why these are two enums.
+/// Roles a KEY may hold. `owner` is mintable (the server's `KEY_ROLES` allows
+/// it) and is what a key needs to archive; it is not *grantable* — see the
+/// note above, and `keys_mint_can_ask_for_owner_and_no_verb_grants_a_role`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum KeyRoleArg {
     Collaborator,
@@ -959,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_mint_can_ask_for_owner_but_a_grant_cannot() {
+    fn keys_mint_can_ask_for_owner_and_no_verb_grants_a_role() {
         let cli = parse(&["reachpad", "keys", "mint", "--role", "owner"]);
         match cli.command {
             Some(Command::Keys(KeysCommand::Mint { role, .. })) => {
@@ -967,17 +951,29 @@ mod tests {
             }
             other => panic!("wrong parse: {other:?}"),
         }
-        // §7.4: owner is not a grantable role, and `share` still refuses it.
-        assert!(Cli::try_parse_from([
-            "reachpad",
-            "share",
-            "ws-1",
-            "--role",
-            "owner",
-            "--expires-in",
-            "1h",
-        ])
-        .is_err());
+        // `owner` is mintable as a KEY role and is not grantable as a SHARE
+        // role. The half of that this file used to prove — `share --role
+        // owner` refused at clap — went with the verb (ADR-0075): what the
+        // CLI now proves is that the verb is gone and stays gone, including
+        // its hidden spelling, because a hidden verb is still in the catalog
+        // an agent plans against (§13.1). The refusal itself moved
+        // server-side, where a direct API caller meets it too:
+        // `bins/controld/tests/edges_routes.rs` and `controld_api.rs` assert
+        // `400 invalid_role` for `owner` and for `harness`.
+        for argv in [
+            vec!["reachpad", "share", "ws-1", "--role", "owner"],
+            vec!["reachpad", "share", "ws-1", "--role", "viewer"],
+            vec!["reachpad", "share", "ws-1"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv.clone()).is_err(),
+                "the retired verb still parses: {argv:?}"
+            );
+        }
+        // The control: an unrelated hidden v0.1.0 spelling still parses, so
+        // the assertions above are about `share` and not about a parser that
+        // has stopped accepting hidden verbs altogether.
+        assert!(Cli::try_parse_from(["reachpad", "credits"]).is_ok());
     }
 
     #[test]
