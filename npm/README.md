@@ -72,7 +72,7 @@ the very first version of each of the five has to be pushed by hand:
 git checkout cli-v<version>
 gh release download cli-v<version> --dir /tmp/rp-assets
 node npm/prepare.mjs --version <version> --artifacts /tmp/rp-assets
-for d in darwin-arm64 darwin-x64 linux-x64 linux-arm64 cli; do npm publish "npm/$d"; done
+for d in darwin-arm64 darwin-x64 linux-x64 linux-arm64 cli; do npm publish "./npm/$d"; done   # ./ matters: a bare npm/cli is a GitHub shorthand, not a path
 ```
 
 Then, at npmjs.com, for **each** of the five packages:

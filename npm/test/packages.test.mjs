@@ -44,6 +44,26 @@ test("every list of platforms is the same list", () => {
   );
 });
 
+test("every `npm publish` names a directory, not a GitHub repo", () => {
+  // `npm publish npm/cli` does not publish this repo's npm/cli directory. npm
+  // reads the argument as a package spec, and `<a>/<b>` is the GitHub
+  // shorthand, so npm fetches github.com/npm/cli and publishes the npm CLI
+  // itself; `npm/darwin-arm64` is a repository that does not exist and fails
+  // with a git error about an ssh key. Only a spec starting with `.`, `/` or
+  // `~/` is read as a path. Checked in the two places that publish: the
+  // release workflow and the by-hand loop in npm/README.md.
+  for (const file of [".github/workflows/release.yml", "npm/README.md"]) {
+    const text = readFileSync(join(REPO, file), "utf8");
+    for (const [line, spec] of text.matchAll(/^.*npm publish "?([^\s"]+)/gm)) {
+      assert.match(
+        spec,
+        /^(\.|\/|~\/)/,
+        `${file}: \`${line.trim()}\` publishes a package spec, not a directory`
+      );
+    }
+  }
+});
+
 test("each platform package declares the os/cpu npm selects it by", () => {
   for (const platform of PLATFORMS) {
     const pkg = manifest(platform.dir);

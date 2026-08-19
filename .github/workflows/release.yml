@@ -339,7 +339,15 @@ jobs:
               echo "$name@$version is already on npm; leaving it alone"
               continue
             fi
-            if npm publish "npm/$dir"; then
+            # ./npm/$dir, not npm/$dir. npm resolves a publish argument as a
+            # package SPEC, and a bare `npm/cli` is not a path to npm -- it is
+            # the GitHub shorthand `<org>/<repo>`, so npm clones
+            # github.com/npm/cli and publishes THAT (the npm CLI itself). The
+            # first iteration, `npm/darwin-arm64`, is a repository that does
+            # not exist, so this loop died on a git error about a public key
+            # while looking like an auth problem with our own registry. Only a
+            # spec starting with `.`, `/`, or `~/` is read as a directory.
+            if npm publish "./npm/$dir"; then
               continue
             fi
             # A publish can fail for ordinary reasons, but there is exactly one
