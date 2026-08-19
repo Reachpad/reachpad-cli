@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "authz"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "biscuit-auth",
  "blake3",
@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "proptest",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "reach"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "authz",

@@ -246,6 +246,25 @@ impl Ctx {
 
     /// Said once per command, on stderr, when this fleet cannot answer
     /// something this CLI knows how to ask.
+    /// What to do with the workspace that was just created.
+    ///
+    /// `create` prints one bare id and nothing else, which is right — a script
+    /// pipes it into the next verb — and which left a person's first workspace
+    /// looking like a command that had not finished. This is the missing half,
+    /// and it is on STDERR and gated on stderr being a terminal, so
+    /// `WS=$(reachpad create)` captures exactly the same bytes it always did.
+    /// Silent under `--json` and `-q` for the same reason: both are asked for
+    /// by something that is parsing, and neither is a person.
+    fn next_step(&self, workspace: &str) {
+        use std::io::IsTerminal as _;
+        if self.json || self.quiet || !std::io::stderr().is_terminal() {
+            return;
+        }
+        eprintln!(
+            "  next: reachpad attach {workspace}  (or `reachpad run {workspace} -- <command>`)"
+        );
+    }
+
     fn note_older_fleet(&self) {
         if self.noticed.replace(true) {
             return;
@@ -498,24 +517,34 @@ fn self_or_any(ctx: &Ctx) -> Result<String, CliError> {
 
 /// What a bare `reachpad` does, decided before anything is attempted.
 ///
-/// The interactivity test is the safety property: a browser sign-in is a
-/// side effect no script asked for, so a pipe keeps the v0.1.0 usage refusal
-/// and its exit code. #50.
+/// The interactivity test is the safety property, and it is about ONE thing:
+/// a browser sign-in is a side effect no script asked for, so it never starts
+/// without a terminal to complete it in (#50).
+///
+/// It used to be applied to the whole command, which made `reachpad` answer
+/// `no command given` to a pipe even when the caller was signed in and a
+/// listing needed no terminal at all. That is the command the installer's last
+/// line tells every new user to run, and an agent or a CI step is exactly the
+/// caller that runs it without a tty — so the product's first instruction
+/// failed for them, twice over: signed in, it refused a listing it could have
+/// printed; signed out, it named `--help` instead of the one command that
+/// signs a browserless machine in.
 #[derive(Debug, PartialEq, Eq)]
 enum Onboarding {
-    /// Not a terminal: the old usage error, unchanged.
-    Refuse,
+    /// No terminal and no credential: refuse, but name the browserless login.
+    /// A browser flow here would print a URL nobody is watching and block.
+    RefuseNoCredential,
     /// A terminal with no credential: sign in, then show what is there.
     SignInThenList,
-    /// A terminal that is already signed in: just show what is there.
+    /// Signed in already: show what is there. A listing is not interactive.
     List,
 }
 
 fn onboarding_action(interactive: bool, signed_in: bool) -> Onboarding {
     match (interactive, signed_in) {
-        (false, _) => Onboarding::Refuse,
+        (_, true) => Onboarding::List,
         (true, false) => Onboarding::SignInThenList,
-        (true, true) => Onboarding::List,
+        (false, false) => Onboarding::RefuseNoCredential,
     }
 }
 
@@ -546,8 +575,11 @@ async fn run_onboarding(cli: &Cli, ctx: &Ctx) -> Result<i32, CliError> {
         conf::Stored::Missing | conf::Stored::Expired => false,
     };
     match onboarding_action(interactive, signed_in) {
-        Onboarding::Refuse => Err(CliError::usage(
-            "no command given. `reachpad --help` lists them.",
+        Onboarding::RefuseNoCredential => Err(CliError::usage(
+            "no saved sign-in on this machine, and no terminal to complete a browser \
+             sign-in in. Run `reachpad auth login --no-browser` and open the printed URL \
+             on another device, or hold an API key in REACHPAD_API_KEY. \
+             `reachpad --help` lists every command.",
         )),
         Onboarding::List => list(ctx, None, None).await,
         Onboarding::SignInThenList => {
@@ -635,6 +667,7 @@ async fn create(
         // script pipes it straight into the next verb.
         std::slice::from_ref(&created.workspace),
     );
+    ctx.next_step(&created.workspace);
     Ok(EXIT_OK)
 }
 
@@ -2258,15 +2291,28 @@ mod tests {
         assert_eq!(gave_up.exit_code, errors::EXIT_UNAVAILABLE);
     }
 
-    /// The safety property of first-run onboarding: a browser sign-in is a
-    /// side effect nobody typed, so ONLY a terminal may trigger one. A pipe
-    /// keeps the v0.1.0 usage refusal whether or not a credential exists.
+    /// The safety property of first-run onboarding, stated exactly: a BROWSER
+    /// SIGN-IN is the side effect nobody typed, so only a terminal may trigger
+    /// one. It is not a rule about the command as a whole — a listing needs no
+    /// terminal, and refusing one to a signed-in pipe was the bug.
     #[test]
-    fn a_bare_reachpad_only_onboards_an_interactive_terminal() {
-        assert_eq!(onboarding_action(false, false), Onboarding::Refuse);
-        assert_eq!(onboarding_action(false, true), Onboarding::Refuse);
+    fn only_a_terminal_ever_starts_a_browser_sign_in() {
+        assert_eq!(
+            onboarding_action(false, false),
+            Onboarding::RefuseNoCredential,
+            "a pipe with no credential must not open a browser; it is told how \
+             to sign in without one"
+        );
         assert_eq!(onboarding_action(true, false), Onboarding::SignInThenList);
+    }
+
+    /// Signed in, a bare `reachpad` lists — terminal or not. This is the
+    /// command the installer's final line names, and an agent, a CI step and a
+    /// `reachpad | tee` all reach it without a tty.
+    #[test]
+    fn a_signed_in_bare_reachpad_lists_with_or_without_a_terminal() {
         assert_eq!(onboarding_action(true, true), Onboarding::List);
+        assert_eq!(onboarding_action(false, true), Onboarding::List);
     }
 
     /// A bare invocation is rendered as a listing, so `reachpad --json` on a

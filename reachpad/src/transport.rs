@@ -430,6 +430,28 @@ async fn resolve(host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
+/// Did the peer close the connection deliberately and without complaint?
+///
+/// QUIC gives an endpoint one number to say why it closed, and the hub spends
+/// it: `0` for a session that ended (`bins/hub/src/quic.rs`), a non-zero
+/// `ERR_*` for everything it refuses. `LocallyClosed` is this process closing
+/// its own connection — a detach — and is graceful for the same reason.
+///
+/// Anything else (a timeout, a reset, a transport error, a non-zero code) is
+/// still a failure and still says so. A client that called EVERY disconnect
+/// graceful would hide the ones worth seeing.
+fn is_graceful_close(e: &quinn::ReadError) -> bool {
+    match e {
+        quinn::ReadError::ConnectionLost(conn) => {
+            matches!(
+                conn,
+                quinn::ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == 0
+            ) || matches!(conn, quinn::ConnectionError::LocallyClosed)
+        }
+        _ => false,
+    }
+}
+
 /// Pump one stream through the shared frozen-frame decoder — the mirror of
 /// hub's read path: a framing error poisons only its own stream, except on
 /// ctl where it ends the session.
@@ -464,6 +486,21 @@ async fn read_stream(mut recv: quinn::RecvStream, tx: mpsc::Sender<Incoming>, is
                 }
                 break None;
             }
+            // The peer hung up on purpose. `bins/hub/src/quic.rs` ends a
+            // finished session with `conn.close(0, b"session ended")`, and a
+            // zero application code is the whole vocabulary QUIC has for
+            // "nothing went wrong" — every real fault the hub reports carries
+            // a non-zero `ERR_*`. Reported as a read failure, that close was
+            // the last thing a user saw after typing `exit`:
+            //
+            //     logout
+            //     reachpad: stream read failed: connection lost
+            //     $ echo $?
+            //     1
+            //
+            // A clean logout is now a clean end of stream, and the exit code
+            // is the 0 the session actually earned.
+            Err(e) if is_graceful_close(&e) => break None,
             Err(e) => break Some(anyhow::anyhow!("stream read failed: {e}")),
         }
     };
