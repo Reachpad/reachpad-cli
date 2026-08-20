@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use crate::api::{DeviceSize, GuestDisk, Head, Limits, Parent, Status, Workspace};
+use crate::api::{DeviceSize, GuestDisk, Head, Limits, Parent, PortShare, Status, Workspace};
 
 /// Epoch milliseconds as RFC 3339 UTC — the only timestamp spelling on this
 /// surface. `0` means "not set", which renders as JSON null.
@@ -114,6 +114,63 @@ pub fn workspace_json(ws: &Workspace) -> Value {
         "head": head_json(ws.head.as_ref()),
         "parent": parent_json(ws.parent.as_ref()),
     })
+}
+
+/// One port share (ADR-0103) as `--json` renders it.
+///
+/// `url` is a `null` rather than a missing key when the fleet composed none:
+/// a caller that keys on it can tell "this fleet has no preview origin" from
+/// "this token has no link", and there is only ever the first.
+pub fn port_share_json(share: &PortShare) -> Value {
+    json!({
+        "port": share.port,
+        "workspace": share.workspace,
+        "token": share.token,
+        "url": share.url,
+        "created_at": time(share.created_at_ms),
+        // `null` on every verb but `revoke`, where it is the outcome: a
+        // scripted caller reads the fleet's own stamp rather than its own
+        // clock.
+        "revoked_at": share.revoked_at_ms.map_or(Value::Null, time),
+    })
+}
+
+/// What to hand a person for one share: the link the fleet composed, or — when
+/// it composed none — the bare token, said as the incomplete thing it is.
+///
+/// The alternative was to build the URL here from a default origin. That would
+/// print a link that resolves nowhere for every deployment whose preview plane
+/// is not `app.reachpad.dev`, and a link that does not work is worse than a
+/// token plus a sentence naming the variable an operator has to set.
+pub fn port_share_target(share: &PortShare) -> String {
+    match &share.url {
+        Some(url) => url.clone(),
+        // No "see below": this string is also a `ports list` row, where there
+        // is no below. The sentence that explains it is
+        // [`port_share_no_origin`], printed once by the verb that has room.
+        None => format!("token {} — no link", share.token),
+    }
+}
+
+/// The sentence for a fleet that minted the share and cannot say where it is
+/// reachable. `None` when the fleet composed a link, which is the ordinary
+/// case and needs no explanation.
+pub fn port_share_no_origin(share: &PortShare) -> Option<String> {
+    share.url.is_none().then(|| {
+        "  this fleet has no preview origin set, so it cannot compose the link: an operator \
+         sets REACHPAD_PREVIEW_ORIGIN on controld (and the preview plane on hub)"
+            .to_owned()
+    })
+}
+
+/// One `ports list` row: the port, then where it is reachable.
+pub fn port_share_line(share: &PortShare, now_ms: u64) -> String {
+    format!(
+        "{:<6} {}  (opened {})",
+        share.port,
+        port_share_target(share),
+        ago(share.created_at_ms, now_ms)
+    )
 }
 
 /// The `status` payload.
@@ -336,6 +393,63 @@ mod tests {
         assert_eq!(v["archived_at"], Value::Null);
         // No `_ms` field survives the rendering layer.
         assert!(!v.to_string().contains("_ms"), "{v}");
+    }
+
+    /// A share the fleet composed a link for, and the same one it did not.
+    fn port_share(url: Option<&str>) -> PortShare {
+        PortShare {
+            token: "11111111-2222-4333-8444-555555555555".into(),
+            workspace: "ws-601".into(),
+            port: 3000,
+            created_at_ms: 1_755_108_131_000,
+            url: url.map(str::to_owned),
+            revoked_at_ms: None,
+        }
+    }
+
+    /// The link comes off the wire or it does not exist. A CLI that composed
+    /// one from a default origin would print a working-looking link that
+    /// resolves nowhere on every deployment but ours.
+    #[test]
+    fn a_link_the_fleet_did_not_compose_is_never_invented() {
+        let with = port_share(Some(
+            "https://app.reachpad.dev/11111111-2222-4333-8444-555555555555",
+        ));
+        assert_eq!(
+            port_share_target(&with),
+            "https://app.reachpad.dev/11111111-2222-4333-8444-555555555555"
+        );
+        assert!(port_share_no_origin(&with).is_none());
+        assert_eq!(port_share_json(&with)["created_at"], "2025-08-13T18:02:11Z");
+
+        let without = port_share(None);
+        let target = port_share_target(&without);
+        assert!(
+            target.contains("11111111-2222-4333-8444-555555555555"),
+            "{target}"
+        );
+        assert!(!target.contains("http"), "no invented origin: {target}");
+        let said = port_share_no_origin(&without).expect("the missing variable is named");
+        assert!(said.contains("REACHPAD_PREVIEW_ORIGIN"), "{said}");
+        // A null, not a missing key: a caller can tell the two states apart.
+        assert_eq!(port_share_json(&without)["url"], Value::Null);
+        assert!(!port_share_json(&without).to_string().contains("_ms"));
+
+        let line = port_share_line(&with, 1_755_108_131_000 + 7_200_000);
+        assert!(line.starts_with("3000"), "{line}");
+        assert!(line.contains("2h ago"), "{line}");
+
+        // The revoke answer's own field: `null` everywhere else, and a
+        // rendered time where the fleet stamped one. The verb whose whole
+        // outcome is a timestamp has to hand it to a scripted caller.
+        assert_eq!(port_share_json(&with)["revoked_at"], Value::Null);
+        let mut revoked = port_share(None);
+        revoked.revoked_at_ms = Some(1_755_108_131_000 + 3_600_000);
+        assert_eq!(
+            port_share_json(&revoked)["revoked_at"],
+            "2025-08-13T19:02:11Z"
+        );
+        assert!(!port_share_json(&revoked).to_string().contains("_ms"));
     }
 
     /// A `Status` with nothing interesting in it but the disk (WP-CP.3).

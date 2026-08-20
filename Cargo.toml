@@ -8,7 +8,7 @@ resolver = "2"
 members = ["reachpad", "crates/proto", "crates/authz"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.85"
 license = "UNLICENSED"
@@ -29,6 +29,7 @@ hex = "0.4"
 proptest = "1"
 prost = "0.13"
 prost-build = "0.13"
+protoc-bin-vendored = "3"
 quinn = "0.11"
 rcgen = { version = "0.14", features = ["pem", "crypto", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

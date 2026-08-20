@@ -293,6 +293,21 @@ pub enum Command {
     /// API keys (`rpak1.…`) — the credential an agent or CI runner holds.
     #[command(subcommand, alias = "key")]
     Keys(KeysCommand),
+    /// Model spend: what is left, and the ceilings that bound it.
+    #[command(subcommand)]
+    Budget(BudgetCommand),
+    /// The account-wide stop: cut every connection and pause everything.
+    #[command(subcommand, name = "kill-switch")]
+    KillSwitch(KillSwitchCommand),
+    /// Ports inside a workspace, opened to the web (ADR-0103).
+    ///
+    /// A namespaced noun, not a bare verb: bare verbs act on a workspace and
+    /// nothing else (ADR-0079 §1, which amended `0069-cli-v1-surface.md` §1
+    /// into the rule rather than the list). And deliberately not
+    /// `share`, which this CLI already taught as "give another account access
+    /// to this workspace" — see the note where that verb used to be.
+    #[command(subcommand, alias = "port")]
+    Ports(PortsCommand),
 
     // ---- this installation, not the account ------------------------------
     /// Check this installation: binary, PATH, saved login, endpoints, reach.
@@ -397,6 +412,149 @@ pub enum KeysCommand {
     Revoke {
         /// The key id (the middle of `rpak1.<id>.<secret>`).
         id: String,
+    },
+}
+
+/// `budget` is a NAMESPACE, not a bare verb: ADR-0079 §1 makes a verb bare
+/// when its direct object is a WORKSPACE, and the object here is a budget.
+/// `--workspace` narrows the read; it does not make the workspace the object.
+#[derive(Subcommand, Debug)]
+pub enum BudgetCommand {
+    /// What is left: the account pool, each connection's ceiling, and — with
+    /// `--workspace` — that workspace's per-link caps.
+    ///
+    /// Every number comes from the server (I13). A cap you cannot read is a
+    /// cap you can only discover by hitting it.
+    Show {
+        /// Also show this workspace's per-link caps.
+        #[arg(long, value_name = "WORKSPACE")]
+        workspace: Option<String>,
+    },
+    /// Set the account-level ceiling on ONE connection: the number fan-out
+    /// cannot multiply.
+    ///
+    /// Per-link caps are independent ceilings, so N spawned children sum to
+    /// N× a parent's. This is the one that bounds the account.
+    Ceiling {
+        /// The connection, by name or id.
+        #[arg(long, value_name = "CONNECTION")]
+        connection: String,
+        /// The ceiling per 30-day period, in dollars (`25`, `12.50`).
+        #[arg(long, value_name = "USD", value_parser = parse_usd_micros)]
+        amount: u64,
+    },
+    /// Set ONE link's cap inside a workspace.
+    Cap {
+        /// The workspace holding the link.
+        workspace: Option<String>,
+        /// The link id (`reachpad budget show --workspace <ws>` lists them).
+        #[arg(long, value_name = "LINK")]
+        link: String,
+        /// The cap per 30-day period, in dollars. `0` stops the edge without
+        /// cutting it — which is reversible, and an unlink is not.
+        #[arg(long, value_name = "USD", value_parser = parse_usd_micros)]
+        amount: u64,
+    },
+}
+
+/// The kill switch is its own namespace because it is not a budget: it is an
+/// account-wide stop that cuts every connection AND pauses every running
+/// workspace. Burying it under `budget` would make the most destructive verb
+/// in the CLI look like a settings change.
+#[derive(Subcommand, Debug)]
+pub enum KillSwitchCommand {
+    /// STOP EVERYTHING: cut every connection on this account and pause every
+    /// running workspace.
+    ///
+    /// This is the one place reachpad stops your work on purpose. Releasing
+    /// it re-allows spend; it does not re-link what it cut.
+    Engage {
+        /// Why — recorded in the audit trail beside who pulled it.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Allow spend again. Connections stay unlinked and workspaces stay
+    /// paused: re-link what you want back.
+    Release,
+    /// Is it engaged?
+    Status,
+}
+
+/// Dollars → micros, exactly and without floating point.
+///
+/// `12.50` is 12_500_000 micros. Money never travels through an `f64` here:
+/// the fraction is parsed as digits and scaled, so `0.1` is 100_000 and not
+/// 99_999.99999999999. More than six decimal places is refused rather than
+/// rounded — a silently truncated ceiling is a ceiling nobody chose.
+pub fn parse_usd_micros(raw: &str) -> Result<u64, String> {
+    let text = raw.trim().trim_start_matches('$');
+    let (whole, frac) = match text.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (text, ""),
+    };
+    if whole.is_empty() && frac.is_empty() {
+        return Err("expected an amount in dollars, e.g. 25 or 12.50".to_owned());
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("{raw:?} is not an amount in dollars"));
+    }
+    if frac.len() > 6 {
+        return Err(format!(
+            "{raw:?} has more than six decimal places; the smallest unit is one micro-dollar"
+        ));
+    }
+    let dollars: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse()
+            .map_err(|_| format!("{raw:?} is larger than this command can express"))?
+    };
+    let mut micros = frac.to_owned();
+    while micros.len() < 6 {
+        micros.push('0');
+    }
+    let micros: u64 = micros.parse().map_err(|_| "bad fraction".to_owned())?;
+    dollars
+        .checked_mul(1_000_000)
+        .and_then(|d| d.checked_add(micros))
+        .ok_or_else(|| format!("{raw:?} is larger than this command can express"))
+}
+
+/// `reachpad ports …` — the three things an owner does with a shared port.
+///
+/// Every one of them takes the port FIRST and the workspace second: the port
+/// is what the person is thinking about, and the workspace is usually already
+/// in `-w`/`REACHPAD_WORKSPACE`. `KeysCommand` is the structural template
+/// (mint/list/revoke); the shape is deliberately the same so a person who has
+/// used one namespace can guess the other.
+#[derive(Subcommand, Debug)]
+pub enum PortsCommand {
+    /// Open a port inside the workspace and print the link that reaches it.
+    ///
+    /// Anyone who has the link AND is signed in to Reachpad can open it; it
+    /// carries no port, no workspace id and no account name. Re-running it
+    /// for a port that is already open returns the SAME link rather than a
+    /// second one.
+    Expose {
+        /// The port your app is listening on inside the workspace (1–65535).
+        port: u32,
+        /// Workspace id (or `-w` / REACHPAD_WORKSPACE).
+        workspace: Option<String>,
+    },
+    /// The ports open on this workspace, oldest first, with their links.
+    List {
+        /// Workspace id (or `-w` / REACHPAD_WORKSPACE).
+        workspace: Option<String>,
+    },
+    /// Close one port. The link stops working at the visitor's next request,
+    /// and re-opening the same port later mints a NEW link — a closed one
+    /// never comes back.
+    Revoke {
+        /// The port to stop sharing.
+        port: u32,
+        /// Workspace id (or `-w` / REACHPAD_WORKSPACE).
+        workspace: Option<String>,
     },
 }
 
@@ -697,6 +855,68 @@ mod tests {
         Cli::try_parse_from(args).expect("args should parse")
     }
 
+    /// Money never travels through an `f64`. `0.1` dollars is exactly 100_000
+    /// micros, not 99_999.999…, and a seventh decimal place is REFUSED rather
+    /// than rounded — a silently truncated ceiling is a ceiling nobody chose.
+    #[test]
+    fn dollars_become_micros_exactly_and_over_precision_is_refused() {
+        for (text, micros) in [
+            ("25", 25_000_000),
+            ("$25", 25_000_000),
+            ("12.50", 12_500_000),
+            ("0.1", 100_000),
+            ("0.000001", 1),
+            ("0", 0),
+            (".5", 500_000),
+        ] {
+            assert_eq!(parse_usd_micros(text), Ok(micros), "{text}");
+        }
+        for bad in ["", "abc", "1.2345678", "-5", "1e6", "1.2.3", "$"] {
+            assert!(parse_usd_micros(bad).is_err(), "must refuse: {bad:?}");
+        }
+    }
+
+    /// The C5 verbs parse under ADR-0079's amended rule: `budget` and
+    /// `kill-switch` are NAMESPACES (their object is a budget and an account,
+    /// not a workspace), and `budget cap` takes the workspace as its first
+    /// positional because that one does act on a workspace's link.
+    #[test]
+    fn the_budget_namespace_parses_as_a_namespace() {
+        assert!(matches!(
+            parse(&["reachpad", "budget", "show"]).command,
+            Some(Command::Budget(BudgetCommand::Show { workspace: None }))
+        ));
+        assert!(matches!(
+            parse(&["reachpad", "budget", "show", "--workspace", "ws-1"]).command,
+            Some(Command::Budget(BudgetCommand::Show { workspace: Some(w) })) if w == "ws-1"
+        ));
+        assert!(matches!(
+            parse(&[
+                "reachpad", "budget", "ceiling", "--connection", "claude", "--amount", "50"
+            ])
+            .command,
+            Some(Command::Budget(BudgetCommand::Ceiling { amount, .. })) if amount == 50_000_000
+        ));
+        assert!(matches!(
+            parse(&[
+                "reachpad", "budget", "cap", "ws-1", "--link", "link-3", "--amount", "1.25"
+            ])
+            .command,
+            Some(Command::Budget(BudgetCommand::Cap { amount, .. })) if amount == 1_250_000
+        ));
+        assert!(matches!(
+            parse(&["reachpad", "kill-switch", "engage", "--reason", "spike"]).command,
+            Some(Command::KillSwitch(KillSwitchCommand::Engage { reason: Some(r) })) if r == "spike"
+        ));
+        assert!(matches!(
+            parse(&["reachpad", "kill-switch", "release"]).command,
+            Some(Command::KillSwitch(KillSwitchCommand::Release))
+        ));
+        // `budget` alone is a namespace, so it needs a subcommand — the
+        // grammar rule "nothing is both" made testable.
+        assert!(Cli::try_parse_from(["reachpad", "budget"]).is_err());
+    }
+
     /// The production endpoint is the default, and a saved one outranks it:
     /// a laptop that logged in once types no URL ever again (v0.1.0 P0 #1).
     #[test]
@@ -976,6 +1196,43 @@ mod tests {
         assert!(Cli::try_parse_from(["reachpad", "credits"]).is_ok());
     }
 
+    /// The port noun is namespaced, takes the port first, and is NOT spelled
+    /// `share` — the word this CLI already teaches for "give another account
+    /// access to this workspace" (ADR-0075, ADR-0103 §1).
+    #[test]
+    fn ports_is_a_namespace_and_the_port_comes_before_the_workspace() {
+        match parse(&["reachpad", "ports", "expose", "3000", "ws-1"]).command {
+            Some(Command::Ports(PortsCommand::Expose { port, workspace })) => {
+                assert_eq!(port, 3000);
+                assert_eq!(workspace.as_deref(), Some("ws-1"));
+            }
+            other => panic!("wrong parse: {other:?}"),
+        }
+        // The workspace is optional here for the same reason it is optional on
+        // `archive`: `-w` and REACHPAD_WORKSPACE supply it.
+        match parse(&["reachpad", "ports", "expose", "8080"]).command {
+            Some(Command::Ports(PortsCommand::Expose { port, workspace })) => {
+                assert_eq!(port, 8080);
+                assert!(workspace.is_none());
+            }
+            other => panic!("wrong parse: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["reachpad", "port", "list"]).command,
+            Some(Command::Ports(PortsCommand::List { .. }))
+        ));
+        assert!(matches!(
+            parse(&["reachpad", "ports", "revoke", "3000"]).command,
+            Some(Command::Ports(PortsCommand::Revoke { port: 3000, .. }))
+        ));
+        // A port that is not a number is refused by clap, before a socket
+        // opens — the server's own `invalid_port` covers the range.
+        assert!(Cli::try_parse_from(["reachpad", "ports", "expose", "http"]).is_err());
+        // And the retired spelling stays retired: no bare `share`, and no
+        // `expose` outside the namespace.
+        assert!(Cli::try_parse_from(["reachpad", "expose", "3000"]).is_err());
+    }
+
     #[test]
     fn states_bucket_the_two_transient_ones() {
         assert_eq!(bucket("sealing"), "running");
@@ -1017,6 +1274,7 @@ mod tests {
             "events",
             "auth",
             "keys",
+            "ports",
             // The maintenance verbs are catalog entries too: an agent that
             // plans against this JSON should be able to see that the CLI can
             // diagnose and update itself (#50).

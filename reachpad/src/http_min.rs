@@ -185,7 +185,34 @@ pub async fn post_json_trust(
     bearer: Option<&str>,
     trust: &TlsTrust,
 ) -> anyhow::Result<Response> {
-    send_json(base_url, "POST", path, Some(body), bearer, trust).await
+    send_json(base_url, "POST", path, Some(body), bearer, None, trust).await
+}
+
+/// POST with an `Idempotency-Key` header.
+///
+/// Every edge mutation on controld's `/v1` surface requires one (design §5:
+/// the API's main clients are agents, and agents retry), and a replay returns
+/// the STORED RESPONSE rather than re-executing. Separate from
+/// [`post_json_trust`] so the header cannot be forgotten on a route that
+/// needs it or sent on one that does not.
+pub async fn post_json_keyed(
+    base_url: &str,
+    path: &str,
+    body: &serde_json::Value,
+    bearer: Option<&str>,
+    idempotency_key: &str,
+    trust: &TlsTrust,
+) -> anyhow::Result<Response> {
+    send_json(
+        base_url,
+        "POST",
+        path,
+        Some(body),
+        bearer,
+        Some(idempotency_key),
+        trust,
+    )
+    .await
 }
 
 /// POST an `application/x-www-form-urlencoded` body. WorkOS CLI Auth uses
@@ -228,7 +255,7 @@ pub async fn get_json_trust(
     bearer: Option<&str>,
     trust: &TlsTrust,
 ) -> anyhow::Result<Response> {
-    send_json(base_url, "GET", path, None, bearer, trust).await
+    send_json(base_url, "GET", path, None, bearer, None, trust).await
 }
 
 /// GET with a JSON BODY — `GET /v1/api-keys` is the one route shaped this
@@ -240,7 +267,7 @@ pub async fn get_json_body_trust(
     body: &serde_json::Value,
     trust: &TlsTrust,
 ) -> anyhow::Result<Response> {
-    send_json(base_url, "GET", path, Some(body), None, trust).await
+    send_json(base_url, "GET", path, Some(body), None, None, trust).await
 }
 
 async fn send_json(
@@ -249,18 +276,20 @@ async fn send_json(
     path: &str,
     body: Option<&serde_json::Value>,
     bearer: Option<&str>,
+    idempotency_key: Option<&str>,
     trust: &TlsTrust,
 ) -> anyhow::Result<Response> {
     let payload = match body {
         Some(body) => serde_json::to_vec(body).context("request body serialization")?,
         None => Vec::new(),
     };
-    send_payload(
+    send_payload_keyed(
         base_url,
         method,
         path,
         &payload,
         bearer,
+        idempotency_key,
         "application/json",
         trust,
     )
@@ -276,11 +305,42 @@ async fn send_payload(
     content_type: &str,
     trust: &TlsTrust,
 ) -> anyhow::Result<Response> {
+    send_payload_keyed(
+        base_url,
+        method,
+        path,
+        payload,
+        bearer,
+        None,
+        content_type,
+        trust,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_payload_keyed(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    payload: &[u8],
+    bearer: Option<&str>,
+    idempotency_key: Option<&str>,
+    content_type: &str,
+    trust: &TlsTrust,
+) -> anyhow::Result<Response> {
     let endpoint = parse_url(base_url)?;
     // BEFORE the socket, and before the credential is formatted into bytes.
     endpoint.ensure_confidential()?;
-    let request =
-        request_head_with_type(&endpoint, method, path, bearer, payload.len(), content_type)?;
+    let request = request_head_with_type(
+        &endpoint,
+        method,
+        path,
+        bearer,
+        idempotency_key,
+        payload.len(),
+        content_type,
+    )?;
 
     let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
         .await
@@ -325,16 +385,19 @@ fn request_head(
         method,
         path,
         bearer,
+        None,
         content_length,
         "application/json",
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn request_head_with_type(
     endpoint: &Endpoint,
     method: &str,
     path: &str,
     bearer: Option<&str>,
+    idempotency_key: Option<&str>,
     content_length: usize,
     content_type: &str,
 ) -> anyhow::Result<String> {
@@ -342,6 +405,18 @@ fn request_head_with_type(
         !content_type.contains(['\r', '\n']),
         "content type contains a line break"
     );
+    // Same rule as the credential: a value with a line break in it would
+    // inject a header, so it is refused rather than escaped.
+    let idempotency = match idempotency_key {
+        Some(key) => {
+            anyhow::ensure!(
+                !key.contains(['\r', '\n']),
+                "idempotency key contains a line break"
+            );
+            format!("Idempotency-Key: {key}\r\n")
+        }
+        None => String::new(),
+    };
     let authorization = match bearer {
         Some(token) => {
             anyhow::ensure!(
@@ -357,6 +432,7 @@ fn request_head_with_type(
          Host: {authority}\r\n\
          Content-Type: {content_type}\r\n\
          {authorization}\
+         {idempotency}\
          Content-Length: {content_length}\r\n\
          Connection: close\r\n\r\n",
         base = endpoint.base_path,

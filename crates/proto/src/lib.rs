@@ -143,8 +143,35 @@ pub mod events {
     /// every future reader of a log line would render as the system's words.
     pub const LINK_REQUESTED: u32 = 21;
 
+    /// A PORT SHARE on this workspace was created or revoked (ADR-0103, the
+    /// port-share PoC). Appended 2026-08-19 under §4.2's "agents MAY add
+    /// types" rule.
+    ///
+    /// Two summaries, one type: `port_share.created` and
+    /// `port_share.revoked`. Deliberately NOT [`GRANT_CHANGED`], which means
+    /// "an authorization EDGE moved" — a port share authorizes no principal
+    /// to act in the workspace and carries no role; it opens one TCP port to
+    /// whoever holds a uuid and is signed in. Folding it into `grant.changed`
+    /// would make `reach tail` say an edge moved when none did.
+    ///
+    /// The summary carries the port and the workspace's own facts — **never
+    /// the token**, which is the capability itself: an event stream a
+    /// collaborator can read must not hand them a live share URL.
+    ///
+    /// In [`NEVER_THINNED`] for the same reason [`GRANT_CHANGED`] is: "when
+    /// was this port opened to the internet, and by whom" is a question an
+    /// incident review asks about the distant past, and retention must not be
+    /// the reason it has no answer.
+    pub const PORT_SHARE_CHANGED: u32 = 22;
+
     /// Types that are never thinned by retention (§4.2).
-    pub const NEVER_THINNED: &[u32] = &[SECRET_USED, GRANT_CHANGED, LEASE_ACQUIRED, LEASE_RELEASED];
+    pub const NEVER_THINNED: &[u32] = &[
+        SECRET_USED,
+        GRANT_CHANGED,
+        LEASE_ACQUIRED,
+        LEASE_RELEASED,
+        PORT_SHARE_CHANGED,
+    ];
 }
 
 /// Envelope format version written by this build (I11).

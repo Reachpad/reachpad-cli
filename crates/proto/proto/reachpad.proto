@@ -103,8 +103,8 @@ message ServerHello {
 // Channel management on ctl (channel 0). Channel ids are u16 on the wire.
 message ChannelOpen {
   uint32 channel = 1; // proposed channel id
-  string kind    = 2; // "ctl" | "pty" | "events" | "fs" | "presence"
-  uint32 index   = 3; // e.g. pty number for kind == "pty"
+  string kind    = 2; // "ctl" | "pty" | "events" | "fs" | "presence" | "tcp"
+  uint32 index   = 3; // e.g. pty number for kind == "pty", port for "tcp"
 }
 
 message ChannelAck {

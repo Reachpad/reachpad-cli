@@ -421,6 +421,31 @@ pub const TABLE: &[Row] = &[
         exit_code: EXIT_NO_SUCH_WORKSPACE,
         retriable: Retriable::No,
     },
+    // ---- port shares (ADR-0103) ------------------------------------------
+    //
+    // The rows land with the routes rather than with the `reachpad ports`
+    // verbs that will call them, because `scripts/ci/check-error-table.py`
+    // measures the SERVER: a `/v1` handler that can emit a code the table
+    // does not carry fails the gate the moment the handler exists, whether or
+    // not a CLI verb reaches it yet.
+    Row {
+        code: "invalid_port",
+        selector: None,
+        sentence: "That is not a port. Give a number between 1 and 65535 — the port your app is listening on inside the workspace.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        code: "port_share_not_found",
+        selector: None,
+        sentence: "That port is not shared on {workspace}. It may already have been revoked.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_NO_SUCH_WORKSPACE,
+        retriable: Retriable::No,
+    },
     Row {
         // Every edge change takes an idempotency key, because the callers that
         // make them are agents and agents retry.
@@ -729,6 +754,89 @@ pub const TABLE: &[Row] = &[
         exit_code: EXIT_LIMIT,
         retriable: Retriable::No,
     },
+    // ---- budgets and ceilings (creds milestone C5, design §9) ------------
+    Row {
+        // THE distinguishable exhaustion. Design §9 is explicit that this must
+        // not be a bare 429: an agent told only "later" cannot tell a ceiling
+        // that resets in a minute from one that resets in three weeks, and
+        // will retry until it is rate-limited for a different reason. The
+        // numbers clause names the scope and the ceiling, both read off the
+        // wire (I13).
+        //
+        // `EXIT_LIMIT` (6), the same class as `entitlement_limit`: the
+        // platform gave you an amount and you used it.
+        code: "cap_exhausted",
+        selector: None,
+        sentence: "This workspace has spent its model budget for the period. Raise the ceiling with `reachpad budget ceiling`, or wait for the period to roll over.",
+        numbers: Some("{scope} {scope_id}: {spent_micros} of {cap_micros} micro-dollars spent."),
+        next_command: Some("reachpad budget show"),
+        exit_code: EXIT_LIMIT,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The account-wide stop. Wrong state rather than a limit: nothing is
+        // exhausted, somebody pulled the switch, and the remedy is a person.
+        code: "kill_switch_engaged",
+        selector: None,
+        sentence: "This account's kill switch is engaged: nothing starts and nothing spends until it is released. Run `reachpad kill-switch release` to allow spend again.",
+        numbers: None,
+        next_command: Some("reachpad kill-switch release"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The narrowing law applied to money: a spawned child's per-link cap
+        // may not exceed its parent's. Both numbers are in the body, so the
+        // agent that hit it can retry with one that fits instead of guessing.
+        code: "budget_exceeds_parent",
+        selector: None,
+        sentence: "A spawned workspace cannot be given a bigger budget than the one that spawned it. Ask for the parent's cap or less.",
+        numbers: Some("Asked for {requested_micros} micro-dollars; the parent's cap is {parent_micros}."),
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // C3's link-request row already holds the selector-less `reason_too_long`,
+        // and `row()` returns the FIRST selector-less match — so a second bare
+        // row here would be unreachable prose and the owner of a stopped
+        // account would be told to "ask again", which is not what a kill
+        // switch does. The route therefore names which limit it hit, exactly
+        // as `entitlement_limit` does, and this row is selected on it.
+        code: "reason_too_long",
+        selector: Some(("limit", "kill_switch_reason")),
+        sentence: "That reason is too long. Keep it under 1024 bytes and pull the switch again.",
+        numbers: Some("You sent {presented_bytes} bytes; the limit is {limit_bytes}."),
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // Trap 41's posture for the C5 verbs: refuse and name the redeploy,
+        // never a silent downgrade. A `budget show` that printed zeroes
+        // against an older controld would be a client inventing a number, and
+        // a `kill-switch engage` that answered `ok` would be a safety feature
+        // reporting success while nothing stopped.
+        code: "fleet_predates_budgets",
+        selector: None,
+        sentence: "This fleet has no budget or kill-switch routes yet, and reachpad will not guess an answer for them. Wait for it to be redeployed.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The echo check (ADR-0079 §4). The call succeeded and the server
+        // reported a different cap than the one asked for — which is a fleet
+        // that accepted the request and did something else with it.
+        code: "cap_not_applied",
+        selector: None,
+        sentence: "The fleet accepted that cap and reported a different one, so nothing here can say what {workspace} is limited to. Run `reachpad budget show --workspace {workspace}`.",
+        numbers: None,
+        next_command: Some("reachpad budget show --workspace {workspace}"),
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
     Row {
         code: "no_entitlement",
         selector: None,
@@ -969,6 +1077,21 @@ pub const TABLE: &[Row] = &[
         code: "fleet_predates_wait",
         selector: None,
         sentence: "This fleet cannot report a workspace's state, so `--wait` would never see {workspace} change. Run the command without `--wait`, or wait for the fleet to be redeployed.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // ADR-0079 §4 for `reachpad ports`: the verb ships with its route and
+        // refuses against a fleet that predates it. Decided by the CLI, from
+        // two wire shapes — no such route (a bare 404), and an answer that
+        // does not echo the port it acted on (trap 41). Neither is degradable:
+        // what this verb prints is a link its user is about to send to another
+        // person, and a link that reaches nothing is worse than a refusal.
+        code: "fleet_predates_port_shares",
+        selector: None,
+        sentence: "This fleet cannot open a port on {workspace}: it is older than this CLI. Ask for it to be redeployed, or run an older reachpad against it.",
         numbers: None,
         next_command: None,
         exit_code: EXIT_UNAVAILABLE,
@@ -1344,6 +1467,42 @@ mod tests {
         // No `limit` field at all: the fallback row, and no invented numbers.
         let err = render("entitlement_limit", &json!({}), Some(403), Some("ws-1"));
         assert!(err.message.contains("account limit"), "{}", err.message);
+    }
+
+    /// **Two routes answer `reason_too_long`, and each gets its own sentence.**
+    ///
+    /// C3's link-request row is the selector-less one, so it is what `row()`
+    /// falls back to; C5's kill switch names its limit and gets the sentence
+    /// that fits an emergency stop. Without the selector the second row is
+    /// unreachable prose — which is exactly what it was when this test was
+    /// written (creds C5, WP5.3).
+    #[test]
+    fn one_code_two_routes_two_sentences() {
+        let switch = json!({
+            "limit": "kill_switch_reason",
+            "limit_bytes": 1024,
+            "presented_bytes": 2000,
+        });
+        let err = render("reason_too_long", &switch, Some(400), None);
+        assert!(
+            err.message.contains("pull the switch again"),
+            "the kill switch got another route's sentence: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("2000 bytes; the limit is 1024"),
+            "{}",
+            err.message
+        );
+
+        // The link-request route sends no `limit`, and keeps its own prose.
+        let err = render("reason_too_long", &json!({}), Some(400), None);
+        assert!(
+            err.message.contains("person who has to read it"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.exit_code, EXIT_USAGE);
     }
 
     #[test]

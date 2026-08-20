@@ -11,6 +11,7 @@ thiserror.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
+protoc-bin-vendored.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

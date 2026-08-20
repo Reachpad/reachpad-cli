@@ -316,6 +316,58 @@ pub struct CreditBalance {
     pub updated_at_ms: u64,
 }
 
+/// One budget scope as the server reports it (creds milestone C5).
+///
+/// `cap_micros` and `remaining_micros` are `Option` for one reason: the
+/// account pool is counted and NOT capped, and a client that renders a
+/// missing number as 0 tells the user they are broke. I13's rule — limits are
+/// values read off the wire, never constants in a client — is why none of
+/// these have defaults here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetScope {
+    pub scope: String,
+    pub scope_id: String,
+    pub cap_micros: Option<u64>,
+    pub spent_micros: u64,
+    pub reserved_micros: u64,
+    pub remaining_micros: Option<u64>,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub period_end_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Budget {
+    /// The account pool. Absent only from a fleet that answered without one.
+    pub pool: Option<BudgetScope>,
+    pub connections: Vec<BudgetScope>,
+    /// Per-link caps, present only when a workspace was named.
+    pub links: Vec<BudgetScope>,
+    pub kill_switch_engaged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillSwitch {
+    pub engaged: bool,
+    pub was_engaged: bool,
+    pub links_cut: u64,
+    pub paused: Vec<String>,
+}
+
+fn budget_scope(row: &Value) -> BudgetScope {
+    BudgetScope {
+        scope: row["scope"].as_str().unwrap_or_default().to_owned(),
+        scope_id: row["scope_id"].as_str().unwrap_or_default().to_owned(),
+        cap_micros: row["cap_micros"].as_u64(),
+        spent_micros: row["spent_micros"].as_u64().unwrap_or(0),
+        reserved_micros: row["reserved_micros"].as_u64().unwrap_or(0),
+        remaining_micros: row["remaining_micros"].as_u64(),
+        tokens_in: row["tokens_in"].as_u64().unwrap_or(0),
+        tokens_out: row["tokens_out"].as_u64().unwrap_or(0),
+        period_end_ms: row["period_end_ms"].as_u64().unwrap_or(0),
+    }
+}
+
 /// Percent-encode one PATH segment. Same alphabet as [`encode_query`], which
 /// is what makes it segment-safe: `/` is escaped too, so an id that arrived
 /// from a file, an environment variable or an agent's output cannot add a
@@ -414,6 +466,78 @@ pub struct Share {
     pub share_token_b64: String,
 }
 
+/// One port share (ADR-0103), as `/v1/workspaces/:id/port-shares` echoes it.
+///
+/// A different thing from [`Share`] above, which is a GRANT — an account's
+/// access to a workspace. This one is a port inside a guest, opened to a
+/// visitor with a link. The two share no field and no route; the names are
+/// kept apart on purpose (ADR-0103 §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortShare {
+    /// The uuid4 in the URL. It IS the capability — never logged, never in an
+    /// event summary.
+    pub token: String,
+    pub workspace: String,
+    pub port: u32,
+    pub created_at_ms: u64,
+    /// The link a visitor opens, **as the fleet composed it**. `None` when
+    /// this controld has no `REACHPAD_PREVIEW_ORIGIN` — this client does not
+    /// guess an origin, because a link that is nearly right is worse than no
+    /// link at all (I13: the value comes off the wire).
+    pub url: Option<String>,
+    /// When the fleet closed this share. `Some` only on the answer to a
+    /// `revoke` — the verb whose whole outcome is a timestamp, which a
+    /// scripted caller otherwise had no way to read back.
+    pub revoked_at_ms: Option<u64>,
+}
+
+/// The shape refusal a port-share call raises when the fleet answered without
+/// echoing the port (trap 41).
+///
+/// A constant rather than a formatted sentence because [`is_port_echo_missing`]
+/// compares against it exactly: the caller turns this one shape into the
+/// "older fleet" refusal, and every other shape failure stays what it is.
+pub const PORT_ECHO_MISSING: &str = "a port-share answer carried no port";
+
+/// Did this fleet answer a port-share call without saying which port it acted
+/// on?
+///
+/// ADR-0079 §4: a verb ships with its route and REFUSES against a fleet that
+/// predates it rather than degrading. A controld that has the route answers
+/// with `port`; anything else — a 200 from some other handler, a body shaped
+/// by an older build — is a fleet this verb cannot speak to, and printing a
+/// link nobody can open would be the failure mode trap 41 describes.
+#[must_use]
+pub fn is_port_echo_missing(err: &ApiError) -> bool {
+    matches!(err, ApiError::Shape(message) if message == PORT_ECHO_MISSING)
+}
+
+/// Read one `port_share` object off the wire.
+///
+/// `token` and `port` are both REQUIRED: without the token there is nothing to
+/// hand a visitor, and without the port there is nothing to say the answer is
+/// about the port that was asked for.
+fn port_share_of(value: &Value) -> Result<PortShare, ApiError> {
+    let port = value
+        .get("port")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ApiError::Shape(PORT_ECHO_MISSING.to_owned()))?;
+    Ok(PortShare {
+        token: str_at(value, &["token"])?,
+        workspace: value["workspace_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        port: u32::try_from(port).unwrap_or(u32::MAX),
+        created_at_ms: value["created_at_ms"].as_u64().unwrap_or(0),
+        url: value["url"].as_str().map(str::to_owned),
+        // Carried by the revoke answer only, and it sits BESIDE `port_share`
+        // in the envelope rather than inside it, so this reader never finds
+        // it — [`Client::revoke_port_share`] lifts it in.
+        revoked_at_ms: None,
+    })
+}
+
 /// Thin client of controld's public endpoints.
 ///
 /// The base URL is `https://<hub-dns>` in production (ADR-0040: hub terminates
@@ -451,6 +575,37 @@ impl Client {
         self.post_auth(path, body, None).await
     }
 
+    /// [`post_auth`](Self::post_auth) with an `Idempotency-Key`.
+    ///
+    /// Every edge mutation on `/v1` requires one and refuses without it
+    /// (`idempotency_key_required`), so the key is threaded from the caller
+    /// rather than defaulted here: the value has to be stable across the
+    /// retries of ONE logical request and different between two, and only the
+    /// command knows which it is making.
+    async fn post_idempotent(
+        &self,
+        path: &str,
+        body: Value,
+        bearer: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<Value, ApiError> {
+        let resp = http_min::post_json_keyed(
+            &self.controld,
+            path,
+            &body,
+            bearer,
+            idempotency_key,
+            &self.trust,
+        )
+        .await
+        .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
+        if (200..300).contains(&resp.status) {
+            Ok(resp.body)
+        } else {
+            Err(refusal(resp))
+        }
+    }
+
     async fn post_auth(
         &self,
         path: &str,
@@ -458,6 +613,19 @@ impl Client {
         bearer: Option<&str>,
     ) -> Result<Value, ApiError> {
         let resp = http_min::post_json_trust(&self.controld, path, &body, bearer, &self.trust)
+            .await
+            .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
+        if (200..300).contains(&resp.status) {
+            Ok(resp.body)
+        } else {
+            Err(refusal(resp))
+        }
+    }
+
+    /// A GET carrying a bearer credential — the shape every workspace-scoped
+    /// read uses, where there is no body to put a Biscuit in.
+    async fn get_auth(&self, path: &str, bearer: &str) -> Result<Value, ApiError> {
+        let resp = http_min::get_json_trust(&self.controld, path, Some(bearer), &self.trust)
             .await
             .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
         if (200..300).contains(&resp.status) {
@@ -1163,6 +1331,146 @@ impl Client {
         Ok(u64_at(&body, &["archived_at_ms"]).unwrap_or(0))
     }
 
+    /// GET /v1/budget — what is left (creds milestone C5, design §9).
+    ///
+    /// A READ: it takes no idempotency key, moves no counter and spends
+    /// nothing. Every number in the answer is the server's — I13's rule that
+    /// limits are values read off the wire and never constants in a client
+    /// applies to ceilings exactly as it does to entitlements.
+    pub async fn budget(
+        &self,
+        user_id: &str,
+        identity_token: &str,
+        workspace: Option<&str>,
+    ) -> Result<Budget, ApiError> {
+        let mut path = format!("/v1/budget?user_id={}", encode_query(user_id));
+        if let Some(ws) = workspace {
+            path.push_str(&format!("&workspace={}", encode_query(ws)));
+        }
+        let resp =
+            http_min::get_json_trust(&self.controld, &path, Some(identity_token), &self.trust)
+                .await
+                .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
+        if !(200..300).contains(&resp.status) {
+            return Err(refusal(resp));
+        }
+        let scopes = |key: &str| -> Vec<BudgetScope> {
+            resp.body[key]
+                .as_array()
+                .map(|rows| rows.iter().map(budget_scope).collect())
+                .unwrap_or_default()
+        };
+        Ok(Budget {
+            pool: resp
+                .body
+                .get("pool")
+                .filter(|v| !v.is_null())
+                .map(budget_scope),
+            connections: scopes("connections"),
+            links: scopes("links"),
+            kill_switch_engaged: resp.body["kill_switch_engaged"].as_bool().unwrap_or(false),
+        })
+    }
+
+    /// POST /v1/connections/:id/ceiling — the account-level per-connection
+    /// ceiling: ONE number account-wide that fan-out cannot multiply.
+    pub async fn set_connection_ceiling(
+        &self,
+        connection: &str,
+        user_id: &str,
+        identity_token: &str,
+        ceiling_micros: u64,
+        idempotency_key: &str,
+    ) -> Result<Vec<String>, ApiError> {
+        let body = self
+            .post_idempotent(
+                &format!("/v1/connections/{}/ceiling", encode_segment(connection)),
+                json!({
+                    "user_id": user_id,
+                    "identity_token": identity_token,
+                    "ceiling_micros": ceiling_micros,
+                }),
+                None,
+                idempotency_key,
+            )
+            .await?;
+        Ok(body["affected_workspaces"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// POST /v1/workspaces/:id/links/:link_id/budget — one link's cap.
+    ///
+    /// Returns the cap the server ECHOED, not the one that was asked for
+    /// (ADR-0079 §4: where a route echoes what it changed, the CLI checks the
+    /// echo). A fleet that accepted the call and ignored the number would
+    /// otherwise be indistinguishable from one that applied it.
+    pub async fn set_link_budget(
+        &self,
+        workspace: &str,
+        link: &str,
+        biscuit_b64: &str,
+        budget_micros: u64,
+        idempotency_key: &str,
+    ) -> Result<u64, ApiError> {
+        let body = self
+            .post_idempotent(
+                &format!(
+                    "/v1/workspaces/{}/links/{}/budget",
+                    encode_segment(workspace),
+                    encode_segment(link)
+                ),
+                json!({ "biscuit": biscuit_b64, "budget_micros": budget_micros }),
+                None,
+                idempotency_key,
+            )
+            .await?;
+        u64_at(&body, &["link", "budget_micros"])
+    }
+
+    /// POST /v1/kill-switch — the account-wide stop, and its release.
+    ///
+    /// Returns (engaged, links cut, workspaces paused). The counts are the
+    /// point: an owner pulling this needs evidence it worked, and "ok" is not
+    /// evidence.
+    pub async fn kill_switch(
+        &self,
+        user_id: &str,
+        identity_token: &str,
+        engage: bool,
+        reason: &str,
+    ) -> Result<KillSwitch, ApiError> {
+        let body = self
+            .post(
+                "/v1/kill-switch",
+                json!({
+                    "user_id": user_id,
+                    "identity_token": identity_token,
+                    "engage": engage,
+                    "reason": reason,
+                }),
+            )
+            .await?;
+        Ok(KillSwitch {
+            engaged: body["engaged"].as_bool().unwrap_or(false),
+            was_engaged: body["was_engaged"].as_bool().unwrap_or(false),
+            links_cut: body["links_cut"].as_u64().unwrap_or(0),
+            paused: body["paused"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
     /// POST /v1/grants — authorized by the presented Biscuit, not by who is
     /// asking (I6). Returns the server-minted share token.
     pub async fn grant(
@@ -1190,6 +1498,85 @@ impl Client {
             expires_at_ms: u64_at(&body, &["grant", "expires_at_ms"])?,
             share_token_b64: str_at(&body, &["share_token"])?,
         })
+    }
+
+    /// POST /v1/workspaces/:id/port-shares — open one in-guest TCP port
+    /// (ADR-0103). Owner-only.
+    ///
+    /// Idempotent by the ROW, not by a header: a second call for a port that
+    /// is already open answers `200` with the same token instead of `201` with
+    /// a second one, and this client cannot tell the two apart on purpose —
+    /// the answer is the live share either way, which is what the caller asked
+    /// for. (The sibling edge routes require an `Idempotency-Key`; this one
+    /// deliberately does not — ADR-0103 §4.)
+    pub async fn create_port_share(
+        &self,
+        workspace: &str,
+        auth: Auth<'_>,
+        port: u32,
+    ) -> Result<PortShare, ApiError> {
+        let (bearer, biscuit) = auth.split();
+        let body = self
+            .post_auth(
+                &format!("/v1/workspaces/{}/port-shares", encode_segment(workspace)),
+                json!({ "biscuit": biscuit.unwrap_or_default(), "port": port }),
+                bearer,
+            )
+            .await?;
+        port_share_of(at(&body, &["port_share"])?)
+    }
+
+    /// GET /v1/workspaces/:id/port-shares — the LIVE port shares, oldest
+    /// first. Owner-only: the listing hands back tokens, and a token is the
+    /// whole credential a visitor needs.
+    pub async fn list_port_shares(
+        &self,
+        workspace: &str,
+        auth: Auth<'_>,
+    ) -> Result<Vec<PortShare>, ApiError> {
+        let body = self
+            .get_auth(
+                &format!("/v1/workspaces/{}/port-shares", encode_segment(workspace)),
+                auth.bearer(),
+            )
+            .await?;
+        let rows = at(&body, &["port_shares"])?
+            .as_array()
+            .ok_or_else(|| ApiError::Shape("port_shares is not an array".to_owned()))?;
+        // Every row is parsed strictly, so ONE row without a port refuses the
+        // whole listing rather than being quietly dropped from it: a `ports
+        // list` that is missing an open port is how somebody concludes a port
+        // is closed when it is not.
+        rows.iter().map(port_share_of).collect()
+    }
+
+    /// POST /v1/workspaces/:id/port-shares/revoke — close one port.
+    ///
+    /// POST-revoke, never DELETE (there is no `DELETE` in that router). The
+    /// answer carries the cut row and no `url`: echoing a link back beside the
+    /// word "revoked" is how a person retries it.
+    pub async fn revoke_port_share(
+        &self,
+        workspace: &str,
+        auth: Auth<'_>,
+        port: u32,
+    ) -> Result<PortShare, ApiError> {
+        let (bearer, biscuit) = auth.split();
+        let body = self
+            .post_auth(
+                &format!(
+                    "/v1/workspaces/{}/port-shares/revoke",
+                    encode_segment(workspace)
+                ),
+                json!({ "biscuit": biscuit.unwrap_or_default(), "port": port }),
+                bearer,
+            )
+            .await?;
+        let mut share = port_share_of(at(&body, &["port_share"])?)?;
+        // The server's own stamp, not this client's clock (I12/I13): "when did
+        // the link stop working" is the one fact this verb exists to produce.
+        share.revoked_at_ms = body.get("revoked_at_ms").and_then(Value::as_u64);
+        Ok(share)
     }
 }
 
@@ -1292,6 +1679,50 @@ mod tests {
             "..%2F..%2Fadmin%2Fv1%2Fnodes"
         );
         assert_eq!(encode_segment("ws-1?biscuit=x"), "ws-1%3Fbiscuit%3Dx");
+    }
+
+    /// Trap 41 / ADR-0079 §4: a verb refuses against a fleet that predates its
+    /// route rather than degrading. The tell is the ECHO — an answer that does
+    /// not say which port it acted on is not an answer this verb can render,
+    /// and a link printed off it would be a link nobody can open.
+    #[test]
+    fn an_answer_that_does_not_echo_the_port_is_not_read_as_a_share() {
+        let full = json!({
+            "token": "11111111-2222-4333-8444-555555555555",
+            "workspace_id": "ws-1",
+            "port": 3000,
+            "created_at_ms": 7,
+            "url": "https://app.reachpad.dev/11111111-2222-4333-8444-555555555555",
+        });
+        let share = port_share_of(&full).expect("a complete answer parses");
+        assert_eq!(share.port, 3000);
+        assert_eq!(share.workspace, "ws-1");
+        assert_eq!(
+            share.url.as_deref(),
+            Some("https://app.reachpad.dev/11111111-2222-4333-8444-555555555555")
+        );
+
+        // No `url`: the fleet composed none, and this client does not invent
+        // one. Absent is absent (the same posture `status` takes on a disk
+        // measurement an older fleet does not report).
+        let mut no_url = full.clone();
+        no_url.as_object_mut().unwrap().remove("url");
+        assert!(port_share_of(&no_url).unwrap().url.is_none());
+
+        // No `port`: the one shape that means "this fleet is older than this
+        // verb", and the only one `is_port_echo_missing` answers to.
+        let mut no_port = full.clone();
+        no_port.as_object_mut().unwrap().remove("port");
+        let err = port_share_of(&no_port).expect_err("a missing echo is refused");
+        assert!(is_port_echo_missing(&err), "{err}");
+
+        // The negative control: a DIFFERENT shape failure must not be read as
+        // an older fleet, or every malformed body would print the wrong
+        // remedy.
+        let mut no_token = full;
+        no_token.as_object_mut().unwrap().remove("token");
+        let err = port_share_of(&no_token).expect_err("a share with no token is refused");
+        assert!(!is_port_echo_missing(&err), "{err}");
     }
 
     #[test]

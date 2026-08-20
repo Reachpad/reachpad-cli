@@ -131,6 +131,10 @@ pub enum ChannelKind {
     Events,
     Fs,
     Presence,
+    /// `tcp/<port>` — one in-guest TCP connection to `127.0.0.1:<port>`.
+    /// The index is the port, so a single kind covers every port; each
+    /// connection gets its own channel (see [`ChannelKind::well_known_id`]).
+    Tcp(u32),
 }
 
 impl ChannelKind {
@@ -142,6 +146,7 @@ impl ChannelKind {
             "events" => Some(ChannelKind::Events),
             "fs" => Some(ChannelKind::Fs),
             "presence" => Some(ChannelKind::Presence),
+            "tcp" => Some(ChannelKind::Tcp(index)),
             _ => None,
         }
     }
@@ -154,6 +159,7 @@ impl ChannelKind {
             ChannelKind::Events => ("events", 0),
             ChannelKind::Fs => ("fs", 0),
             ChannelKind::Presence => ("presence", 0),
+            ChannelKind::Tcp(port) => ("tcp", port),
         }
     }
 
@@ -166,6 +172,14 @@ impl ChannelKind {
             ChannelKind::Fs => Some(channel::FS),
             ChannelKind::Presence => Some(channel::PRESENCE),
             ChannelKind::Pty(n) => u16::try_from(u32::from(channel::PTY_BASE).checked_add(n)?).ok(),
+            // Deliberately none: a tcp channel is one *connection*, not one
+            // port, so N concurrent connections to the same port must each
+            // get their own id. `None` sends every open through
+            // `alloc_dynamic()` (ids >= DYNAMIC_BASE). Carving a well-known
+            // `TCP_BASE + port` range out of `crate::framing::channel` would
+            // both collide with `PTY_BASE` and cap the feature at one
+            // connection per port.
+            ChannelKind::Tcp(_) => None,
         }
     }
 }
@@ -458,6 +472,53 @@ mod tests {
             m.open(ChannelKind::Pty(u32::MAX)).unwrap_err(),
             ChannelError::PtyIndexOverflow(u32::MAX)
         );
+    }
+
+    #[test]
+    fn tcp_round_trips_wire() {
+        assert_eq!(
+            ChannelKind::from_wire("tcp", 3000),
+            Some(ChannelKind::Tcp(3000))
+        );
+        assert_eq!(ChannelKind::Tcp(3000).to_wire(), ("tcp", 3000));
+    }
+
+    #[test]
+    fn tcp_takes_a_dynamic_id_per_connection() {
+        let mut m = ChannelMap::new();
+        // Two channels for the SAME port: one preview page opening two
+        // parallel HTTP connections must not collide.
+        let (first, msg) = m.open(ChannelKind::Tcp(3000)).unwrap();
+        assert_eq!(first, DYNAMIC_BASE);
+        assert_eq!((msg.kind.as_str(), msg.index), ("tcp", 3000));
+        let (second, _) = m.open(ChannelKind::Tcp(3000)).unwrap();
+        assert_eq!(second, DYNAMIC_BASE + 1);
+        assert_eq!(m.kind(second), Some(ChannelKind::Tcp(3000)));
+    }
+
+    #[test]
+    fn tcp_open_from_an_old_peer_is_skipped_not_fatal() {
+        // A peer that predates the `tcp` kind parses it as unknown. Emulate
+        // that side by construction: `from_wire` is the whole vocabulary, so
+        // an old peer's answer is exactly the Skip path below.
+        let mut m = ChannelMap::new();
+        let open = wire::ChannelOpen {
+            channel: u32::from(DYNAMIC_BASE),
+            kind: "tcp".into(),
+            index: 3000,
+        };
+        // New peer: accepted.
+        assert_eq!(
+            m.handle_open(&open).unwrap(),
+            OpenOutcome::Accepted(DYNAMIC_BASE)
+        );
+        // Old peer: the kind is not in its vocabulary, so the open is
+        // skipped and acked with accepted=false and an EMPTY error, which is
+        // how a caller tells "not supported" from "failed".
+        let ack = ChannelMap::ack_for(&open, &Ok(OpenOutcome::Skip));
+        assert_eq!(ack.channel, u32::from(DYNAMIC_BASE));
+        assert!(!ack.accepted);
+        assert!(ack.error.is_empty());
     }
 
     #[test]

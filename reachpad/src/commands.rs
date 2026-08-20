@@ -17,7 +17,8 @@ use serde_json::{json, Value};
 
 use crate::api::{self, Auth, Client, ExecItem, ExecSpec};
 use crate::cli::{
-    self, AuthCommand, Cli, Command, KeysCommand, StateFilter, TokenCommand, WaitState, WsCommand,
+    self, AuthCommand, BudgetCommand, Cli, Command, KeysCommand, KillSwitchCommand, PortsCommand,
+    StateFilter, TokenCommand, WaitState, WsCommand,
 };
 use crate::conf;
 use crate::errors::{self, CliError, EXIT_OK, EXIT_USAGE};
@@ -393,6 +394,15 @@ fn command_name(command: &Command) -> &'static str {
         Command::Keys(KeysCommand::Mint { .. }) => "keys.mint",
         Command::Keys(KeysCommand::List) => "keys.list",
         Command::Keys(KeysCommand::Revoke { .. }) => "keys.revoke",
+        Command::Budget(BudgetCommand::Show { .. }) => "budget.show",
+        Command::Budget(BudgetCommand::Ceiling { .. }) => "budget.ceiling",
+        Command::Budget(BudgetCommand::Cap { .. }) => "budget.cap",
+        Command::KillSwitch(KillSwitchCommand::Engage { .. }) => "kill-switch.engage",
+        Command::KillSwitch(KillSwitchCommand::Release) => "kill-switch.release",
+        Command::KillSwitch(KillSwitchCommand::Status) => "kill-switch.status",
+        Command::Ports(PortsCommand::Expose { .. }) => "ports.expose",
+        Command::Ports(PortsCommand::List { .. }) => "ports.list",
+        Command::Ports(PortsCommand::Revoke { .. }) => "ports.revoke",
         Command::Attach { .. } => "workspace.attach",
         Command::Tail { .. } => "workspace.events",
         Command::Credits => "account.credits",
@@ -452,6 +462,9 @@ async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
         Command::Events { workspace, since } => events(ctx, workspace, since).await,
         Command::Auth(auth) => run_auth(ctx, auth).await,
         Command::Keys(keys) => run_keys(ctx, keys).await,
+        Command::Budget(budget) => run_budget(ctx, budget).await,
+        Command::KillSwitch(switch) => run_kill_switch(ctx, switch).await,
+        Command::Ports(ports) => run_ports(ctx, ports).await,
         Command::Doctor => crate::doctor::run(ctx).await,
         Command::Update => crate::self_update::run(ctx),
         Command::Completions { shell } => {
@@ -1713,6 +1726,278 @@ async fn logout(ctx: &Ctx, all: bool) -> Result<i32, CliError> {
 }
 
 // ---------------------------------------------------------------------------
+// budget + kill-switch (creds milestone C5, design §9)
+// ---------------------------------------------------------------------------
+
+/// An `Idempotency-Key` for ONE invocation of a mutating command.
+///
+/// Unique per invocation rather than random: this CLI has no RNG dependency,
+/// and it does not need one — the key must be stable across the retries of
+/// one logical request (this client makes none inside an invocation) and
+/// different between two. Process id plus nanoseconds gives that, and the
+/// server's body hash turns any conceivable collision into a refusal rather
+/// than into somebody else's answer.
+fn idempotency_key(verb: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("cli-{verb}-{}-{nanos}", std::process::id())
+}
+
+/// Micros as dollars, exactly: `12_500_000` renders `$12.50`. No floating
+/// point on the way out either.
+fn usd(micros: u64) -> String {
+    format!("${}.{:06}", micros / 1_000_000, micros % 1_000_000)
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+fn scope_line(label: &str, s: &api::BudgetScope) -> String {
+    match (s.cap_micros, s.remaining_micros) {
+        (Some(cap), Some(left)) => format!(
+            "  {label} {}: {} left of {} ({} spent, {} held)",
+            s.scope_id,
+            usd(left),
+            usd(cap),
+            usd(s.spent_micros),
+            usd(s.reserved_micros),
+        ),
+        _ => format!(
+            "  {label} {}: {} spent, no ceiling",
+            s.scope_id,
+            usd(s.spent_micros)
+        ),
+    }
+}
+
+fn scope_json(s: &api::BudgetScope) -> Value {
+    json!({
+        "scope": s.scope,
+        "id": s.scope_id,
+        "cap_micros": s.cap_micros,
+        "spent_micros": s.spent_micros,
+        "reserved_micros": s.reserved_micros,
+        "remaining_micros": s.remaining_micros,
+        "tokens_in": s.tokens_in,
+        "tokens_out": s.tokens_out,
+        "period_end": render::time(s.period_end_ms),
+    })
+}
+
+async fn run_budget(ctx: &Ctx, cmd: BudgetCommand) -> Result<i32, CliError> {
+    match cmd {
+        BudgetCommand::Show { workspace } => {
+            let identity = ctx.identity().await?;
+            let workspace = workspace.or_else(|| ctx.workspaces.first().cloned());
+            let budget = ctx
+                .client()
+                .budget(
+                    &identity.user_id,
+                    &identity.identity_token,
+                    workspace.as_deref(),
+                )
+                .await
+                .map_err(|e| budget_error(&e, workspace.as_deref()))?;
+            let mut lines = Vec::new();
+            if budget.kill_switch_engaged {
+                lines.push(
+                    "KILL SWITCH ENGAGED: nothing on this account spends until it is \
+                     released (`reachpad kill-switch release`)."
+                        .to_owned(),
+                );
+            }
+            match &budget.pool {
+                Some(pool) => lines.push(format!(
+                    "pool: {} spent this period",
+                    usd(pool.spent_micros)
+                )),
+                None => lines.push("pool: not reported".to_owned()),
+            }
+            for c in &budget.connections {
+                lines.push(scope_line("connection", c));
+            }
+            for l in &budget.links {
+                lines.push(scope_line("link", l));
+            }
+            if budget.connections.is_empty() && budget.links.is_empty() {
+                lines.push("  no connections yet.".to_owned());
+            }
+            ctx.emit(
+                json!({
+                    "pool": budget.pool.as_ref().map(scope_json),
+                    "connections": budget.connections.iter().map(scope_json).collect::<Vec<_>>(),
+                    "links": budget.links.iter().map(scope_json).collect::<Vec<_>>(),
+                    "kill_switch_engaged": budget.kill_switch_engaged,
+                }),
+                &lines,
+            );
+            Ok(EXIT_OK)
+        }
+        BudgetCommand::Ceiling { connection, amount } => {
+            let identity = ctx.identity().await?;
+            let affected = ctx
+                .client()
+                .set_connection_ceiling(
+                    &connection,
+                    &identity.user_id,
+                    &identity.identity_token,
+                    amount,
+                    &idempotency_key("ceiling"),
+                )
+                .await
+                .map_err(|e| budget_error(&e, None))?;
+            ctx.emit(
+                json!({
+                    "connection": connection,
+                    "ceiling_micros": amount,
+                    "affected_workspaces": affected,
+                }),
+                &[
+                    format!(
+                        "{connection}: ceiling set to {} per 30-day period.",
+                        usd(amount)
+                    ),
+                    format!(
+                        "  {} workspace(s) hold a live link to it and will re-read it.",
+                        affected.len()
+                    ),
+                ],
+            );
+            Ok(EXIT_OK)
+        }
+        BudgetCommand::Cap {
+            workspace,
+            link,
+            amount,
+        } => {
+            let workspace = ctx.workspace(workspace)?;
+            let biscuit = ctx.authority(&workspace).await?;
+            let echoed = ctx
+                .client()
+                .set_link_budget(
+                    &workspace,
+                    &link,
+                    match biscuit.auth() {
+                        Auth::Biscuit(b) => b,
+                        // The route takes the workspace's own capability in
+                        // the body; an API key authenticates by header and
+                        // this route has no header path, so say so rather
+                        // than sending an empty capability and reading
+                        // `not_owner` as if it were about the workspace.
+                        Auth::ApiKey(_) => {
+                            return Err(CliError::usage(
+                                "setting a link's cap needs your own credential, not an API \
+                                 key. Run `reachpad auth login` on this machine.",
+                            ))
+                        }
+                    },
+                    amount,
+                    &idempotency_key("cap"),
+                )
+                .await
+                .map_err(|e| budget_error(&e, Some(&workspace)))?;
+            // ADR-0079 §4: where a route echoes what it changed, the CLI
+            // CHECKS the echo. A fleet that accepted the call and ignored the
+            // number would otherwise look like a success.
+            if echoed != amount {
+                return Err(CliError::from_code("cap_not_applied", Some(&workspace)));
+            }
+            ctx.emit(
+                json!({ "workspace": workspace, "link": link, "budget_micros": amount }),
+                &[format!(
+                    "{link}: cap set to {} per 30-day period.",
+                    usd(amount)
+                )],
+            );
+            Ok(EXIT_OK)
+        }
+    }
+}
+
+/// Trap 41's posture, applied to every C5 verb: against a fleet that predates
+/// these routes, REFUSE and name the redeploy. A `budget` that printed zeroes
+/// against an older controld would be a client inventing a number, and a
+/// `kill-switch` that answered `ok` against one would be a safety feature
+/// reporting success while nothing stopped.
+fn budget_error(err: &api::ApiError, workspace: Option<&str>) -> CliError {
+    if api::is_route_absent(err) {
+        return CliError::from_code("fleet_predates_budgets", workspace);
+    }
+    CliError::from_api(err, workspace)
+}
+
+async fn run_kill_switch(ctx: &Ctx, cmd: KillSwitchCommand) -> Result<i32, CliError> {
+    let identity = ctx.identity().await?;
+    let client = ctx.client();
+    match cmd {
+        KillSwitchCommand::Status => {
+            let budget = client
+                .budget(&identity.user_id, &identity.identity_token, None)
+                .await
+                .map_err(|e| budget_error(&e, None))?;
+            ctx.emit(
+                json!({ "engaged": budget.kill_switch_engaged }),
+                &[if budget.kill_switch_engaged {
+                    "ENGAGED: nothing on this account spends or starts.".to_owned()
+                } else {
+                    "not engaged.".to_owned()
+                }],
+            );
+            Ok(EXIT_OK)
+        }
+        KillSwitchCommand::Engage { reason } => {
+            let out = client
+                .kill_switch(
+                    &identity.user_id,
+                    &identity.identity_token,
+                    true,
+                    reason.as_deref().unwrap_or_default(),
+                )
+                .await
+                .map_err(|e| budget_error(&e, None))?;
+            ctx.emit(
+                json!({
+                    "engaged": out.engaged,
+                    "links_cut": out.links_cut,
+                    "paused": out.paused,
+                }),
+                &[
+                    format!(
+                        "KILL SWITCH ENGAGED: {} connection link(s) cut, {} workspace(s) \
+                         pausing.",
+                        out.links_cut,
+                        out.paused.len()
+                    ),
+                    "  Releasing it allows spend again; it does not re-link what it cut."
+                        .to_owned(),
+                ],
+            );
+            Ok(EXIT_OK)
+        }
+        KillSwitchCommand::Release => {
+            let out = client
+                .kill_switch(&identity.user_id, &identity.identity_token, false, "")
+                .await
+                .map_err(|e| budget_error(&e, None))?;
+            ctx.emit(
+                json!({ "engaged": false, "was_engaged": out.was_engaged }),
+                &[
+                    if out.was_engaged {
+                        "Kill switch released: this account can spend again.".to_owned()
+                    } else {
+                        "The kill switch was not engaged.".to_owned()
+                    },
+                    "  Connections it cut stay cut — re-link what you want back.".to_owned(),
+                ],
+            );
+            Ok(EXIT_OK)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // keys
 // ---------------------------------------------------------------------------
 
@@ -1823,6 +2108,99 @@ async fn run_keys(ctx: &Ctx, cmd: KeysCommand) -> Result<i32, CliError> {
                 &[format!(
                     "{id} is revoked; commands presenting it are refused."
                 )],
+            );
+            Ok(EXIT_OK)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ports — a port inside the guest, opened to the web (ADR-0103)
+// ---------------------------------------------------------------------------
+
+/// The refusal a port-share call renders.
+///
+/// Two fleet-age shapes collapse into one sentence: a fleet with no such route
+/// at all (a bare 404, [`api::is_route_absent`]) and a fleet that answered
+/// without echoing the port it acted on ([`api::is_port_echo_missing`], trap
+/// 41). ADR-0079 §4 makes that a refusal rather than a degraded success —
+/// there is no half of this verb worth printing, because what it prints is a
+/// link somebody is about to send to another person.
+fn port_share_refusal(err: &api::ApiError, workspace: &str) -> CliError {
+    if api::is_route_absent(err) || api::is_port_echo_missing(err) {
+        return CliError::from_code("fleet_predates_port_shares", Some(workspace));
+    }
+    CliError::from_api(err, Some(workspace))
+}
+
+async fn run_ports(ctx: &Ctx, cmd: PortsCommand) -> Result<i32, CliError> {
+    match cmd {
+        PortsCommand::Expose { port, workspace } => {
+            let workspace = ctx.workspace(workspace)?;
+            let held = ctx.authority(&workspace).await?;
+            let share = ctx
+                .client()
+                .create_port_share(&workspace, held.auth(), port)
+                .await
+                .map_err(|e| port_share_refusal(&e, &workspace))?;
+            // The link is the FIRST line and it is alone on it, so
+            // `reachpad ports expose 3000 | head -1` is exactly the thing a
+            // person pastes into a message — the same property `keys mint`
+            // gives its secret on the last line (trap 36).
+            let mut human = vec![render::port_share_target(&share)];
+            if let Some(said) = render::port_share_no_origin(&share) {
+                human.push(said);
+            }
+            human.push(format!(
+                "  anyone with this link who signs in to Reachpad reaches port {} in {workspace}",
+                share.port
+            ));
+            human.push(format!(
+                "  close it with `reachpad ports revoke {} {workspace}`",
+                share.port
+            ));
+            ctx.emit(render::port_share_json(&share), &human);
+            Ok(EXIT_OK)
+        }
+        PortsCommand::List { workspace } => {
+            let workspace = ctx.workspace(workspace)?;
+            let held = ctx.authority(&workspace).await?;
+            let shares = ctx
+                .client()
+                .list_port_shares(&workspace, held.auth())
+                .await
+                .map_err(|e| port_share_refusal(&e, &workspace))?;
+            let now = now_ms();
+            let data: Vec<Value> = shares.iter().map(render::port_share_json).collect();
+            let mut human: Vec<String> = shares
+                .iter()
+                .map(|s| render::port_share_line(s, now))
+                .collect();
+            if human.is_empty() {
+                human.push(format!("no ports are open in {workspace}"));
+            }
+            ctx.emit(json!({ "port_shares": data }), &human);
+            Ok(EXIT_OK)
+        }
+        PortsCommand::Revoke { port, workspace } => {
+            let workspace = ctx.workspace(workspace)?;
+            let held = ctx.authority(&workspace).await?;
+            let share = ctx
+                .client()
+                .revoke_port_share(&workspace, held.auth(), port)
+                .await
+                .map_err(|e| port_share_refusal(&e, &workspace))?;
+            ctx.emit(
+                render::port_share_json(&share),
+                &[
+                    format!("port {} is closed in {workspace}.", share.port),
+                    // Said here because it is the one thing about this feature
+                    // a person can get wrong twice: the old link is dead for
+                    // good, and re-opening the port hands out a different one.
+                    "  the link that reached it stops working at the next request; re-opening \
+                     this port mints a NEW link."
+                        .to_owned(),
+                ],
             );
             Ok(EXIT_OK)
         }
