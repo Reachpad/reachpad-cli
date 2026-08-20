@@ -476,8 +476,19 @@ async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
             // The script goes to stdout even under `-q`: redirecting it into a
             // file is the whole use, and `--json` has nothing to say about a
             // shell script.
-            let mut stdout = std::io::stdout();
-            clap_complete::generate(generator, &mut Cli::command(), "reachpad", &mut stdout);
+            //
+            // Generated into a buffer first: clap_complete panics on a write
+            // error, and `reachpad completions zsh | head` closes the pipe
+            // early. A closed pipe on this path is the reader saying "enough",
+            // not a failure.
+            let mut script = Vec::new();
+            clap_complete::generate(generator, &mut Cli::command(), "reachpad", &mut script);
+            use std::io::Write as _;
+            match std::io::stdout().write_all(&script) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(e) => return Err(CliError::usage(format!("cannot write completions: {e}"))),
+            }
             Ok(EXIT_OK)
         }
         Command::Ws(ws) => run_ws(ctx, ws).await,
