@@ -39,9 +39,16 @@ pub struct Cli {
     #[arg(long, global = true, env = "REACHPAD_ENDPOINT")]
     pub endpoint: Option<String>,
 
-    /// An API key (`rpak1.…`) instead of your saved credential. Takes `-`
-    /// (stdin), `@<path>` or `env:<VAR>` — never the secret itself, because
-    /// argv is readable by every other process in a workspace.
+    /// An API key (`rpak1.…`) instead of your saved credential, for the verbs
+    /// that act on ONE workspace: `status`, `run`, `pause`, `fork`, `archive`,
+    /// `events`, `ports`.
+    ///
+    /// Account-wide verbs — `list`, `budget`, `keys`, `auth` — need your own
+    /// credential. They REFUSE a key rather than quietly falling back to
+    /// whatever `auth login` left on disk, which is what they used to do.
+    ///
+    /// Takes `-` (stdin), `@<path>` or `env:<VAR>` — never the secret itself,
+    /// because argv is readable by every other process in a workspace.
     #[arg(
         long,
         global = true,
@@ -207,6 +214,12 @@ pub enum Command {
         /// The same label, named. `create <name>` is the shorter spelling.
         #[arg(long = "name", value_name = "NAME")]
         name_flag: Option<String>,
+        /// A GitHub repository this workspace works in: `org/name`, or the
+        /// URL you would clone. Run `reachpad connect github` first — a
+        /// repository Reachpad is not installed on is refused here, before
+        /// the workspace exists, rather than at the first `git push`.
+        #[arg(long, value_name = "ORG/NAME")]
+        repo: Option<String>,
     },
     /// Your workspaces and what each one is doing.
     List {
@@ -252,7 +265,44 @@ pub enum Command {
         #[arg(last = true)]
         argv: Vec<String>,
     },
-    /// Save disk and memory, then stop the meter.
+    /// Open an interactive terminal in a workspace (ADR-0033).
+    ///
+    /// Ctrl-C reaches the workspace; Ctrl-] detaches and leaves everything
+    /// running.
+    ///
+    /// NOT a v0.1.0 spelling, and it is listed here rather than hidden beside
+    /// them because the manual leads with it: `/docs/quickstart`,
+    /// `/docs/terminal` and five other pages tell a reader to run it, and a
+    /// `hide = true` keeps a verb out of `--help` AND out of every generated
+    /// completion — which the docs promise are built from this command tree.
+    Attach {
+        /// Workspace id (or `-w` / REACHPAD_WORKSPACE).
+        workspace: Option<String>,
+        /// Which existing terminal to attach to.
+        #[arg(long, default_value_t = 0, conflicts_with_all = ["new", "list"])]
+        pty: u32,
+        /// Open a NEW terminal in the workspace and attach to it (ADR-0063).
+        #[arg(long, conflicts_with = "list")]
+        new: bool,
+        /// Print the roster of live PTYs and exit.
+        #[arg(long)]
+        list: bool,
+        /// Skip the controld attach call and go straight to hub.
+        #[arg(long)]
+        no_place: bool,
+        /// Non-interactive only: keep printing output this long after stdin
+        /// EOF before detaching.
+        #[arg(long, default_value_t = 2_000)]
+        linger_ms: u64,
+        /// Never put the terminal in raw mode (scripted runs, tests).
+        #[arg(long)]
+        no_raw: bool,
+        /// Wait up to this long for the workspace's node to join the session
+        /// before sending the first keystroke (0 disables the wait).
+        #[arg(long, default_value_t = 30_000)]
+        wait_for_node_ms: u64,
+    },
+    /// Save disk, then stop the meter.
     Pause {
         /// Workspace id (or `-w` / REACHPAD_WORKSPACE).
         workspace: Option<String>,
@@ -308,6 +358,14 @@ pub enum Command {
     /// to this workspace" — see the note where that verb used to be.
     #[command(subcommand, alias = "port")]
     Ports(PortsCommand),
+    /// Outside accounts your workspaces reach: connect one, or see what is
+    /// already connected.
+    ///
+    /// A namespaced noun for the same reason `ports` is one (ADR-0079 §1): it
+    /// acts on the ACCOUNT, not on a workspace, and every bare verb in this
+    /// CLI acts on a workspace.
+    #[command(subcommand)]
+    Connect(ConnectCommand),
 
     // ---- this installation, not the account ------------------------------
     /// Check this installation: binary, PATH, saved login, endpoints, reach.
@@ -333,33 +391,6 @@ pub enum Command {
     /// v0.1.0: the workspace verbs before they were flattened.
     #[command(subcommand, hide = true)]
     Ws(WsCommand),
-    /// v0.1.0: an interactive terminal in a workspace (ADR-0033).
-    #[command(hide = true)]
-    Attach {
-        workspace: Option<String>,
-        #[arg(long, default_value_t = 0, conflicts_with_all = ["new", "list"])]
-        pty: u32,
-        /// Open a NEW terminal in the workspace and attach to it (ADR-0063).
-        #[arg(long, conflicts_with = "list")]
-        new: bool,
-        /// Print the roster of live PTYs and exit.
-        #[arg(long)]
-        list: bool,
-        /// Skip the controld attach call and go straight to hub.
-        #[arg(long)]
-        no_place: bool,
-        /// Non-interactive only: keep printing output this long after stdin
-        /// EOF before detaching.
-        #[arg(long, default_value_t = 2_000)]
-        linger_ms: u64,
-        /// Never put the terminal in raw mode (scripted runs, tests).
-        #[arg(long)]
-        no_raw: bool,
-        /// Wait up to this long for the workspace's node to join the session
-        /// before sending the first keystroke (0 disables the wait).
-        #[arg(long, default_value_t = 30_000)]
-        wait_for_node_ms: u64,
-    },
     /// v0.1.0: the event tail, before it was `events`.
     #[command(hide = true)]
     Tail { workspace: Option<String> },
@@ -556,6 +587,21 @@ pub enum PortsCommand {
         /// Workspace id (or `-w` / REACHPAD_WORKSPACE).
         workspace: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConnectCommand {
+    /// Connect GitHub, so workspaces can clone and push your repositories.
+    ///
+    /// Already connected, this prints the GitHub accounts it covers and
+    /// changes nothing. Otherwise it prints the link that installs Reachpad's
+    /// GitHub App, opens it if it can, and waits for you to finish there.
+    ///
+    /// The App is installed once per GitHub account, so an organization is
+    /// added by running this again and picking it. No GitHub token ever
+    /// reaches a workspace: the fleet mints one narrowed to a single
+    /// repository at the moment git asks for it.
+    Github,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1147,18 +1193,68 @@ mod tests {
             vec!["reachpad", "create", "--name", "demo"],
         ] {
             match parse(&args).command {
-                Some(Command::Create { name, name_flag }) => {
+                Some(Command::Create {
+                    name,
+                    name_flag,
+                    repo,
+                }) => {
                     assert_eq!(name.or(name_flag).as_deref(), Some("demo"), "{args:?}");
+                    assert!(repo.is_none(), "{args:?}");
                 }
                 other => panic!("wrong parse: {other:?}"),
             }
         }
         // A workspace nobody named is fine; the id is the handle.
         match parse(&["reachpad", "create"]).command {
-            Some(Command::Create { name, name_flag }) => {
-                assert!(name.is_none() && name_flag.is_none());
+            Some(Command::Create {
+                name,
+                name_flag,
+                repo,
+            }) => {
+                assert!(name.is_none() && name_flag.is_none() && repo.is_none());
             }
             other => panic!("wrong parse: {other:?}"),
+        }
+    }
+
+    /// `connect` is a namespaced noun, like `ports` and unlike every bare
+    /// verb: it acts on the ACCOUNT, and ADR-0079 §1 reserves bare verbs for
+    /// the ones that act on a workspace.
+    #[test]
+    fn connect_github_is_a_namespaced_noun() {
+        assert!(matches!(
+            parse(&["reachpad", "connect", "github"]).command,
+            Some(Command::Connect(ConnectCommand::Github))
+        ));
+        // Not a bare verb: `reachpad github` is a usage error, not a second
+        // spelling of the same command.
+        assert!(Cli::try_parse_from(["reachpad", "github"]).is_err());
+    }
+
+    /// `create --repo` carries what the caller typed, verbatim. Both the
+    /// `org/name` and the URL spelling reach controld unchanged: it owns the
+    /// normalization, and a second normalizer here is a second answer to
+    /// "does `.git` count".
+    #[test]
+    fn create_takes_a_repo_in_either_spelling_and_passes_it_through() {
+        let Some(Command::Create { name, repo, .. }) =
+            parse(&["reachpad", "create", "demo", "--repo", "acme/api"]).command
+        else {
+            panic!("create --repo should parse");
+        };
+        assert_eq!(name.as_deref(), Some("demo"));
+        assert_eq!(repo.as_deref(), Some("acme/api"));
+
+        for url in [
+            "https://github.com/acme/api",
+            "https://github.com/acme/api.git",
+        ] {
+            let Some(Command::Create { repo, .. }) =
+                parse(&["reachpad", "create", "--repo", url]).command
+            else {
+                panic!("create --repo {url} should parse");
+            };
+            assert_eq!(repo.as_deref(), Some(url));
         }
     }
 
@@ -1194,6 +1290,45 @@ mod tests {
         // the assertions above are about `share` and not about a parser that
         // has stopped accepting hidden verbs altogether.
         assert!(Cli::try_parse_from(["reachpad", "credits"]).is_ok());
+    }
+
+    /// **A VERB THE MANUAL LEADS WITH IS IN `--help`.**
+    ///
+    /// `attach` shipped `hide = true`, parked with the v0.1.0 spellings while
+    /// ADR-0069 §1's grammar question was open — and seven documentation pages
+    /// went on telling readers to run `reachpad attach <id>`. A hidden verb is
+    /// in neither `--help` nor the generated completions, which §13.1 promises
+    /// come from this exact tree, so the binary and the manual disagreed about
+    /// whether the terminal verb exists.
+    ///
+    /// The catalog is asserted rather than the help text, because the catalog
+    /// is what an agent plans against (§13.1) and `tail` beside it is the
+    /// control: this test is about `attach`, not about a parser that stopped
+    /// hiding anything.
+    #[test]
+    fn attach_is_a_listed_verb_and_the_retired_spellings_are_still_hidden() {
+        let catalog = catalog();
+        let verb = |name: &str| -> serde_json::Value {
+            catalog["subcommands"]
+                .as_array()
+                .expect("subcommands")
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap_or_else(|| panic!("no `{name}` in the catalog"))
+                .clone()
+        };
+        assert_eq!(
+            verb("attach")["hidden"],
+            serde_json::json!(false),
+            "the manual leads with `reachpad attach`, so it must be in --help \
+             and in the completions generated from this tree"
+        );
+        assert_eq!(
+            verb("tail")["hidden"],
+            serde_json::json!(true),
+            "the control: `tail` really is a retired v0.1.0 spelling and stays \
+             hidden, so the assertion above is about `attach`"
+        );
     }
 
     /// The port noun is namespaced, takes the port first, and is NOT spelled

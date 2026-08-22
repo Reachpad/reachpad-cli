@@ -64,6 +64,30 @@ pub fn ago(then_ms: u64, now_ms: u64) -> String {
     }
 }
 
+/// The idle-pause threshold, as a person would say it.
+///
+/// The raw seconds were printed unformatted, which is fine for `1800` and
+/// unreadable for the value an account with auto-pause switched off actually
+/// carries: `idle pause: 2147483647s`. There is no "never" sentinel in the
+/// policy — `0` means pause as soon as the idle conditions hold (ADR-0029),
+/// and "never" is expressed by a threshold no workspace will reach — so a
+/// year is the line above which the number stops being a duration anyone is
+/// waiting for and starts being a way of writing "off".
+///
+/// `--json` is untouched: it carries `idle_pause_seconds` as a number, and a
+/// machine reading it must not have to parse English.
+#[must_use]
+pub fn idle_window(seconds: u64) -> String {
+    const YEAR: u64 = 365 * 86_400;
+    match seconds {
+        0 => "as soon as it goes idle".to_owned(),
+        s if s >= YEAR => "never".to_owned(),
+        s if s % 3_600 == 0 => format!("{}h", s / 3_600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
 /// A label a person can read. An empty one is a workspace nobody named, and
 /// the id is the handle anyway.
 #[must_use]
@@ -79,7 +103,7 @@ pub fn head_json(head: Option<&Head>) -> Value {
     match head {
         None => Value::Null,
         Some(h) => {
-            let mut v = json!({ "snapshot": h.snapshot, "kind": h.kind });
+            let mut v = json!({ "snapshot": h.snapshot });
             if let Some(sealed) = h.sealed_at_ms {
                 v["sealed_at"] = time(sealed);
             }
@@ -233,11 +257,10 @@ pub fn status_lines(status: &Status, now_ms: u64) -> Vec<String> {
     }
     match &status.head {
         Some(h) => out.push(format!(
-            "  last save: {} ({}{})",
+            "  last save: {}{}",
             h.snapshot,
-            h.kind,
             h.sealed_at_ms
-                .map(|s| format!(", {}", ago(s, now_ms)))
+                .map(|s| format!(" ({})", ago(s, now_ms)))
                 .unwrap_or_default()
         )),
         None => out.push("  last save: none — it has never been saved".to_owned()),
@@ -246,8 +269,10 @@ pub fn status_lines(status: &Status, now_ms: u64) -> Vec<String> {
         out.push(format!("  forked from: {}", p.workspace));
     }
     out.push(format!(
-        "  saves: {}   forks: {}   idle pause: {}s",
-        status.snapshots, status.forks, status.idle_pause_seconds
+        "  saves: {}   forks: {}   idle pause: {}",
+        status.snapshots,
+        status.forks,
+        idle_window(status.idle_pause_seconds)
     ));
     if let Some(d) = &status.device {
         out.push(disk_line(d));
@@ -340,6 +365,22 @@ pub fn limits_line(limits: &Limits) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_idle_window_reads_as_a_duration_or_as_off() {
+        // The one that prompted this: an account with auto-pause switched off
+        // printed `idle pause: 2147483647s`, which is 68 years written as a
+        // number nobody can read.
+        assert_eq!(idle_window(i32::MAX as u64), "never");
+        assert_eq!(idle_window(1_800), "30m");
+        assert_eq!(idle_window(600), "10m");
+        assert_eq!(idle_window(3_600), "1h");
+        assert_eq!(idle_window(7_200), "2h");
+        assert_eq!(idle_window(90), "90s");
+        // 0 is not "never" — ADR-0029 makes it "pause immediately", and the
+        // two readings are opposites.
+        assert_eq!(idle_window(0), "as soon as it goes idle");
+    }
+
     use super::*;
 
     #[test]
@@ -376,7 +417,6 @@ mod tests {
             state: Some("running".into()),
             head: Some(Head {
                 snapshot: "snap-9d1".into(),
-                kind: "disk+mem".into(),
                 sealed_at_ms: None,
             }),
             parent: Some(Parent {

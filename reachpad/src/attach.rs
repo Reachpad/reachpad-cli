@@ -24,7 +24,7 @@
 //!
 //! - **Raw mode** via `stty`, not a termios crate: ADR-0031 set the precedent
 //!   (`pty.resize` shells out rather than reach for `unsafe`), the workspace
-//!   forbids `unsafe` outside blockd/UFFD (§12), and this keeps `reach` free
+//!   forbids `unsafe` outside blockd (§12), and this keeps `reach` free
 //!   of a libc dependency for something that runs twice per session.
 //! - **Ctrl-C passes through** — in raw mode the terminal generates no local
 //!   SIGINT, so `\x03` travels to the guest and interrupts the *remote*

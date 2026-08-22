@@ -165,8 +165,10 @@ pub fn summarize(type_code: u32, payload: &[u8]) -> String {
                 )
             })
             .unwrap_or_else(|_| fallback()),
+        // `kind` stays on the wire but KIND_DISK is its only value since
+        // ADR-0104, so rendering it would print the same constant every time.
         events::SNAPSHOT_SEALED => wire::SnapshotSealed::decode(payload)
-            .map(|s| format!("log_seq={} kind={}", s.log_seq, s.kind))
+            .map(|s| format!("log_seq={}", s.log_seq))
             .unwrap_or_else(|_| fallback()),
         events::GRANT_CHANGED => wire::GrantChanged::decode(payload)
             .map(|g| {

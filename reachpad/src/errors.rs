@@ -83,6 +83,23 @@ pub const TABLE: &[Row] = &[
         exit_code: EXIT_CREDENTIAL,
         retriable: Retriable::No,
     },
+    // ADR-0059 §4, said to the caller instead of silently worked around. The
+    // CLI used to reach for the SAVED credential whenever a verb could not
+    // use the key it was handed — so `keys mint --api-key <k>` minted under
+    // the operator credential and printed a key, and a key scoped to one
+    // workspace for a day produced one covering the whole account for ninety.
+    // Nothing was escalated server-side; the caller was simply not told which
+    // credential acted. Falling back to a broader one is the thing this
+    // refusal exists to prevent.
+    Row {
+        code: "api_key_not_accepted",
+        selector: None,
+        sentence: "This needs your own credential, not an API key: a key cannot mint or read keys, and cannot answer for the whole account. Drop `--api-key` / `REACHPAD_API_KEY`, or run `reachpad auth login`.",
+        numbers: None,
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
     Row {
         code: "no_identity_token",
         selector: None,
@@ -230,6 +247,22 @@ pub const TABLE: &[Row] = &[
         retriable: Retriable::No,
     },
     Row {
+        // The ports verbs, which is where this refusal is most likely to be
+        // read by somebody automating. `--role owner` is the honest advice
+        // and it is not the whole story: there is no role between
+        // `collaborator` and `owner`, so the key that may publish a port is
+        // also the key that may archive the workspace. Saying so here is not
+        // a fix — the roles are a frozen lattice (§7.4) and a narrower one
+        // needs an ADR — but it stops the remedy reading as free.
+        code: "not_owner_port_share",
+        selector: None,
+        sentence: "Opening or listing a port on {workspace} needs owner access: a link is a capability, and so is the list of them. Mint the key with `--role owner` — noting that an owner key can also archive this workspace, because there is no narrower role today.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
         // Decided by this client, not by a server: the state route withholds
         // the fencing token from a caller it would not let write, and pause
         // needs write access — NOT owner, which is what the `not_owner`
@@ -343,11 +376,14 @@ pub const TABLE: &[Row] = &[
         retriable: Retriable::No,
     },
     Row {
-        // `share --role`: the grant roles are narrower than a key's, because
-        // `owner` is not grantable (§7.4).
+        // The grant roles are narrower than a key's, because `owner` is not
+        // grantable (§7.4). No `--role` is named: ADR-0075 removed the CLI's
+        // `share` verb, so the only caller that meets this code is one posting
+        // to `/v1/workspaces/:id/shares` directly, and a flag it cannot type
+        // sends it looking for a command that is not there.
         code: "invalid_role",
         selector: None,
-        sentence: "That is not a role a share can have. Use `--role viewer` or `--role collaborator`.",
+        sentence: "That is not a role a share can have. A share is `viewer` or `collaborator`; `owner` cannot be granted.",
         numbers: None,
         next_command: None,
         exit_code: EXIT_USAGE,
@@ -522,9 +558,13 @@ pub const TABLE: &[Row] = &[
         // locker.
         code: "link_not_held",
         selector: None,
-        sentence: "That workspace cannot pass down a connection it does not have. `reachpad connections list {workspace}` shows what it can.",
+        // `reachpad connections list` was never a verb. The listing of what
+        // a workspace holds is `GET /v1/workspaces/:id/links`, and the CLI
+        // reaches it through `budget show --workspace`, which prints one line
+        // per live link.
+        sentence: "That workspace cannot pass down a connection it does not have. `reachpad budget show --workspace {workspace}` lists the links it holds.",
         numbers: None,
-        next_command: Some("reachpad connections list {workspace}"),
+        next_command: Some("reachpad budget show --workspace {workspace}"),
         exit_code: EXIT_WRONG_STATE,
         retriable: Retriable::No,
     },
@@ -726,6 +766,74 @@ pub const TABLE: &[Row] = &[
         exit_code: EXIT_WRONG_STATE,
         retriable: Retriable::No,
     },
+    // ---- GitHub coverage (INT-171) ---------------------------------------
+    //
+    // All three are EXIT_WRONG_STATE, not EXIT_CREDENTIAL: the credential this
+    // command presented is fine and re-signing in would change nothing. What
+    // is missing is an App installation on a GitHub account, which is a state
+    // somebody changes on GitHub — the same shape as `sharing_disabled`.
+    Row {
+        // `create --repo` passes what it was given through verbatim and lets
+        // controld normalize it, so this is the one github row that is a
+        // TYPO rather than a state: the account is fine, the connection is
+        // fine, and what arrived is not a repository.
+        code: "bad_repo",
+        selector: None,
+        sentence: "That is not a repository reachpad can read. Give it as `org/name`, or paste the GitHub URL.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The org and the link are the SERVER's to say (I13). A client that
+        // composed either URL would send people to whichever App its own
+        // constant named, which on a self-hosted fleet is the wrong one.
+        //
+        // THE LINK IS `connect_url`, NOT `install_url`, and the difference is
+        // the difference between a remedy and a loop: installing the App
+        // creates an installation and no GRANT, and coverage needs both — so
+        // somebody sent to GitHub's install screen installs, retries, and is
+        // refused again by the same predicate. The webapp's ceremony is the
+        // door that produces both. `install_url` is still in the body for
+        // consumers that want the raw screen; this row does not use it.
+        //
+        // The link lives in `numbers` rather than the sentence because `fill`
+        // drops that clause whole when a field is missing while an
+        // unrenderable SENTENCE degrades to nothing at all: against a fleet
+        // that predates `connect_url` this row still says what happened, and
+        // `next_command` below carries the remedy.
+        code: "github_not_installed",
+        selector: None,
+        sentence: "Reachpad is not installed on that GitHub account, so it cannot reach those repositories.",
+        numbers: Some("Connect it for {org} at {connect_url}, then retry."),
+        next_command: Some("reachpad connect github"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // The installation is still there; this account's join to it is not.
+        // Reconnecting is the whole remedy, and it does not touch GitHub.
+        code: "github_grant_revoked",
+        selector: None,
+        sentence: "Your GitHub connection was disconnected, so Reachpad can no longer reach those repositories.",
+        numbers: Some("Connect it again at {connect_url}."),
+        next_command: Some("reachpad connect github"),
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // Suspension is GitHub's own switch, so reconnecting here would not
+        // move it: the remedy is in GitHub's settings and this row says so
+        // rather than naming a reachpad command that cannot help.
+        code: "github_installation_suspended",
+        selector: None,
+        sentence: "Reachpad's GitHub install is suspended, so it cannot reach those repositories. Unsuspend it in GitHub's settings, then retry.",
+        numbers: Some("It is suspended on {org}."),
+        next_command: None,
+        exit_code: EXIT_WRONG_STATE,
+        retriable: Retriable::No,
+    },
     // ---- limits ----------------------------------------------------------
     Row {
         code: "entitlement_limit",
@@ -739,7 +847,10 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "entitlement_limit",
         selector: Some(("limit", "max_concurrent")),
-        sentence: "You are at your limit of workspaces running at once. Pause one, or wait — idle workspaces pause themselves.",
+        // "or wait" is gone with idle auto-pause (unlimited during beta): a
+        // workspace runs until its owner pauses it, so waiting frees nothing
+        // and the advice would strand the reader.
+        sentence: "You are at your limit of workspaces running at once. Pause one to free a slot.",
         numbers: Some("{active_leases} of {max_concurrent} are running."),
         next_command: Some("reachpad pause <id>"),
         exit_code: EXIT_LIMIT,
@@ -838,9 +949,13 @@ pub const TABLE: &[Row] = &[
         retriable: Retriable::No,
     },
     Row {
+        // Not /pricing. That page publishes the free preview and nothing else
+        // (the paid tier is deliberately withheld until its rate and purchase
+        // path settle), so sending an account with no allowance there is a
+        // dead end. /docs/billing names this address for the same reason.
         code: "no_entitlement",
         selector: None,
-        sentence: "This account has no workspace allowance. Set one up at https://reachpad.dev/pricing.",
+        sentence: "This account has no workspace allowance. Write to seiji@reachpad.dev to have one set up.",
         numbers: None,
         next_command: Some("reachpad auth whoami"),
         exit_code: EXIT_LIMIT,
@@ -851,7 +966,10 @@ pub const TABLE: &[Row] = &[
         // not a reading — so this row states no balance.
         code: "credits_exhausted",
         selector: None,
-        sentence: "Out of compute credits. Top up at https://reachpad.dev/pricing.",
+        // Top-ups are handled by hand during the preview; there is nothing to
+        // buy on /pricing. Same address as `no_entitlement` above and as
+        // /docs/billing, so the three cannot drift apart.
+        sentence: "Out of compute credits. Write to seiji@reachpad.dev to top up.",
         numbers: None,
         next_command: Some("reachpad auth whoami"),
         exit_code: EXIT_LIMIT,
@@ -927,6 +1045,30 @@ pub const TABLE: &[Row] = &[
         exit_code: EXIT_UNAVAILABLE,
         retriable: Retriable::No,
     },
+    // ---- the git use-point, which is a THIRD upstream behind that same
+    // front door (INT-171, on ADR-0083's terms). The pair below splits the
+    // same way the gateway's does, and for the same reason. What a person
+    // usually meets is `git` printing the status line itself — these
+    // sentences exist because the table is the fleet's one vocabulary for a
+    // code, not because `reachpad` is the common way to reach them.
+    Row {
+        code: "git_upstream_unavailable",
+        selector: None,
+        sentence: "reachpad's git use-point is not answering right now, so clones and pushes through this workspace will fail. Try again.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        code: "git_use_point_not_configured",
+        selector: None,
+        sentence: "This fleet does not carry github.com traffic for you — it has no git use-point deployed. Use your own GitHub credentials in this workspace instead.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
     Row {
         code: "internal",
         selector: None,
@@ -961,6 +1103,17 @@ pub const TABLE: &[Row] = &[
         code: "llm_request_too_large",
         selector: None,
         sentence: "That model request is too large for reachpad's front door — it carries about 32 MiB. Send less context.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_USAGE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // And the git use-point's, which is a thousand times the control
+        // plane's: a first push is the size of the work somebody did.
+        code: "git_request_too_large",
+        selector: None,
+        sentence: "That push is too large for reachpad's front door — it carries about 1 GiB. Push it in smaller pieces.",
         numbers: None,
         next_command: None,
         exit_code: EXIT_USAGE,
@@ -1024,6 +1177,20 @@ pub const TABLE: &[Row] = &[
         sentence: "{workspace} is still saving.",
         numbers: Some("It has been saving for {waited_s}s."),
         next_command: Some("reachpad status {workspace}"),
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::Yes,
+    },
+    Row {
+        // `connect github` waiting on a ceremony that happens somewhere else.
+        // Retriable, and it says so: installing the App on an organization can
+        // need an owner's approval, which arrives on nobody's schedule, and
+        // re-running the command picks it up whenever it lands. Nothing was
+        // lost by giving up — the browser half finishes without this process.
+        code: "github_connect_timeout",
+        selector: None,
+        sentence: "Gave up waiting for GitHub. Finish the install in your browser, then run `reachpad connect github` again — it prints what is connected.",
+        numbers: Some("It was still not connected after {waited_s}s."),
+        next_command: Some("reachpad connect github"),
         exit_code: EXIT_UNAVAILABLE,
         retriable: Retriable::Yes,
     },
@@ -1092,6 +1259,20 @@ pub const TABLE: &[Row] = &[
         code: "fleet_predates_port_shares",
         selector: None,
         sentence: "This fleet cannot open a port on {workspace}: it is older than this CLI. Ask for it to be redeployed, or run an older reachpad against it.",
+        numbers: None,
+        next_command: None,
+        exit_code: EXIT_UNAVAILABLE,
+        retriable: Retriable::No,
+    },
+    Row {
+        // ADR-0079 §4 again, for `reachpad connect github`: the verb ships
+        // with its route and refuses against a fleet that predates it. A fleet
+        // without the route answers a bare 404, which reads as "the fleet
+        // refused this: unknown" unless it is named here — and the remedy for
+        // it has nothing to do with GitHub.
+        code: "fleet_predates_github",
+        selector: None,
+        sentence: "This fleet cannot connect GitHub: it is older than this CLI. Ask for it to be redeployed, or run an older reachpad against it.",
         numbers: None,
         next_command: None,
         exit_code: EXIT_UNAVAILABLE,
@@ -1469,6 +1650,113 @@ mod tests {
         assert!(err.message.contains("account limit"), "{}", err.message);
     }
 
+    /// **The GitHub refusals name only what the server named (I13).**
+    ///
+    /// The org somebody tried to reach and the URL that fixes it are both
+    /// facts of the fleet — a self-hosted deployment runs its own GitHub App
+    /// and its own webapp — so a client constant for either would send people
+    /// somewhere that is not their fleet. When the fleet sends neither, the
+    /// clause disappears and the next command carries the whole remedy.
+    #[test]
+    fn the_github_refusals_take_the_org_and_the_link_off_the_wire() {
+        let body = json!({
+            "org": "acme",
+            "install_url": "https://github.com/apps/reachpad/installations/new",
+            "connect_url": "https://reachpad.dev/connect/github",
+        });
+        let err = render("github_not_installed", &body, Some(403), None);
+        assert!(err.message.contains("acme"), "{}", err.message);
+        // THE CONNECT URL, not the install URL. Installing the App creates an
+        // installation and no grant, and coverage needs both — so the raw
+        // install screen would send this person round the same refusal again.
+        assert!(
+            err.message.contains("https://reachpad.dev/connect/github"),
+            "{}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("apps/reachpad/installations/new"),
+            "the CLI must not send a person to the install screen: {}",
+            err.message
+        );
+        assert_eq!(err.next_command.as_deref(), Some("reachpad connect github"));
+        assert_eq!(err.exit_code, EXIT_WRONG_STATE);
+        assert!(!err.retriable);
+
+        // A fleet that predates `connect_url` sends the body without it. The
+        // whole clause goes, rather than a sentence reading "connect it at
+        // null" — and the org goes with it, because a half-rendered clause is
+        // the thing `fill` exists to prevent. What must survive is the
+        // sentence and the next command, so the person is not left with an
+        // empty message.
+        let err = render(
+            "github_not_installed",
+            &json!({ "org": "acme", "install_url": Value::Null }),
+            Some(403),
+            None,
+        );
+        assert!(!err.message.contains('{'), "{}", err.message);
+        assert!(!err.message.contains("null"), "{}", err.message);
+        assert!(
+            err.message.contains("not installed on that GitHub account"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.next_command.as_deref(), Some("reachpad connect github"));
+
+        // Suspension is GitHub's switch, not Reachpad's: the remedy is in
+        // GitHub's settings, and this row names no reachpad command that
+        // cannot move it.
+        let err = render(
+            "github_installation_suspended",
+            &json!({ "org": "acme" }),
+            Some(403),
+            None,
+        );
+        assert!(err.message.contains("suspended on acme"), "{}", err.message);
+        assert_eq!(err.next_command, None);
+        assert_eq!(err.exit_code, EXIT_WRONG_STATE);
+
+        // A revoked grant is not a credential problem: signing in again would
+        // change nothing, so it must not exit 3 and send somebody there.
+        let err = render(
+            "github_grant_revoked",
+            &json!({ "connect_url": "https://reachpad.dev/connect/github" }),
+            Some(403),
+            None,
+        );
+        assert_eq!(err.next_command.as_deref(), Some("reachpad connect github"));
+        assert_eq!(err.exit_code, EXIT_WRONG_STATE);
+        assert_ne!(err.exit_code, EXIT_CREDENTIAL);
+        assert!(err.message.contains("disconnected"), "{}", err.message);
+        assert!(
+            err.message.contains("https://reachpad.dev/connect/github"),
+            "{}",
+            err.message
+        );
+        // And it still says what happened against a fleet that sends no link.
+        let err = render("github_grant_revoked", &json!({}), Some(403), None);
+        assert!(err.message.contains("disconnected"), "{}", err.message);
+        assert!(!err.message.contains('{'), "{}", err.message);
+        assert_eq!(err.next_command.as_deref(), Some("reachpad connect github"));
+    }
+
+    /// Giving up on the browser half is a wait that ended, not a failure: the
+    /// install may land a minute later, and re-running the command picks it
+    /// up. So it is retriable, and it says how long it waited using the only
+    /// clock that knows — this one.
+    #[test]
+    fn the_connect_wait_says_how_long_it_waited_and_invites_a_retry() {
+        let err = CliError::from_body("github_connect_timeout", &json!({ "waited_s": 600 }), None);
+        assert!(err.message.contains("600s"), "{}", err.message);
+        assert!(err.retriable);
+        assert_eq!(err.exit_code, EXIT_UNAVAILABLE);
+        assert_eq!(err.next_command.as_deref(), Some("reachpad connect github"));
+        // With no elapsed time to report the sentence still stands alone.
+        let err = CliError::from_body("github_connect_timeout", &json!({}), None);
+        assert!(!err.message.contains('{'), "{}", err.message);
+    }
+
     /// **Two routes answer `reason_too_long`, and each gets its own sentence.**
     ///
     /// C3's link-request row is the selector-less one, so it is what `row()`
@@ -1532,7 +1820,7 @@ mod tests {
         let err = render("credits_exhausted", &body, Some(402), Some("ws-1"));
         assert_eq!(
             err.message,
-            "Out of compute credits. Top up at https://reachpad.dev/pricing."
+            "Out of compute credits. Write to seiji@reachpad.dev to top up."
         );
         assert!(!err.message.contains('0'), "{}", err.message);
     }

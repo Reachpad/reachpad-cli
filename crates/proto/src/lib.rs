@@ -36,15 +36,11 @@ pub mod events {
     /// An authorization denial the hub enforced and logged (e.g. viewer
     /// `pty.in` dropped at the hub, §5.2/§7.4). Appended for the sim wave.
     pub const AUTHZ_DENIED: u32 = 14;
-    /// A snapshot that is LESS than what was attempted — a pause whose disk
-    /// half sealed and whose memory half did not (report §30.6).
-    ///
-    /// Appended 2026-08-06 under §4.2's "agents MAY add types" rule. It
-    /// exists because `SNAPSHOT_SEALED{kind: Disk}` cannot distinguish a
-    /// pause that never tried to seal memory from one whose memory seal
-    /// FAILED, and the difference is the whole of "resumes mid-thought"
-    /// having been silently withdrawn from a workspace.
-    pub const SNAPSHOT_DEGRADED: u32 = 15;
+    // 15 was SNAPSHOT_DEGRADED: a pause whose disk half sealed and whose
+    // memory half did not. Removed 2026-08-20 with memory snapshots — a
+    // snapshot has one half now, so "less than what was attempted" is not a
+    // state a pause can reach. The registry is append-only and numbers are
+    // never renumbered, so 15 is RESERVED rather than reused.
 
     /// One command run through the exec surface (ADR-0059 §7), emitted when
     /// the exec ENDS — however it ended, including "the node stopped

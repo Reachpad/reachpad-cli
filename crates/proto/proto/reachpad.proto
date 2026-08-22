@@ -20,8 +20,11 @@ message Event {
 enum Kind {
   KIND_UNSPECIFIED  = 0;
   KIND_DISK         = 1;
-  KIND_DISK_MEM     = 2;
   KIND_ROOTFS_LAYER = 3;
+
+  // Was KIND_DISK_MEM: memory snapshots removed 2026-08-20 (owner directive),
+  // number reserved so nothing reuses it.
+  reserved 2;
 }
 
 message ChunkRef {
@@ -38,51 +41,17 @@ message Manifest {
   Kind   kind              = 4;
   uint64 log_seq           = 5; // log position this seals (I4)
   repeated ChunkRef chunks = 6;
-  bytes  pool_id           = 7; // set iff kind == KIND_DISK_MEM
-  bytes  host_cpu_sig      = 8; // set iff kind == KIND_DISK_MEM: the sealing
-                                // host's guest-visible CPU identity. A
-                                // restoring node MUST compare it against its
-                                // own BEFORE asking the VMM to load, and
-                                // degrade to the disk half on mismatch.
-                                //
-                                // `v` STAYS 1. `Cas::get_manifest` rejects on
-                                // `v != MANIFEST_V` by exact equality, so a
-                                // bump makes every existing manifest
-                                // unreadable — disk ones included. Appending
-                                // at v=1 is wire-safe: manifests sealed
-                                // before this decode with an empty signature,
-                                // which `restore_memory` refuses by name
-                                // rather than mistaking for corruption.
 
-  // ---- ADR-0096: snapshot ⇄ artifact identity (set iff KIND_DISK_MEM) ----
+  // Were pool_id (7), host_cpu_sig (8), rootfs_digest (9) and mem_mib (10),
+  // all of which existed only to bind a MEMORY image to the pool, CPU and
+  // artifacts it was captured against. Memory snapshots removed 2026-08-20
+  // (owner directive — this is the human approval the preamble requires);
+  // snapshots are filesystem-only, and a disk image is portable, so nothing
+  // replaces them. Numbers reserved so nothing reuses them.
   //
-  // A memory image is only meaningful beside the artifacts it was captured
-  // against, and NEITHER of them is inside the snapshot. The guest rootfs is
-  // a shared host file every VM opens read-only, and the guest's RAM size
-  // comes back out of the vmstate file — so rebuilding the image in place, or
-  // changing the node's `--mem-mib`, silently repoints a restore at different
-  // artifacts. That is the 2026-08-15 incident: an in-place rootfs rebuild
-  // shifted every inode by one, a warm resume reopened the new image under
-  // the old guest's dentry cache, and every userland binary answered
-  // `Exec format error`.
-  //
-  // Same discipline as `host_cpu_sig` (field 8), same three cases at restore:
-  // absent = unknown provenance = refuse the memory half; different = refuse;
-  // equal = load. Refusal is never fatal — it is a COLD BOOT from the disk
-  // half, which is intact.
-  //
-  // Appended at `v=1` for field 8's reason, and legacy manifests need no
-  // compatibility path: a `DISK_MEM` manifest with no identity cold-boots
-  // (owner ruling 2026-08-16 — existing workspaces are expendable).
-  bytes  rootfs_digest     = 9;  // sha256 of the rootfs image the sealing
-                                 // guest was booted from (raw 32 bytes).
-  uint64 mem_mib           = 10; // the guest RAM size the image was captured
-                                 // at. Restore takes the size from the
-                                 // vmstate file, so a node whose configured
-                                 // size has moved would otherwise resume a
-                                 // guest at the OLD size while its cgroup cap
-                                 // sits at the new one, with nothing
-                                 // detecting the split.
+  // `v` STAYS 1: `Cas::get_manifest` rejects on `v != MANIFEST_V` by exact
+  // equality, so a bump would make every existing manifest unreadable.
+  reserved 7 to 10;
 }
 
 // ---- §6 handshake / capability negotiation ------------------------------
@@ -124,16 +93,11 @@ message GrantChanged { bytes principal = 1; string role = 2; uint64 expires_at_m
 message SecretUsed   { string credential_id = 1; string use_point = 2; }
 message Presence     { bytes principal = 1; string display = 2; }
 message WsLifecycle  { string transition = 1; } // created|attached|paused|forked|rewound|archived
-// A snapshot that was taken but is LESS than what was attempted — today, a
-// pause whose disk half sealed and whose memory half did not (report §30.6).
-// Distinct from `SnapshotSealed{kind:Disk}`, which is also what a pause that
-// never tried to seal memory looks like: this one says a warm resume was
-// attempted and LOST, which is the difference between a policy and a failure.
-message SnapshotDegraded {
-  string half            = 1;  // "memory"
-  string reason          = 2;  // the error, as the node saw it
-  uint64 attempted_bytes = 3;  // what the capture had already written
-}
+// `SnapshotDegraded` was here: the payload of event type 15, which reported a
+// pause whose disk half sealed and whose memory half did not. Removed
+// 2026-08-20 with memory snapshots; a snapshot has one half now, so a partial
+// snapshot is not a state that exists. Type 15 stays reserved in
+// `proto::events`.
 
 // One command run through the exec surface (ADR-0059 §7, event type 16).
 //
@@ -167,8 +131,10 @@ message ExecRan {
   // the only moment anything knows, so a later usage question is a read
   // rather than a migration (the deferred-billing hedge, ADR-0059 §12(e)).
   bool   caused_resume = 12;
-  // WHAT it woke it from: `already_running`, `starting`, `restoring` or
-  // `resuming` (`controld::execbroker::BootKind`).
+  // WHAT it woke it from: `already_running`, `starting` or `restoring`
+  // (`controld::execbroker::BootKind`). `resuming` was the fourth, and went
+  // with memory snapshots on 2026-08-20 — waking a paused workspace is
+  // always a restore from its disk snapshot now.
   //
   // `caused_resume` above could not answer this and was reported as a resume
   // for all three, including a workspace that had never started and had no

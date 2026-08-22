@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 
 use crate::api::{self, Auth, Client, ExecItem, ExecSpec};
 use crate::cli::{
-    self, AuthCommand, BudgetCommand, Cli, Command, KeysCommand, KillSwitchCommand, PortsCommand,
-    StateFilter, TokenCommand, WaitState, WsCommand,
+    self, AuthCommand, BudgetCommand, Cli, Command, ConnectCommand, KeysCommand, KillSwitchCommand,
+    PortsCommand, StateFilter, TokenCommand, WaitState, WsCommand,
 };
 use crate::conf;
 use crate::errors::{self, CliError, EXIT_OK, EXIT_USAGE};
@@ -34,6 +34,18 @@ const SEAL_BUDGET_MS: u64 = 600_000;
 const LEASE_TTL_MS: u64 = 30_000;
 /// Room for the last heartbeat to land after that.
 const SEAL_MARGIN_MS: u64 = 60_000;
+
+/// Where a person connects GitHub. The web app owns the whole ceremony — the
+/// App install, the account picker, GitHub's own confirmation — so this
+/// constant is the only part of it this CLI knows.
+const CONNECT_GITHUB_URL: &str = "https://reachpad.dev/connect/github";
+/// How often `connect github` asks whether the browser half has finished.
+const CONNECT_POLL_MS: u64 = 3_000;
+/// The longest it backs off to after a poll that could not be answered.
+const CONNECT_POLL_MAX_MS: u64 = 30_000;
+/// How long it waits before saying so. Long enough to install an App on an
+/// organization whose owner has to approve it first.
+const CONNECT_DEADLINE_MS: u64 = 600_000;
 
 /// Entry point for `main`: returns the process exit code.
 ///
@@ -277,13 +289,40 @@ impl Ctx {
     }
 
     /// The user-scoped identity token every account-level verb needs.
+    /// The account-scoped identity token, for the verbs that answer for a
+    /// whole account rather than one workspace.
+    ///
+    /// An API key cannot produce one — it names a workspace, not an account —
+    /// so this is one of the two doors [`Ctx::deny_api_key`] guards.
     async fn identity(&self) -> Result<state::Identity, CliError> {
+        self.deny_api_key()?;
         state::identity(&self.client(), &self.paths, now_ms()).await
+    }
+
+    /// Refuse when the caller named an API key a verb cannot use.
+    ///
+    /// The alternative — what this used to do — is to ignore `--api-key` and
+    /// act under whatever `auth login` left on disk. That is a silent change
+    /// of identity, in the widening direction, on a command the caller was
+    /// deliberately trying to confine. `keys mint` was the sharp edge: it
+    /// printed an account-wide key in answer to a workspace-scoped one.
+    ///
+    /// Guarding the two DOORS rather than each verb is deliberate: a new
+    /// account-wide verb reaches for `identity()` or `credential()` on its
+    /// first line, and inherits the refusal without anyone remembering to
+    /// add it. `budget show` is the proof — it took neither of the paths an
+    /// earlier version of this guard covered, and shipped a hole.
+    pub(crate) fn deny_api_key(&self) -> Result<(), CliError> {
+        if self.api_key.is_some() {
+            return Err(CliError::from_code("api_key_not_accepted", None));
+        }
+        Ok(())
     }
 
     /// The saved operator credential, or the refusal that says which of the
     /// two reasons it is missing for.
     pub(crate) fn credential(&self) -> Result<conf::Credential, CliError> {
+        self.deny_api_key()?;
         match conf::load_credential(&self.paths, now_ms())? {
             conf::Stored::Present(c) => Ok(c),
             conf::Stored::Missing => Err(CliError::from_code("no_credential", None)),
@@ -403,6 +442,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Ports(PortsCommand::Expose { .. }) => "ports.expose",
         Command::Ports(PortsCommand::List { .. }) => "ports.list",
         Command::Ports(PortsCommand::Revoke { .. }) => "ports.revoke",
+        Command::Connect(ConnectCommand::Github) => "connect.github",
         Command::Attach { .. } => "workspace.attach",
         Command::Tail { .. } => "workspace.events",
         Command::Credits => "account.credits",
@@ -427,7 +467,11 @@ fn command_name(command: &Command) -> &'static str {
 
 async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
     match command {
-        Command::Create { name, name_flag } => create(ctx, name.or(name_flag), None).await,
+        Command::Create {
+            name,
+            name_flag,
+            repo,
+        } => create(ctx, name.or(name_flag), repo, None).await,
         Command::List { state } => list(ctx, state, None).await,
         Command::Status { workspace, wait } => status(ctx, workspace, wait).await,
         Command::Run {
@@ -465,6 +509,7 @@ async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
         Command::Budget(budget) => run_budget(ctx, budget).await,
         Command::KillSwitch(switch) => run_kill_switch(ctx, switch).await,
         Command::Ports(ports) => run_ports(ctx, ports).await,
+        Command::Connect(connect) => run_connect(ctx, connect).await,
         Command::Doctor => crate::doctor::run(ctx).await,
         Command::Update => crate::self_update::run(ctx),
         Command::Completions { shell } => {
@@ -643,6 +688,9 @@ struct Claimed {
 }
 
 async fn user_identity(ctx: &Ctx, claimed: Option<Claimed>) -> Result<(String, String), CliError> {
+    // Also guarded here, not only in `Ctx::identity`: the explicit
+    // `--idp-assertion` branch below never reaches that door.
+    ctx.deny_api_key()?;
     let client = ctx.client();
     match claimed {
         Some(Claimed {
@@ -674,19 +722,20 @@ async fn user_identity(ctx: &Ctx, claimed: Option<Claimed>) -> Result<(String, S
 async fn create(
     ctx: &Ctx,
     name: Option<String>,
+    repo: Option<String>,
     claimed: Option<Claimed>,
 ) -> Result<i32, CliError> {
     let (user, identity) = user_identity(ctx, claimed).await?;
     let name = name.unwrap_or_default();
     let created = ctx
         .client()
-        .create_workspace(&user, &identity, &name)
+        .create_workspace(&user, &identity, &name, repo.as_deref())
         .await
         .map_err(|e| CliError::from_api(&e, None))?;
     ctx.remember(&created.workspace, &created.biscuit_b64, None)?;
     ctx.ids(std::slice::from_ref(&created.workspace));
     ctx.emit(
-        json!({ "id": created.workspace, "name": name }),
+        json!({ "id": created.workspace, "name": name, "repo": repo }),
         // The id IS the output: `reachpad create demo` prints `ws-431` and a
         // script pipes it straight into the next verb.
         std::slice::from_ref(&created.workspace),
@@ -721,6 +770,11 @@ async fn list(
         }
     }
 
+    // Archived is only ever shown when it was explicitly asked for — as its
+    // own filter, or folded into `--state all`. That same ask governs
+    // whether the summary and counts mention it at all.
+    let archived_requested = matches!(filter, Some(StateFilter::Archived) | Some(StateFilter::All));
+
     let shown: Vec<&api::Workspace> = listing
         .workspaces
         .iter()
@@ -745,11 +799,14 @@ async fn list(
         "workspaces": shown.iter().map(|ws| render::workspace_json(ws)).collect::<Vec<_>>(),
     });
     // Counts are a claim about state, so a fleet that reports no state gets
-    // no counts rather than a made-up zero.
+    // no counts rather than a made-up zero. Archived is only in the object
+    // when the caller asked for it — same rule as the rows themselves.
     if !stateless {
-        data["counts"] = json!({
-            "running": counts.0, "paused": counts.1, "archived": counts.2,
-        });
+        data["counts"] = if archived_requested {
+            json!({ "running": counts.0, "paused": counts.1, "archived": counts.2 })
+        } else {
+            json!({ "running": counts.0, "paused": counts.1 })
+        };
     }
     if let Some(limits) = &listing.limits {
         data["limits"] = render::limits_json(limits);
@@ -763,7 +820,7 @@ async fn list(
         let head = ws
             .head
             .as_ref()
-            .map(|h| format!("saved {} ({})", h.snapshot, h.kind))
+            .map(|h| format!("saved {}", h.snapshot))
             .unwrap_or_else(|| "never saved".to_owned());
         human.push(format!(
             "{}  {:<16} {:<13} {head}",
@@ -773,10 +830,14 @@ async fn list(
         ));
     }
     if !stateless {
-        human.push(format!(
-            "{} running, {} paused, {} archived",
-            counts.0, counts.1, counts.2
-        ));
+        human.push(if archived_requested {
+            format!(
+                "{} running, {} paused, {} archived",
+                counts.0, counts.1, counts.2
+            )
+        } else {
+            format!("{} running, {} paused", counts.0, counts.1)
+        });
     }
     if let Some(limits) = &listing.limits {
         human.push(render::limits_line(limits).trim_start().to_owned());
@@ -848,7 +909,6 @@ async fn compose_status(ctx: &Ctx, workspace: &str, held: &Held) -> Result<api::
         }),
         head: lineage.head.as_ref().map(|h| api::Head {
             snapshot: h.id.clone(),
-            kind: h.kind.clone(),
             sealed_at_ms: Some(h.sealed_at_ms),
         }),
         parent: None,
@@ -1046,7 +1106,7 @@ async fn pause(ctx: &Ctx, workspace: Option<String>, wait: bool) -> Result<i32, 
     ctx.emit(
         json!({ "id": workspace, "state": "sealing", "sealing": true }),
         &[
-            format!("{workspace} is saving disk and memory."),
+            format!("{workspace} is saving disk."),
             "  It still holds its slot until the save finishes; `--wait` blocks until it does."
                 .to_owned(),
         ],
@@ -1060,7 +1120,7 @@ async fn pause(ctx: &Ctx, workspace: Option<String>, wait: bool) -> Result<i32, 
 /// `--wait` is refused here rather than dropped: the same fleet cannot report
 /// when the save finished either, so waiting would mean exiting 0 the instant
 /// the seal was ORDERED — the caller's next step (an rsync, a shutdown) would
-/// run ten minutes before the memory image is durable.
+/// run ten minutes before the disk image is durable.
 async fn pause_on_an_older_fleet(
     ctx: &Ctx,
     workspace: &str,
@@ -1097,7 +1157,7 @@ async fn pause_on_an_older_fleet(
     }
     ctx.emit(
         json!({ "id": workspace, "state": "sealing", "sealing": true }),
-        &[format!("{workspace} is saving disk and memory.")],
+        &[format!("{workspace} is saving disk.")],
     );
     Ok(EXIT_OK)
 }
@@ -1194,19 +1254,36 @@ async fn fork(
 async fn archive(ctx: &Ctx, workspace: Option<String>) -> Result<i32, CliError> {
     let workspace = ctx.workspace(workspace)?;
     let held = ctx.authority(&workspace).await?;
-    let at = ctx
+    let archived = ctx
         .client()
         .archive(&workspace, held.auth())
         .await
         .map_err(|e| CliError::from_api(&e, Some(&workspace)))?;
+    let mut human = vec![
+        format!("{workspace} is archived and its slot is free."),
+        // Not "untouched": ADR-0070 makes archived state managed
+        // retention, not a permanent-backup promise. Nothing goes now.
+        "  Nothing is deleted now; archived state follows managed retention.".to_owned(),
+    ];
+    // Said out loud, because the alternative is what this used to do: leave
+    // every link live and mention none of them, so the person tidying up
+    // learns from whoever still has the URL.
+    if !archived.ports_closed.is_empty() {
+        let ports: Vec<String> = archived.ports_closed.iter().map(u64::to_string).collect();
+        human.push(format!(
+            "  {} port {} closed: {}. Those links are dead, and re-opening a port mints a new one.",
+            ports.len(),
+            if ports.len() == 1 { "share" } else { "shares" },
+            ports.join(", ")
+        ));
+    }
     ctx.emit(
-        json!({ "id": workspace, "archived_at": render::time(at) }),
-        &[
-            format!("{workspace} is archived and its slot is free."),
-            // Not "untouched": ADR-0070 makes archived state managed
-            // retention, not a permanent-backup promise. Nothing goes now.
-            "  Nothing is deleted now; archived state follows managed retention.".to_owned(),
-        ],
+        json!({
+            "id": workspace,
+            "archived_at": render::time(archived.at_ms),
+            "port_shares_revoked": archived.ports_closed,
+        }),
+        &human,
     );
     Ok(EXIT_OK)
 }
@@ -2141,7 +2218,72 @@ fn port_share_refusal(err: &api::ApiError, workspace: &str) -> CliError {
     if api::is_route_absent(err) || api::is_port_echo_missing(err) {
         return CliError::from_code("fleet_predates_port_shares", Some(workspace));
     }
+    // The generic `not_owner` sentence advises `--role owner` without saying
+    // what else that grants, and these verbs are the ones somebody automates.
+    if matches!(refused_as(err), Some(("not_owner", _))) {
+        return CliError::from_code("not_owner_port_share", Some(workspace));
+    }
     CliError::from_api(err, Some(workspace))
+}
+
+/// After minting a link: is anything actually there?
+///
+/// A share is a row, and `expose` will hand out a confident link for a port
+/// nothing has ever listened on — `ports expose 1` and `ports expose 3000` on
+/// a workspace that has never started both print a URL and the "anyone with
+/// this link" blurb, with nothing to say the link goes nowhere. The person
+/// who finds out is the one it was sent to.
+///
+/// **It never resumes the workspace.** The state read is a GET; the dial only
+/// happens when the workspace is already running. Waking a paused VM as a
+/// side effect of naming a port would put a billable resume behind a command
+/// nobody thought was billable — the same property ADR-0103 §5 protects on
+/// the visitor's side, for the same reason.
+///
+/// Returns `None` when there is nothing worth saying, including every case
+/// where the check itself could not run: a probe that did not execute is not
+/// evidence that a port is dead, and saying so would send somebody to restart
+/// a server that was serving.
+async fn port_reality_check(ctx: &Ctx, workspace: &str, held: &Held, port: u32) -> Option<String> {
+    let state = ctx
+        .client()
+        .workspace_status(workspace, held.auth())
+        .await
+        .ok()?
+        .state;
+    if state != "running" {
+        return Some(format!(
+            "  {workspace} is {state}, so nothing is listening yet — the link works once it is running and something is on {port}"
+        ));
+    }
+    // The dial hub itself makes: a TCP connect to 127.0.0.1:<port> in the
+    // guest. `ss` is the fallback for an image without python3.
+    let script = format!(
+        "if command -v python3 >/dev/null 2>&1; then \
+python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(2); \
+sys.exit(0 if s.connect_ex((\"127.0.0.1\",{port}))==0 else 1)'; \
+else ss -ltn 2>/dev/null | grep -q \":{port} \"; fi"
+    );
+    let argv = ["/bin/sh".to_owned(), "-lc".to_owned(), script];
+    let env = std::collections::BTreeMap::new();
+    let spec = api::ExecSpec {
+        argv: &argv,
+        cwd: None,
+        env: &env,
+        timeout_ms: Some(15_000),
+        stdin_b64: None,
+    };
+    let end = ctx
+        .client()
+        .exec(workspace, held.auth(), &spec, |_| {})
+        .await
+        .ok()?;
+    // 1 is the dial's own "connected to nothing". Anything else — 127 for a
+    // shell that could not run it, a timeout, a refusal — is unknown, and
+    // unknown says nothing.
+    (end.get("exit_code").and_then(Value::as_i64) == Some(1)).then(|| {
+        format!("  NOTHING IS LISTENING on {port} yet — the link resolves, and a visitor gets an error page rather than your app")
+    })
 }
 
 async fn run_ports(ctx: &Ctx, cmd: PortsCommand) -> Result<i32, CliError> {
@@ -2166,6 +2308,9 @@ async fn run_ports(ctx: &Ctx, cmd: PortsCommand) -> Result<i32, CliError> {
                 "  anyone with this link who signs in to Reachpad reaches port {} in {workspace}",
                 share.port
             ));
+            if let Some(said) = port_reality_check(ctx, &workspace, &held, share.port).await {
+                human.push(said);
+            }
             human.push(format!(
                 "  close it with `reachpad ports revoke {} {workspace}`",
                 share.port
@@ -2219,6 +2364,182 @@ async fn run_ports(ctx: &Ctx, cmd: PortsCommand) -> Result<i32, CliError> {
 }
 
 // ---------------------------------------------------------------------------
+// Outside accounts (INT-171)
+// ---------------------------------------------------------------------------
+
+async fn run_connect(ctx: &Ctx, cmd: ConnectCommand) -> Result<i32, CliError> {
+    match cmd {
+        ConnectCommand::Github => connect_github(ctx).await,
+    }
+}
+
+/// `connect github`: say what is connected, and if nothing is, wait for the
+/// browser half to make it so.
+///
+/// The ceremony itself belongs to the web app — App install, account picker,
+/// GitHub's confirmation — so this command owns exactly two things: the link,
+/// and the patience. It writes nothing to disk: the connection lives on the
+/// account, so the answer is the same from any machine and a second laptop
+/// needs no second install.
+async fn connect_github(ctx: &Ctx) -> Result<i32, CliError> {
+    let identity = ctx.identity().await?;
+    let client = ctx.client();
+    // Both borrowed OUTSIDE the closure, so each poll's future holds a plain
+    // `&Client` rather than a borrow of the closure itself. That is what lets
+    // the polling loop below stay a bare `Fn() -> Future` — and a loop with
+    // that shape can be driven by a fixture instead of a fleet.
+    let (client, identity) = (&client, &identity);
+    let ask = move || async move {
+        client
+            .github_connection(&identity.user_id, &identity.identity_token)
+            .await
+    };
+
+    let connection = match ask().await {
+        Ok(connection) => connection,
+        // ADR-0079 §4: this verb ships with its route. A fleet without it says
+        // 404 with no code, which would otherwise render as "the fleet refused
+        // this: unknown" — a sentence whose remedy nobody could guess.
+        Err(e) if api::is_route_absent(&e) => {
+            return Err(CliError::from_code("fleet_predates_github", None))
+        }
+        Err(e) => return Err(CliError::from_api(&e, None)),
+    };
+    if connection.connected {
+        emit_github_connection(ctx, &connection);
+        return Ok(EXIT_OK);
+    }
+
+    // The link and the waiting go to stderr, the way the device-flow prompt
+    // does: `--json` keeps ONE machine-readable line on stdout, and the link
+    // is not a secret, so it is printed even under `-q`.
+    eprintln!("Connect GitHub: {CONNECT_GITHUB_URL}");
+    if crate::cli_auth::open_browser(CONNECT_GITHUB_URL) {
+        eprintln!("  Opened it in your browser.");
+    }
+    eprintln!("Waiting for GitHub…");
+    let started = now_ms();
+    let connection =
+        poll_for_github(started, started.saturating_add(CONNECT_DEADLINE_MS), ask).await?;
+    emit_github_connection(ctx, &connection);
+    Ok(EXIT_OK)
+}
+
+/// Ask until the answer is `connected`, the deadline passes, or the fleet says
+/// something that waiting cannot fix.
+///
+/// The pacing is the device-flow shape (`cli_auth`): a fixed interval, longer
+/// after a poll that could not be answered, and a deadline that a slow answer
+/// does not extend. `ask` is a parameter rather than a client so this is
+/// testable without a fleet — the loop is the part with the bugs in it.
+async fn poll_for_github<F, Fut>(
+    started_ms: u64,
+    deadline_ms: u64,
+    ask: F,
+) -> Result<api::GithubConnection, CliError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<api::GithubConnection, api::ApiError>>,
+{
+    let mut interval_ms = CONNECT_POLL_MS;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms + jitter_ms())).await;
+        match ask().await {
+            Ok(connection) if connection.connected => return Ok(connection),
+            // Answered, just not yet: back to the ordinary interval, whatever
+            // the last failure had stretched it to.
+            Ok(_) => interval_ms = CONNECT_POLL_MS,
+            Err(e) if worth_waiting_out(&e) => {
+                interval_ms = interval_ms.saturating_mul(2).min(CONNECT_POLL_MAX_MS);
+            }
+            Err(e) => return Err(CliError::from_api(&e, None)),
+        }
+        let now = now_ms();
+        if now >= deadline_ms {
+            let waited = json!({ "waited_s": now.saturating_sub(started_ms) / 1_000 });
+            return Err(CliError::from_body("github_connect_timeout", &waited, None));
+        }
+    }
+}
+
+/// Is this a reason to keep waiting, or an answer?
+///
+/// A wait that is watching for something to HAPPEN treats a dropped connection
+/// and a control plane that is restarting as noise. A refusal the fleet meant
+/// — a credential it will not accept, a route it does not have — is an answer,
+/// and polling over it for ten minutes is how somebody waits out a typo.
+fn worth_waiting_out(err: &api::ApiError) -> bool {
+    match err {
+        api::ApiError::Transport(_) | api::ApiError::Deadline => true,
+        api::ApiError::Api { status, .. } => *status >= 500,
+        api::ApiError::Shape(_) => false,
+    }
+}
+
+/// What `connect github` prints once it has an answer.
+fn emit_github_connection(ctx: &Ctx, connection: &api::GithubConnection) {
+    let rows: Vec<Value> = connection
+        .installations
+        .iter()
+        .map(|i| {
+            json!({
+                "installation_id": i.installation_id,
+                "account_login": i.account_login,
+                "account_type": i.account_type,
+                "state": i.state,
+                "repository_selection": i.repository_selection,
+                "granted_at_ms": i.granted_at_ms,
+            })
+        })
+        .collect();
+    let mut human = vec![if connection.connected {
+        "GitHub is connected.".to_owned()
+    } else {
+        "GitHub is not connected.".to_owned()
+    }];
+    human.extend(connection.installations.iter().map(github_coverage_line));
+    // Coverage grows one GitHub account at a time, and the only way to add one
+    // is to install the App again — so the link is worth saying even on the
+    // success path, where a person is looking at a list that is missing an org.
+    if let Some(url) = &connection.install_url {
+        human.push(format!("  add another GitHub account at {url}"));
+    }
+    ctx.emit(
+        json!({
+            "connected": connection.connected,
+            "install_url": connection.install_url,
+            "installations": rows,
+        }),
+        &human,
+    );
+}
+
+/// One line per GitHub account, saying what it reaches — or why it does not.
+///
+/// A non-live installation is LISTED rather than hidden: "suspended" is the
+/// answer to "why can it not see my repositories", and a list that silently
+/// dropped it would send somebody to reinstall an App that is already there.
+fn github_coverage_line(i: &api::GithubInstallation) -> String {
+    // A pending installation is recorded before the webhook that names it
+    // arrives, so it has no login yet. The id is public and is what GitHub's
+    // own settings page shows.
+    let who = if i.account_login.is_empty() {
+        format!("installation {}", i.installation_id)
+    } else {
+        i.account_login.clone()
+    };
+    let reaches = match (i.state.as_str(), i.repository_selection.as_str()) {
+        ("live", "all") => "every repository".to_owned(),
+        ("live", "selected") => "the repositories you picked".to_owned(),
+        // A state or a selection this CLI has not heard of is printed as the
+        // server said it (I13), not flattened into "unknown".
+        ("live", other) => other.to_owned(),
+        (state, _) => state.to_owned(),
+    };
+    format!("  {who} — {reaches}")
+}
+
+// ---------------------------------------------------------------------------
 // The v0.1.0 tree
 // ---------------------------------------------------------------------------
 
@@ -2233,6 +2554,9 @@ async fn run_ws(ctx: &Ctx, cmd: WsCommand) -> Result<i32, CliError> {
             create(
                 ctx,
                 name,
+                // The v0.1.0 spelling never grew a `--repo`, and it is not
+                // going to: it is kept working, not extended.
+                None,
                 Some(Claimed {
                     user,
                     principal,
@@ -2325,7 +2649,7 @@ async fn run_ws(ctx: &Ctx, cmd: WsCommand) -> Result<i32, CliError> {
             let human = if released.released {
                 format!("{workspace} stopped; everything since the last save is gone.")
             } else {
-                format!("{workspace} is saving disk and memory, then it stops.")
+                format!("{workspace} is saving disk, then it stops.")
             };
             ctx.emit(
                 json!({
@@ -2349,8 +2673,8 @@ async fn run_ws(ctx: &Ctx, cmd: WsCommand) -> Result<i32, CliError> {
             let mut human = vec![format!("workspace={workspace}")];
             match &lineage.head {
                 Some(head) => human.push(format!(
-                    "  resumes from: {} (kind={} log_seq={})",
-                    head.id, head.kind, head.log_seq
+                    "  resumes from: {} (log_seq={})",
+                    head.id, head.log_seq
                 )),
                 None => {
                     human.push("  resumes from: nothing (never saved — a fresh boot)".to_owned())
@@ -2358,9 +2682,8 @@ async fn run_ws(ctx: &Ctx, cmd: WsCommand) -> Result<i32, CliError> {
             }
             for s in &lineage.snapshots {
                 human.push(format!(
-                    "    {}  kind={} log_seq={} sealed_at_ms={}{}",
+                    "    {}  log_seq={} sealed_at_ms={}{}",
                     s.id,
-                    s.kind,
                     s.log_seq,
                     s.sealed_at_ms,
                     if Some(&s.id) == head_id.as_ref() {
@@ -2376,9 +2699,9 @@ async fn run_ws(ctx: &Ctx, cmd: WsCommand) -> Result<i32, CliError> {
             ctx.emit(
                 json!({
                     "id": workspace,
-                    "head": lineage.head.as_ref().map(|h| json!({ "snapshot": h.id, "kind": h.kind })),
+                    "head": lineage.head.as_ref().map(|h| json!({ "snapshot": h.id })),
                     "snapshots": lineage.snapshots.iter().map(|s| json!({
-                        "snapshot": s.id, "kind": s.kind, "sealed_at": render::time(s.sealed_at_ms),
+                        "snapshot": s.id, "sealed_at": render::time(s.sealed_at_ms),
                     })).collect::<Vec<_>>(),
                     "forks": lineage.forks,
                 }),
@@ -2713,5 +3036,142 @@ mod tests {
             command_name(&Command::List { state: None }),
             "workspace.list"
         );
+    }
+
+    fn connection(connected: bool) -> api::GithubConnection {
+        api::GithubConnection {
+            connected,
+            install_url: None,
+            installations: if connected {
+                vec![api::GithubInstallation {
+                    installation_id: 7,
+                    account_login: "acme".to_owned(),
+                    account_type: "org".to_owned(),
+                    state: "live".to_owned(),
+                    repository_selection: "all".to_owned(),
+                    granted_at_ms: 1_000,
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// The wait ends when the browser half finishes, not before: a `connected:
+    /// false` answer is an answer, and the loop asks again rather than
+    /// reporting it as the outcome.
+    #[tokio::test(start_paused = true)]
+    async fn the_connect_wait_ends_when_github_says_connected() {
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let asked = &asked;
+        let now = now_ms();
+        let got = poll_for_github(now, now + CONNECT_DEADLINE_MS, move || async move {
+            let n = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(connection(n >= 2))
+        })
+        .await
+        .expect("the third answer connects");
+        assert!(got.connected);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// A poll that could not be answered is not an answer. The browser half
+    /// may be finishing at that exact moment, so a hiccup on one request must
+    /// not make somebody start the ceremony over — the wait backs off and
+    /// keeps waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_extends_the_wait_instead_of_ending_it() {
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let asked = &asked;
+        let started = tokio::time::Instant::now();
+        let now = now_ms();
+        let got = poll_for_github(now, now + CONNECT_DEADLINE_MS, move || async move {
+            match asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Err(api::ApiError::Transport("connection reset".to_owned())),
+                1 => Err(api::ApiError::Api {
+                    status: 503,
+                    code: "control_upstream_unavailable".to_owned(),
+                    detail: None,
+                    body: json!({}),
+                }),
+                _ => Ok(connection(true)),
+            }
+        })
+        .await
+        .expect("a hiccup is not an outcome");
+        assert!(got.connected);
+        // 3s, then 6s, then 12s: each failure lengthens the next pause, so a
+        // fleet that is restarting is not also being hammered.
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_secs(21),
+            "backed off too little: {waited:?}"
+        );
+    }
+
+    /// A refusal the fleet MEANT ends the wait immediately. Polling over a
+    /// credential the fleet will not accept is how somebody waits out a typo
+    /// for ten minutes and learns nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_the_fleet_meant_is_not_waited_out() {
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let asked = &asked;
+        let now = now_ms();
+        let err = poll_for_github(now, now + CONNECT_DEADLINE_MS, move || async move {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(api::ApiError::Api {
+                status: 401,
+                code: "operator_token_expired".to_owned(),
+                detail: None,
+                body: json!({}),
+            })
+        })
+        .await
+        .expect_err("an expired credential is an answer");
+        assert_eq!(err.code, "operator_token_expired");
+        assert_eq!(err.exit_code, errors::EXIT_CREDENTIAL);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The deadline is the client's own, and what it produces is a sentence
+    /// about waiting — not a claim that GitHub or the fleet failed.
+    #[tokio::test(start_paused = true)]
+    async fn the_connect_wait_gives_up_on_its_own_deadline() {
+        let now = now_ms();
+        let err = poll_for_github(now, now, || async { Ok(connection(false)) })
+            .await
+            .expect_err("a deadline already past ends the first pass");
+        assert_eq!(err.code, "github_connect_timeout");
+        assert_eq!(err.exit_code, errors::EXIT_UNAVAILABLE);
+        assert!(err.retriable);
+        assert!(err.message.contains("Gave up waiting"), "{}", err.message);
+    }
+
+    /// A non-live installation is LISTED, not hidden: "suspended" is the
+    /// answer to "why can it not see my repositories", and dropping the row
+    /// would send somebody to reinstall an App that is already there.
+    #[test]
+    fn coverage_lines_name_what_each_account_reaches_or_why_it_does_not() {
+        let mut i = api::GithubInstallation {
+            installation_id: 42,
+            account_login: "acme".to_owned(),
+            account_type: "org".to_owned(),
+            state: "live".to_owned(),
+            repository_selection: "all".to_owned(),
+            granted_at_ms: 0,
+        };
+        assert_eq!(github_coverage_line(&i), "  acme — every repository");
+        i.repository_selection = "selected".to_owned();
+        assert_eq!(
+            github_coverage_line(&i),
+            "  acme — the repositories you picked"
+        );
+        i.state = "suspended".to_owned();
+        assert_eq!(github_coverage_line(&i), "  acme — suspended");
+        // A grant recorded before the webhook that names it: the id is public
+        // and is what GitHub's own settings page shows.
+        i.state = "pending".to_owned();
+        i.account_login = String::new();
+        assert_eq!(github_coverage_line(&i), "  installation 42 — pending");
     }
 }

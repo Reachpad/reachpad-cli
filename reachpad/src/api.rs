@@ -34,10 +34,9 @@ pub enum ExecItem<'a> {
     /// boot rather than a hang.
     ///
     /// `reason` is the server's word for what it is doing — `starting`
-    /// (nothing to restore), `restoring` (a disk-only head) or `resuming` (a
-    /// `disk+mem` head, the mid-thought case). It is rendered verbatim, so a
-    /// server that learns a new one needs no CLI release; the CLI only owns
-    /// the sentence around it.
+    /// (nothing to restore) or `restoring` (a head snapshot to boot from).
+    /// It is rendered verbatim, so a server that learns a new one needs no
+    /// CLI release; the CLI only owns the sentence around it.
     Waiting { reason: &'a str },
 }
 
@@ -212,7 +211,6 @@ pub struct Workspace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Head {
     pub snapshot: String,
-    pub kind: String,
     pub sealed_at_ms: Option<u64>,
 }
 
@@ -298,6 +296,20 @@ pub struct DeviceSize {
     pub workspace_bytes: u64,
     /// What a workspace created now is stamped with.
     pub new_workspace_bytes: u64,
+}
+
+/// What an archive did.
+///
+/// The port shares are here because archiving CLOSES them, and a workspace
+/// put away with a link still pointing at it is the defect this exists to
+/// report. A fleet that predates that behaviour sends no field and the list
+/// is empty — which reads the same as "it had none", and is the one
+/// ambiguity worth accepting rather than printing a sentence about a fleet
+/// version.
+#[derive(Debug, Clone, Default)]
+pub struct Archived {
+    pub at_ms: u64,
+    pub ports_closed: Vec<u64>,
 }
 
 /// What a release did: `released` ended the lease now (a discard), `sealing`
@@ -419,11 +431,8 @@ pub struct Rewound {
 #[derive(Debug, Clone)]
 pub struct SnapshotRow {
     pub id: String,
-    /// `disk+mem` resumes mid-thought (within its pool); `disk` boots.
-    pub kind: String,
     pub log_seq: u64,
     pub sealed_at_ms: u64,
-    pub pool_id: Option<String>,
 }
 
 /// The lineage view a rewind is driven from.
@@ -464,6 +473,49 @@ pub struct Share {
     pub role: String,
     pub expires_at_ms: u64,
     pub share_token_b64: String,
+}
+
+/// One GitHub App installation this account holds a live grant on, as
+/// `/v1/github/connection` lists it.
+///
+/// A Reachpad account's GitHub connection is N installations shown as one:
+/// the App is installed per GitHub account, so somebody who works in their own
+/// repositories and in two organizations is covered by three of these. Which
+/// is why `connected` is a separate fact from this list — a connection can be
+/// live and still not reach the org somebody just tried to clone from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubInstallation {
+    pub installation_id: u64,
+    /// The GitHub account the App is installed on, lowercased by the fleet.
+    /// Empty while an installation is `pending` — the grant is recorded before
+    /// the webhook that names it arrives.
+    pub account_login: String,
+    /// `user` or `org`. The server's word, rendered verbatim.
+    pub account_type: String,
+    /// `pending` | `live` | `suspended` | `deleted`. Only `live` reaches
+    /// repositories; the others are shown so a person can see WHY a clone was
+    /// refused instead of concluding the connection is gone.
+    pub state: String,
+    /// `all` or `selected` — every repository on that account, or the ones
+    /// picked at install time.
+    pub repository_selection: String,
+    pub granted_at_ms: u64,
+}
+
+/// What `/v1/github/connection` says about this account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubConnection {
+    /// At least one grant whose installation is live. The server decides this,
+    /// not the client: the predicate that answers it is the same one that
+    /// admits a clone (INT-171), and a second copy of it here would be a
+    /// second answer.
+    pub connected: bool,
+    /// Where a person installs the App on one more account. `None` when this
+    /// fleet has no App slug configured — this client never composes a GitHub
+    /// URL it was not given (I13), because a link to the wrong App installs
+    /// the wrong App.
+    pub install_url: Option<String>,
+    pub installations: Vec<GithubInstallation>,
 }
 
 /// One port share (ADR-0103), as `/v1/workspaces/:id/port-shares` echoes it.
@@ -517,6 +569,50 @@ pub fn is_port_echo_missing(err: &ApiError) -> bool {
 /// `token` and `port` are both REQUIRED: without the token there is nothing to
 /// hand a visitor, and without the port there is nothing to say the answer is
 /// about the port that was asked for.
+fn github_connection_of(body: &Value) -> Result<GithubConnection, ApiError> {
+    let connected = body
+        .get("connected")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::Shape("missing field connected".to_owned()))?;
+    let installations = match body.get("installations") {
+        // Absent is not the same as empty and is not treated as it: an answer
+        // with no list at all is a shape this client does not know, and
+        // printing "connected, covering nothing" for it would be a claim the
+        // server never made.
+        Some(Value::Array(rows)) => rows
+            .iter()
+            .map(github_installation_of)
+            .collect::<Result<Vec<_>, ApiError>>()?,
+        Some(_) => return Err(ApiError::Shape("installations is not an array".to_owned())),
+        None => Vec::new(),
+    };
+    Ok(GithubConnection {
+        connected,
+        install_url: body["install_url"].as_str().map(str::to_owned),
+        installations,
+    })
+}
+
+fn github_installation_of(value: &Value) -> Result<GithubInstallation, ApiError> {
+    Ok(GithubInstallation {
+        installation_id: u64_at(value, &["installation_id"])?,
+        // The three fields the rendering names are required; the two it only
+        // qualifies with are not, so a fleet that adds a state later does not
+        // make this listing unreadable.
+        account_login: str_at(value, &["account_login"])?,
+        state: str_at(value, &["state"])?,
+        account_type: value["account_type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        repository_selection: value["repository_selection"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        granted_at_ms: value["granted_at_ms"].as_u64().unwrap_or(0),
+    })
+}
+
 fn port_share_of(value: &Value) -> Result<PortShare, ApiError> {
     let port = value
         .get("port")
@@ -753,6 +849,29 @@ impl Client {
         })
     }
 
+    /// POST /v1/github/connection → whether this account has GitHub connected,
+    /// and which GitHub accounts that reaches.
+    ///
+    /// A read spelled as a POST because the user-scoped identity token travels
+    /// in the body, exactly as it does for `create_workspace` — this surface
+    /// puts an identity token on a GET nowhere.
+    ///
+    /// Nothing here is a credential: an installation id is a public number and
+    /// the tokens it can mint never leave the fleet.
+    pub async fn github_connection(
+        &self,
+        user_id: &str,
+        identity_token: &str,
+    ) -> Result<GithubConnection, ApiError> {
+        let body = self
+            .post(
+                "/v1/github/connection",
+                json!({ "user_id": user_id, "identity_token": identity_token }),
+            )
+            .await?;
+        github_connection_of(&body)
+    }
+
     /// POST /v1/workspaces → (workspace id, the creator's owner Biscuit).
     ///
     /// The returned Biscuit is what every later call for this workspace
@@ -766,17 +885,23 @@ impl Client {
         user_id: &str,
         identity_token: &str,
         name: &str,
+        repo: Option<&str>,
     ) -> Result<Created, ApiError> {
-        let body = self
-            .post(
-                "/v1/workspaces",
-                json!({
-                    "user_id": user_id,
-                    "identity_token": identity_token,
-                    "name": name,
-                }),
-            )
-            .await?;
+        let mut request = json!({
+            "user_id": user_id,
+            "identity_token": identity_token,
+            "name": name,
+        });
+        // `repo` is sent ONLY when one was asked for, which is the opposite of
+        // `name` above and for the opposite reason: a fleet that predates the
+        // GitHub connector has no such field, and an absent field means the
+        // same thing to both fleets — no repository. It is passed verbatim,
+        // URL form included: controld owns the normalization, so there is one
+        // normalizer and not two that can disagree about `.git`.
+        if let Some(repo) = repo {
+            request["repo"] = json!(repo);
+        }
+        let body = self.post("/v1/workspaces", request).await?;
         Ok(Created {
             workspace: str_at(&body, &["workspace", "id"])?,
             biscuit_b64: str_at(&body, &["biscuit"])?,
@@ -819,7 +944,6 @@ impl Client {
                     state: row["state"].as_str().map(str::to_owned),
                     head: row["head"]["snapshot"].as_str().map(|s| Head {
                         snapshot: s.to_owned(),
-                        kind: row["head"]["kind"].as_str().unwrap_or_default().to_owned(),
                         sealed_at_ms: None,
                     }),
                     parent: parent_of(&row["origin"]),
@@ -874,10 +998,6 @@ impl Client {
             }),
             head: body["head_snapshot"]["id"].as_str().map(|id| Head {
                 snapshot: id.to_owned(),
-                kind: body["head_snapshot"]["kind"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
                 sealed_at_ms: body["head_snapshot"]["sealed_at_ms"].as_u64(),
             }),
             parent: parent_of(&ws["origin"]),
@@ -1026,7 +1146,7 @@ impl Client {
                         let reason = v
                             .get("reason")
                             .and_then(Value::as_str)
-                            .unwrap_or("resuming");
+                            .unwrap_or("restoring");
                         on_item(ExecItem::Waiting { reason });
                     }
                     Some("exec.end") => end = Some(v),
@@ -1072,31 +1192,6 @@ impl Client {
         Err(ApiError::Transport(format!(
             "the exec stream ended without `exec.end` (HTTP {status}). Whether the command              ran is UNKNOWN — this is not a zero exit, and must not be treated as one."
         )))
-    }
-
-    /// GET /v1/workspaces/:id/lineage — the head snapshot and the fork tree.
-    ///
-    /// Returns `(kind, pool_id)` of the snapshot this workspace RESUMES from,
-    /// or `None` when it has never been sealed. A client needs this to tell a
-    /// warm resume from a cold boot without reaching into the database, which
-    /// no client may do (I6: there is no privileged interface).
-    pub async fn head_snapshot(
-        &self,
-        workspace: &str,
-        auth: Auth<'_>,
-    ) -> Result<Option<(String, Option<String>)>, ApiError> {
-        let path = format!("/v1/workspaces/{}/lineage", encode_segment(workspace));
-        let resp =
-            http_min::get_json_trust(&self.controld, &path, Some(auth.bearer()), &self.trust)
-                .await
-                .map_err(|e| ApiError::Transport(format!("{e:#}")))?;
-        if !(200..300).contains(&resp.status) {
-            return Err(refusal(resp));
-        }
-        let head = &resp.body["head_snapshot"];
-        Ok(head["kind"]
-            .as_str()
-            .map(|k| (k.to_owned(), head["pool_id"].as_str().map(str::to_owned))))
     }
 
     /// POST /v1/workspaces/:id/fork → a child workspace rooted at a sealed
@@ -1178,10 +1273,8 @@ impl Client {
         }
         let snapshot_row = |v: &Value| SnapshotRow {
             id: v["id"].as_str().unwrap_or_default().to_owned(),
-            kind: v["kind"].as_str().unwrap_or_default().to_owned(),
             log_seq: v["log_seq"].as_u64().unwrap_or(0),
             sealed_at_ms: v["sealed_at_ms"].as_u64().unwrap_or(0),
-            pool_id: v["pool_id"].as_str().map(str::to_owned),
         };
         Ok(Lineage {
             head: resp
@@ -1319,7 +1412,7 @@ impl Client {
     /// against `max_workspaces` (I13). Archived state follows ADR-0070's
     /// managed-retention boundary rather than a permanent-backup promise.
     /// Returns when it was archived.
-    pub async fn archive(&self, workspace: &str, auth: Auth<'_>) -> Result<u64, ApiError> {
+    pub async fn archive(&self, workspace: &str, auth: Auth<'_>) -> Result<Archived, ApiError> {
         let (bearer, biscuit) = auth.split();
         let body = self
             .post_auth(
@@ -1328,7 +1421,16 @@ impl Client {
                 bearer,
             )
             .await?;
-        Ok(u64_at(&body, &["archived_at_ms"]).unwrap_or(0))
+        Ok(Archived {
+            at_ms: u64_at(&body, &["archived_at_ms"]).unwrap_or(0),
+            // Absent on a fleet that predates the change, which is not the
+            // same as "it closed none" — hence `Vec::new()` and a sentence
+            // the caller only prints when there is something to print.
+            ports_closed: body["port_shares_revoked"]
+                .as_array()
+                .map(|ports| ports.iter().filter_map(Value::as_u64).collect())
+                .unwrap_or_default(),
+        })
     }
 
     /// GET /v1/budget — what is left (creds milestone C5, design §9).
