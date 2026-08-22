@@ -59,6 +59,14 @@ rcgen.workspace = true
 rustls-platform-verifier = "0.7"
 blake3.workspace = true
 
+[dev-dependencies]
+# `tokio::test(start_paused = true)`: `connect github` waits ten minutes for a
+# ceremony that happens in a browser, and the part worth testing is its pacing
+# — three seconds, longer after a failure it could not read, and a deadline.
+# On the real clock that test would take as long as the wait it tests. The
+# same dev-only feature hub and noded already take for the same reason; it
+# ships in no binary.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
