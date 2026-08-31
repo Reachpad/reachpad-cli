@@ -1,7 +1,8 @@
 # reachpad CLI
 
-Run coding agents in durable cloud workspaces: disk and memory survive the
-machine underneath, so a paused workspace resumes mid-session.
+Run coding agents in durable cloud workspaces: the disk survives the machine
+underneath, so a paused workspace costs nothing and picks up from its last
+save. Files survive a pause; running processes do not.
 
 ## Install
 
@@ -51,13 +52,18 @@ On a remote machine without a usable browser, run `reachpad auth login
 credential flow remains available from
 [reachpad.dev/connect](https://reachpad.dev/connect) as a recovery path.
 
-Then list, create, or attach to a workspace:
+Then create a workspace, work in it, and put it away:
 
 ```sh
-reachpad ws list
-reachpad ws create --name scratch
+reachpad create scratch
+reachpad list
 reachpad attach <workspace-id>
+reachpad run <workspace-id> -- cargo test
+reachpad pause <workspace-id>
 ```
+
+`create` prints the workspace id the other verbs take. The name is only a
+label; there is no lookup by name.
 
 Useful maintenance commands:
 
@@ -80,12 +86,12 @@ Docs: [reachpad.dev/docs/cli](https://reachpad.dev/docs/cli)
 ## Source and provenance
 
 This repository carries the full CLI source: the `reach` package (shipped
-binary name `reachpad`) and its three library crates (`proto`, the frozen
-wire protocol; `authz`, Biscuit verify and offline attenuation; `runtime`,
-the config and tracing shell). Release binaries are built from this source
-by [the release workflow](.github/workflows/release.yml) on GitHub's
-runners, and every release carries a SHA256SUMS the install script verifies.
-To build it yourself (needs Rust and `protoc`):
+binary name `reachpad`) and its two library crates (`proto`, the frozen wire
+protocol, and `authz`, Biscuit verify and offline attenuation). Release
+binaries are built from this source by
+[the release workflow](.github/workflows/release.yml) on GitHub's runners, and
+every release carries a SHA256SUMS the install script verifies. To build it
+yourself (needs Rust and `protoc`):
 
 ```sh
 cargo build --release -p reach

@@ -19,6 +19,7 @@ case "$os/$arch" in
     Linux/x86_64)           target="x86_64-unknown-linux-musl" ;;
     Linux/aarch64)          target="aarch64-unknown-linux-musl" ;;
     Darwin/arm64)           target="aarch64-apple-darwin" ;;
+    Darwin/x86_64)          target="x86_64-apple-darwin" ;;
     *)
         echo "reachpad: no prebuilt binary for $os/$arch." >&2
         echo "Open an issue at https://github.com/Reachpad/reachpad-cli and we will add the target." >&2
