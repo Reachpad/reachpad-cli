@@ -34,9 +34,11 @@ warm cache.
 ## Use it without installing
 
 ```sh
-npx @reachpad/cli create --name scratch
-npx @reachpad/cli run scratch -- cargo test
+ws=$(npx @reachpad/cli create scratch)
+npx @reachpad/cli run "$ws" -- cargo test
 ```
+
+`create` prints the workspace id `run` takes. There is no lookup by name.
 
 ## The surface
 
@@ -45,7 +47,8 @@ reachpad create [name]        make a workspace, print its id
 reachpad list                 your workspaces and what each is doing
 reachpad status <ws>          state, save, lease, limits (--wait to block)
 reachpad run <ws> -- <argv>   run one command, waking a paused workspace
-reachpad pause <ws>           save disk and memory, stop the meter
+reachpad attach <ws>          an interactive terminal in the workspace
+reachpad pause <ws>           save the disk, stop the meter
 reachpad fork <ws>            branch new workspaces from the last save
 reachpad archive <ws>         free the slot; deletes nothing
 reachpad events <ws>          live event stream
