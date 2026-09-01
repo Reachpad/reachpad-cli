@@ -41,7 +41,9 @@ pub struct Cli {
 
     /// An API key (`rpak1.…`) instead of your saved credential, for the verbs
     /// that act on ONE workspace: `status`, `run`, `pause`, `fork`, `archive`,
-    /// `events`, `ports`.
+    /// `events`, `ports`. `fork` takes an ACCOUNT-WIDE key only (one minted
+    /// with no `--workspace` scope): a scoped key's children would be born
+    /// outside its scope, so the fleet refuses them.
     ///
     /// Account-wide verbs — `list`, `budget`, `keys`, `auth` — need your own
     /// credential. They REFUSE a key rather than quietly falling back to

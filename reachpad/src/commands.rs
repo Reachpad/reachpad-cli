@@ -1186,8 +1186,10 @@ async fn fork(
             "--name names one workspace; with --count the server names them.",
         ));
     }
-    let biscuit = ctx.biscuit(&workspace).await?;
-    let held = Held::Biscuit(biscuit);
+    // Either carrier: `--api-key` when one was passed (documented for fork
+    // since v1, silently ignored until 2026-08-31), the workspace's own
+    // token otherwise.
+    let held = ctx.authority(&workspace).await?;
     let client = ctx.client();
 
     // ONE snapshot for all N children: resolved here, so a fan-out cannot
@@ -1204,11 +1206,8 @@ async fn fork(
     let mut children = Vec::new();
     let mut rows = Vec::new();
     for _ in 0..count {
-        let Held::Biscuit(biscuit) = &held else {
-            unreachable!("fork presents the workspace's own token");
-        };
         let forked = match client
-            .fork(&workspace, biscuit, snapshot.as_deref(), name.as_deref())
+            .fork(&workspace, held.auth(), snapshot.as_deref(), name.as_deref())
             .await
         {
             Ok(forked) => forked,

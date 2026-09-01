@@ -349,6 +349,15 @@ pub const TABLE: &[Row] = &[
         retriable: Retriable::No,
     },
     Row {
+        code: "api_key_scoped_cannot_fork",
+        selector: None,
+        sentence: "A workspace-scoped key cannot fork: the child would be outside its scope. Mint an account-wide key (`reachpad keys mint` with no `--workspace`) or use your signed-in credential.",
+        numbers: None,
+        next_command: Some("reachpad keys mint"),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
+    Row {
         code: "api_key_lookup_failed",
         selector: None,
         sentence: "reachpad could not check that API key just now. Try again.",

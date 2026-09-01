@@ -1200,11 +1200,12 @@ impl Client {
     pub async fn fork(
         &self,
         workspace: &str,
-        biscuit_b64: &str,
+        auth: Auth<'_>,
         snapshot_id: Option<&str>,
         name: Option<&str>,
     ) -> Result<Forked, ApiError> {
-        let mut req = json!({ "biscuit": biscuit_b64 });
+        let (bearer, biscuit) = auth.split();
+        let mut req = json!({ "biscuit": biscuit.unwrap_or_default() });
         if let Some(id) = snapshot_id {
             req["snapshot_id"] = json!(id);
         }
@@ -1212,9 +1213,10 @@ impl Client {
             req["name"] = json!(n);
         }
         let body = self
-            .post(
+            .post_auth(
                 &format!("/v1/workspaces/{}/fork", encode_segment(workspace)),
                 req,
+                bearer,
             )
             .await?;
         Ok(Forked {
