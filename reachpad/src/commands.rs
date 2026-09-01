@@ -1207,7 +1207,12 @@ async fn fork(
     let mut rows = Vec::new();
     for _ in 0..count {
         let forked = match client
-            .fork(&workspace, held.auth(), snapshot.as_deref(), name.as_deref())
+            .fork(
+                &workspace,
+                held.auth(),
+                snapshot.as_deref(),
+                name.as_deref(),
+            )
             .await
         {
             Ok(forked) => forked,
