@@ -12,10 +12,13 @@
 //!   the same whichever stream they arrive on.
 //!
 //! TLS for `quic://`: real hostnames are verified against the platform
-//! trust store. `--quic-dev-pin` instead pins the hub's DETERMINISTIC dev
-//! certificate ([`dev_pinned_hub_cert`]) by exact DER equality — dev only:
-//! that key is derived from a public constant, so the pinned cert
-//! authenticates nothing outside a machine you already trust.
+//! trust store, and there is no posture that does less. The `dev-pin` feature
+//! — off in every shipped binary, on only for this crate's own tests — pins
+//! the hub's DETERMINISTIC dev certificate ([`dev_pinned_hub_cert`]) by exact
+//! DER equality instead. It is dev only: that key derives from a public
+//! constant, so the pinned cert authenticates nothing outside a machine you
+//! already trust. The `--quic-dev-pin` flag that used to select it is gone,
+//! and the verifier that implements it is no longer compiled into `reachpad`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -88,14 +91,21 @@ fn blake3_hash(s: &str) -> [u8; 32] {
 ///   wider — the OS roots are not added back.
 /// - **`dev_pin`** — the deterministic dev certificate, by exact DER equality.
 ///   Dev only (its key derives from a public constant) and it wins over
-///   `ca_files` when both are set.
+///   `ca_files` when both are set. Behind the `dev-pin` feature, which is off
+///   by default and OFF in every shipped `reachpad`: it is a certificate
+///   verification override, the flag that once selected it (`--quic-dev-pin`)
+///   no longer exists, and code that can replace certificate verification has
+///   no business in a binary a user installs. `bins/reach/Cargo.toml` turns it
+///   on for this crate's own test build and nowhere else.
 #[derive(Debug, Clone, Default)]
 pub struct TlsTrust {
+    #[cfg(feature = "dev-pin")]
     pub dev_pin: bool,
     pub ca_files: Vec<std::path::PathBuf>,
 }
 
 impl TlsTrust {
+    #[cfg(feature = "dev-pin")]
     #[must_use]
     pub fn dev_pin(dev_pin: bool) -> Self {
         TlsTrust {
@@ -113,12 +123,18 @@ impl TlsTrust {
     /// that control and data ride the same hostname on the same port.
     /// There is deliberately no posture that disables verification.
     pub fn client_config(&self, alpn: &[&[u8]]) -> anyhow::Result<rustls::ClientConfig> {
-        let mut config = if self.dev_pin {
-            pinned_dev_config()?
-        } else if self.ca_files.is_empty() {
-            platform_config()?
+        #[cfg(feature = "dev-pin")]
+        let pinned = if self.dev_pin {
+            Some(pinned_dev_config()?)
         } else {
-            explicit_roots_config(&self.ca_files)?
+            None
+        };
+        #[cfg(not(feature = "dev-pin"))]
+        let pinned: Option<rustls::ClientConfig> = None;
+        let mut config = match pinned {
+            Some(config) => config,
+            None if self.ca_files.is_empty() => platform_config()?,
+            None => explicit_roots_config(&self.ca_files)?,
         };
         config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Ok(config)
@@ -127,7 +143,11 @@ impl TlsTrust {
     /// Human summary for the "what am I trusting" line a client should print.
     #[must_use]
     pub fn describe(&self) -> String {
-        if self.dev_pin {
+        #[cfg(feature = "dev-pin")]
+        let pinned = self.dev_pin;
+        #[cfg(not(feature = "dev-pin"))]
+        let pinned = false;
+        if pinned {
             "pinned dev certificate (DEV ONLY)".to_owned()
         } else if self.ca_files.is_empty() {
             "the OS trust store".to_owned()
@@ -189,15 +209,20 @@ pub enum ClientTransport {
 }
 
 impl ClientTransport {
-    /// Dial `hub_url`. `quic_dev_pin` selects the pinned dev certificate
-    /// instead of platform trust for `quic://` (dev only; no effect on ws).
-    pub async fn connect(hub_url: &str, quic_dev_pin: bool) -> anyhow::Result<Self> {
-        Self::connect_with(hub_url, &TlsTrust::dev_pin(quic_dev_pin)).await
-    }
-
     /// Dial with an explicit trust posture ([`TlsTrust`]). `ws://`/`wss://`
     /// ignore it: the WebSocket fallback verifies against webpki roots.
+    ///
+    /// The URL is put through [`crate::cli_auth::validate_hub_url`] FIRST, and
+    /// this is the gate that matters rather than the one in
+    /// `validate_connection_urls`: every session opened here presents a
+    /// workspace Biscuit in its first frames, and a `ws://` hub off this
+    /// machine puts that capability on the wire in cleartext. The check
+    /// existed and was wired only into the sign-in exchange, so any other
+    /// route to a hub URL — `--hub`, a saved endpoint, a `tail`/`attach`
+    /// caller holding one — reached `connect_async` with no confidentiality
+    /// check at all. One call, before a socket opens, covers all of them.
     pub async fn connect_with(hub_url: &str, trust: &TlsTrust) -> anyhow::Result<Self> {
+        crate::cli_auth::validate_hub_url(hub_url)?;
         match HubUrl::parse(hub_url)? {
             HubUrl::Ws(url) => {
                 let (ws, _) = tokio_tungstenite::connect_async(&url)
@@ -570,7 +595,8 @@ fn explicit_roots_config(ca_files: &[std::path::PathBuf]) -> anyhow::Result<rust
     Ok(config)
 }
 
-/// Exact-DER pin of the deterministic dev hub certificate (`--quic-dev-pin`).
+/// Exact-DER pin of the deterministic dev hub certificate.
+#[cfg(feature = "dev-pin")]
 fn pinned_dev_config() -> anyhow::Result<rustls::ClientConfig> {
     let expected = dev_pinned_hub_cert()?;
     let provider = ring_provider();
@@ -591,12 +617,18 @@ fn pinned_dev_config() -> anyhow::Result<rustls::ClientConfig> {
 /// equality. Signatures are still verified against that cert's key, so a
 /// connection either speaks to a holder of the (public, dev-only) key or
 /// fails loudly.
+///
+/// A [`rustls::client::danger::ServerCertVerifier`] replaces the trust
+/// decision, so it is compiled ONLY under the `dev-pin` feature — off by
+/// default, on for this crate's tests, and never in a released `reachpad`.
+#[cfg(feature = "dev-pin")]
 #[derive(Debug)]
 struct PinnedCert {
     expected: CertificateDer<'static>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
+#[cfg(feature = "dev-pin")]
 impl rustls::client::danger::ServerCertVerifier for PinnedCert {
     fn verify_server_cert(
         &self,
@@ -681,6 +713,65 @@ mod tests {
         assert!(HubUrl::parse("http://x").is_err());
         assert!(HubUrl::parse("quic://").is_err());
         assert!(HubUrl::parse("quic://host:notaport").is_err());
+    }
+
+    /// `connect_with` matched `HubUrl::Ws(url)` and handed it straight to
+    /// `connect_async` — no confidentiality check, no host check. Every
+    /// session opened here presents a workspace Biscuit in its first frames,
+    /// so a `ws://` hub anywhere but this machine put a capability on the wire
+    /// in cleartext. The check existed in `cli_auth` and was wired only into
+    /// the sign-in exchange, which is not the path `--hub`, a saved endpoint
+    /// or a `tail`/`attach` caller takes.
+    ///
+    /// The refusal must happen BEFORE a socket opens, which is what the
+    /// unroutable port here is for: a dial would hang or take a connection
+    /// error, and this returns immediately with the refusal's own words.
+    #[tokio::test]
+    async fn a_plaintext_hub_off_this_machine_is_refused_before_a_socket_opens() {
+        use crate::cli_auth::validate_hub_url;
+        let err =
+            match ClientTransport::connect_with("ws://hub.example.com:1/ws", &TlsTrust::default())
+                .await
+            {
+                Ok(_) => panic!("a cleartext hub off-box must be refused"),
+                Err(err) => format!("{err:#}"),
+            };
+        assert!(
+            err.contains("plaintext") || err.contains("refusing"),
+            "the refusal must say what it refused: {err}"
+        );
+        // The confidential spellings are untouched, and loopback still works
+        // in the clear — the dev hub is this machine.
+        assert!(validate_hub_url("wss://hub.example.com/ws").is_ok());
+        assert!(validate_hub_url("quic://hub.example.com").is_ok());
+        assert!(validate_hub_url("ws://127.0.0.1:7420/ws").is_ok());
+    }
+
+    /// The dev-certificate pin replaces rustls's trust decision, so the type
+    /// that implements it must not be compiled into a binary anyone installs.
+    /// `dev-pin` is off by default and turned on in exactly one place — this
+    /// crate's own dev-dependency on itself, which resolves for test builds
+    /// and for nothing that ships.
+    #[test]
+    fn the_certificate_verifier_override_is_not_in_a_shipped_build() {
+        let manifest =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        assert!(
+            !manifest.contains("default = ["),
+            "reach has no default feature set, and `dev-pin` must never join one: {manifest}"
+        );
+        let enabling: Vec<&str> = manifest
+            .lines()
+            .filter(|line| line.contains("dev-pin") && !line.trim_start().starts_with('#'))
+            .collect();
+        assert_eq!(
+            enabling,
+            vec![
+                "dev-pin = []",
+                "reach = { path = \".\", features = [\"dev-pin\"] }",
+            ],
+            "`dev-pin` is declared once and enabled once, by the dev-dependency"
+        );
     }
 
     #[test]

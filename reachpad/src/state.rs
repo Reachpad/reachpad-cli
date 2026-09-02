@@ -140,6 +140,52 @@ pub fn forget_all(paths: &Paths) -> anyhow::Result<()> {
 // Re-minting
 // ---------------------------------------------------------------------------
 
+/// Refuse to send a stored credential to a host other than the one that issued
+/// it, and say so out loud when the record cannot answer the question.
+///
+/// The two doors that produce an operator credential — [`identity`] here and
+/// `Ctx::credential` — both call this, for the same reason `deny_api_key`
+/// guards doors rather than verbs: a new account-wide verb reaches for one of
+/// them on its first line and inherits the check without anyone remembering.
+///
+/// A record with no `endpoint_host` is a laptop that signed in before the
+/// field existed. It gets a warning and a re-auth prompt, NOT a refusal:
+/// hard-failing would sign out every existing installation on upgrade over a
+/// binding it never had the chance to write, and a security fix that logs the
+/// whole userbase out is a security fix nobody ships. The warning goes to
+/// stderr, so `--json` keeps one parseable line on stdout, and it is said once
+/// per command — the credential is loaded more than once inside one.
+pub fn bind_to_endpoint(
+    credential: &conf::Credential,
+    endpoint_host: &str,
+) -> Result<(), CliError> {
+    match credential.check_endpoint(endpoint_host) {
+        conf::Binding::Ok => Ok(()),
+        conf::Binding::Unbound => {
+            if !UNBOUND_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "reachpad: your saved credential does not record which endpoint issued it, \
+                     so it cannot be checked against {endpoint_host}. Run `reachpad auth login` \
+                     to re-bind it."
+                );
+            }
+            Ok(())
+        }
+        conf::Binding::Foreign { stored_host } => Err(CliError::from_body(
+            "credential_endpoint_mismatch",
+            &serde_json::json!({
+                "stored_host": stored_host,
+                "endpoint_host": endpoint_host,
+            }),
+            None,
+        )),
+    }
+}
+
+/// Once per process, which is once per command: this CLI runs one verb and
+/// exits, and the credential is loaded on more than one path inside it.
+static UNBOUND_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The identity token, from the cache when it is still good and from the saved
 /// operator credential otherwise.
 pub async fn identity(client: &Client, paths: &Paths, now_ms: u64) -> Result<Identity, CliError> {
@@ -151,6 +197,12 @@ pub async fn identity(client: &Client, paths: &Paths, now_ms: u64) -> Result<Ide
         conf::Stored::Missing => return Err(CliError::from_code("no_credential", None)),
         conf::Stored::Expired => return Err(CliError::from_code("operator_token_expired", None)),
     };
+    // The host this client dials, not the endpoint some caller believes in:
+    // the bearer header below is about to go to exactly that host.
+    let host = crate::http_min::parse_url(client.controld())
+        .map(|control| control.host)
+        .map_err(CliError::from)?;
+    bind_to_endpoint(&credential, &host)?;
     let session = client
         .operator_session(credential.bearer())
         .await
@@ -249,6 +301,11 @@ pub fn migrate_v0_files(paths: &Paths, now_ms: u64) -> anyhow::Result<Option<Str
             operator_token: credential.to_owned(),
             token_id: None,
             expires_at_ms: None,
+            // A v0.1.0 file never recorded an endpoint, and inventing one here
+            // would bind the credential to whatever host this migrating
+            // command happened to be aimed at. `None` is the honest answer,
+            // and it takes the warn-and-re-auth path.
+            endpoint_host: None,
         },
     )?;
 

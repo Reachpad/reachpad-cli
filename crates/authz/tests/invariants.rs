@@ -285,6 +285,111 @@ fn d_attenuating_to_earlier_exp_narrows() {
     verify(&short, &root_pub(), WS, &Op::Read, NOW - 1).unwrap();
 }
 
+/// The chain's expiry is REPORTED, not just enforced — trap 81.
+///
+/// `Verified` carried the principal and the effective role and dropped the
+/// expiry, so `controld::api::attach` could not clamp the token it re-mints
+/// from a presented one even in principle: it minted a fresh authority block
+/// at `now + BISCUIT_TTL_MS` and the attenuation carrying the share's own
+/// deadline went with the old chain. A collaborator therefore re-attached
+/// hourly forever, and since there is no Biscuit revocation list the recorded
+/// `expires_at_ms` enforced nothing.
+///
+/// The number is the MINIMUM over the whole chain, on the same rule as
+/// `role_effective`. Asserted at three shapes, because a `min` that reads only
+/// one side passes on two of them.
+#[test]
+fn d_the_effective_expiry_is_the_minimum_over_the_whole_chain() {
+    let owner = mint(&root(), ALICE, WS, Role::Owner, EXP).unwrap();
+    assert_eq!(
+        verify(&owner, &root_pub(), WS, &Op::Write, NOW)
+            .unwrap()
+            .expires_at_ms,
+        EXP,
+        "a bare token expires when its authority block says"
+    );
+
+    // Narrowed: the attenuation wins.
+    let short = attenuate(&owner, Role::Collaborator, NOW + 1_000).unwrap();
+    assert_eq!(
+        verify(&short, &root_pub(), WS, &Op::Write, NOW)
+            .unwrap()
+            .expires_at_ms,
+        NOW + 1_000,
+        "an attenuation that ends sooner is the chain's expiry"
+    );
+
+    // "Widened": the authority block wins, exactly as `d_attenuating_to_
+    // later_exp_does_not_extend` proves for authorization itself. This is the
+    // half that makes the reported number safe to re-mint from — if an
+    // appended block could raise it, the clamp would be laundering the
+    // extension it exists to refuse.
+    let stretched = attenuate(&owner, Role::Owner, EXP * 10).unwrap();
+    assert_eq!(
+        verify(&stretched, &root_pub(), WS, &Op::Write, NOW)
+            .unwrap()
+            .expires_at_ms,
+        EXP,
+        "an appended block can never report MORE life than the authority block"
+    );
+
+    // Two attenuations, the earlier one buried in the middle of the chain.
+    let chained = attenuate(&short, Role::Collaborator, EXP * 10).unwrap();
+    assert_eq!(
+        verify(&chained, &root_pub(), WS, &Op::Write, NOW)
+            .unwrap()
+            .expires_at_ms,
+        NOW + 1_000,
+        "every block is read, not only the last one"
+    );
+}
+
+/// A time constraint this build cannot restate reads as "expires now".
+///
+/// The reported expiry is a floor, and the only shape it promises to
+/// understand is the one `attenuate` emits. A hand-built block constraining
+/// `time` some other way still VERIFIES on its own datalog — that is the
+/// authority — but a caller re-minting from it is told the chain has no
+/// remaining life, so the mistake can only produce a SHORTER credential.
+/// Fail-closed in the direction a credential is allowed to be wrong in.
+#[test]
+fn d_a_time_check_that_cannot_be_restated_reports_no_remaining_life() {
+    let owner = mint(&root(), ALICE, WS, Role::Owner, EXP).unwrap();
+    let odd = append_raw_block(&owner, "check if time($t), $t < 900000, $t > 1;");
+
+    let verified = verify(&odd, &root_pub(), WS, &Op::Write, NOW).unwrap();
+    assert_eq!(
+        verified.role_effective,
+        Role::Owner,
+        "the block constrains time, not the op set: authorization is unchanged"
+    );
+    assert_eq!(
+        verified.expires_at_ms, NOW,
+        "an unreadable time bound must not be read as the authority block's own"
+    );
+
+    // The §9.8 control: the SAME block written in the canonical shape is
+    // restated exactly, so the assertion above is about the shape and not
+    // about appended blocks in general.
+    let canonical = append_raw_block(&owner, "check if time($t), $t < 900000;");
+    assert_eq!(
+        verify(&canonical, &root_pub(), WS, &Op::Write, NOW)
+            .unwrap()
+            .expires_at_ms,
+        900_000,
+    );
+
+    // An appended block that says nothing about time constrains nothing about
+    // it — the second control, without which "everything reports NOW" passes.
+    let op_only = attenuate(&owner, Role::Viewer, EXP).unwrap();
+    assert_eq!(
+        verify(&op_only, &root_pub(), WS, &Op::Read, NOW)
+            .unwrap()
+            .expires_at_ms,
+        EXP,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (e) wrong workspace
 // ---------------------------------------------------------------------------

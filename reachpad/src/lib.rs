@@ -40,6 +40,31 @@
 //! - [`commands`] — command dispatch; all printing lives here.
 //! - [`doctor`] — local installation, credential, and connectivity checks.
 //! - [`self_update`] — package-manager-aware native updates.
+//! - [`out`] — the fds themselves: a closed reader ends the output instead
+//!   of panicking (issue #56).
+//!
+//! # `println!` in this crate is [`out::out_line`]
+//!
+//! The two macros below deliberately SHADOW `std`'s for every module of this
+//! crate. `std`'s `println!` panics when the write fails, so
+//! `reachpad events … --json | head -6` died with `failed printing to
+//! stdout: Broken pipe` and exit 101 the moment `head` hung up — on the path
+//! agents use most. Rebinding the macro once here is what makes that true of
+//! every line the CLI prints, including the ones nobody has written yet;
+//! renaming 58 call sites to `outln!` would have been the same fix with a
+//! way for the 59th to get it wrong. See [`out`] for what happens instead of
+//! the panic, and why `libc::signal(SIGPIPE, SIG_DFL)` is not available to
+//! this crate.
+
+macro_rules! println {
+    () => { $crate::out::out_line(format_args!("")) };
+    ($($arg:tt)*) => { $crate::out::out_line(format_args!($($arg)*)) };
+}
+
+macro_rules! eprintln {
+    () => { $crate::out::err_line(format_args!("")) };
+    ($($arg:tt)*) => { $crate::out::err_line(format_args!($($arg)*)) };
+}
 
 pub mod api;
 pub mod attach;
@@ -51,6 +76,7 @@ pub mod doctor;
 pub mod errors;
 pub mod http_min;
 pub mod inspect;
+pub mod out;
 pub mod privatefile;
 pub mod render;
 pub mod self_update;

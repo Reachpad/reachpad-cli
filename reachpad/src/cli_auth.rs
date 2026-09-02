@@ -67,12 +67,23 @@ fn validate_https_or_loopback(url: &str) -> anyhow::Result<()> {
     endpoint.ensure_confidential()
 }
 
-/// A WorkOS token is sent to this origin, so a merely TLS-valid arbitrary
-/// `--account-url` would be a credential exfiltration footgun. Production is
-/// confined to Reachpad-controlled DNS; loopback remains available for local
-/// integration tests.
-fn validate_account_url(url: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(url.len() <= MAX_URL_LEN, "account URL is too long");
+/// The one allowlist for every origin this CLI hands a long-lived secret to.
+///
+/// Two callers, one rule. `--account-url` receives a WorkOS access token; the
+/// control plane `--endpoint` expands to receives the `rpop1` operator
+/// credential on an `Authorization: Bearer` header. A merely TLS-valid
+/// arbitrary host on either would be a credential exfiltration footgun, and
+/// `--endpoint` was the sharper of the two: it had `env =
+/// "REACHPAD_ENDPOINT"`, so one exported variable was enough to send the
+/// account's root credential wherever the exporter liked. Production is
+/// confined to Reachpad-controlled DNS on 443 with no path prefix (ADR-0040:
+/// one host, one port, both planes); loopback remains available for local
+/// integration tests, where plaintext can only ever reach this machine.
+///
+/// There is deliberately no second copy of this check. A divergent allowlist
+/// is how one of two doors ends up wider than the other.
+pub fn validate_credential_origin(url: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(url.len() <= MAX_URL_LEN, "control URL is too long");
     let endpoint = http_min::parse_url(url)?;
     endpoint.ensure_confidential()?;
     if endpoint.is_loopback() {
@@ -83,12 +94,20 @@ fn validate_account_url(url: &str) -> anyhow::Result<()> {
             && endpoint.port == 443
             && endpoint.base_path.is_empty()
             && (endpoint.host == "reachpad.dev" || endpoint.host.ends_with(".reachpad.dev")),
-        "refusing non-Reachpad account URL: a WorkOS access token is sent to this origin"
+        "refusing to send a credential to {}: this CLI speaks to reachpad.dev, \
+         *.reachpad.dev on 443, or a controld on this machine, and nothing else. \
+         An operator credential or a WorkOS access token is sent to this origin.",
+        endpoint.host
     );
     Ok(())
 }
 
-fn validate_hub_url(url: &str) -> anyhow::Result<()> {
+/// The same rule for the DATA plane. A `ws://` hub off-box carries workspace
+/// Biscuits in the clear, so it is refused for exactly the reason the control
+/// plane refuses plaintext; `quic://` and `wss://` are confidential by
+/// construction. Public because [`crate::transport::ClientTransport::connect_with`]
+/// is the last gate before a socket opens.
+pub fn validate_hub_url(url: &str) -> anyhow::Result<()> {
     anyhow::ensure!(url.len() <= MAX_URL_LEN, "hub URL is too long");
     match HubUrl::parse(url)? {
         HubUrl::Quic { .. } => Ok(()),
@@ -176,7 +195,7 @@ pub async fn start_device_authorization(
     account_url: &str,
     reachpad_trust: &TlsTrust,
 ) -> anyhow::Result<DeviceAuthorization> {
-    validate_account_url(account_url)?;
+    validate_credential_origin(account_url)?;
     let config = tokio::time::timeout(
         AUTH_REQUEST_TIMEOUT,
         http_min::get_json_trust(account_url, CLI_CONFIG_PATH, None, reachpad_trust),
@@ -262,7 +281,7 @@ pub async fn complete_device_authorization(
 ) -> anyhow::Result<CliLogin> {
     // Re-check at the credential-bearing boundary even though the normal
     // caller already checked before starting the device flow.
-    validate_account_url(account_url)?;
+    validate_credential_origin(account_url)?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(device.expires_in);
     let mut interval = device.interval;
     let (access_token, email) = loop {
@@ -402,13 +421,13 @@ mod tests {
 
     #[test]
     fn account_exchange_is_pinned_to_reachpad_or_loopback() {
-        assert!(validate_account_url("https://reachpad.dev").is_ok());
-        assert!(validate_account_url("https://staging.reachpad.dev").is_ok());
-        assert!(validate_account_url("http://127.0.0.1:3000").is_ok());
-        assert!(validate_account_url("https://example.com").is_err());
-        assert!(validate_account_url("https://reachpad.dev.example.com").is_err());
-        assert!(validate_account_url("https://reachpad.dev:444").is_err());
-        assert!(validate_account_url("https://reachpad.dev/prefix").is_err());
+        assert!(validate_credential_origin("https://reachpad.dev").is_ok());
+        assert!(validate_credential_origin("https://staging.reachpad.dev").is_ok());
+        assert!(validate_credential_origin("http://127.0.0.1:3000").is_ok());
+        assert!(validate_credential_origin("https://example.com").is_err());
+        assert!(validate_credential_origin("https://reachpad.dev.example.com").is_err());
+        assert!(validate_credential_origin("https://reachpad.dev:444").is_err());
+        assert!(validate_credential_origin("https://reachpad.dev/prefix").is_err());
     }
 
     #[test]

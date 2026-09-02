@@ -667,6 +667,16 @@ impl Client {
         }
     }
 
+    /// The control-plane base URL this client dials.
+    ///
+    /// Exposed so a caller can ask "which host am I about to hand a
+    /// credential to" without being handed the endpoint a command *thought*
+    /// it was using — `--controld` can differ, and it is the dialled host that
+    /// matters (`conf::Credential::check_endpoint`).
+    pub fn controld(&self) -> &str {
+        &self.controld
+    }
+
     async fn post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
         self.post_auth(path, body, None).await
     }
@@ -1200,12 +1210,11 @@ impl Client {
     pub async fn fork(
         &self,
         workspace: &str,
-        auth: Auth<'_>,
+        biscuit_b64: &str,
         snapshot_id: Option<&str>,
         name: Option<&str>,
     ) -> Result<Forked, ApiError> {
-        let (bearer, biscuit) = auth.split();
-        let mut req = json!({ "biscuit": biscuit.unwrap_or_default() });
+        let mut req = json!({ "biscuit": biscuit_b64 });
         if let Some(id) = snapshot_id {
             req["snapshot_id"] = json!(id);
         }
@@ -1213,10 +1222,9 @@ impl Client {
             req["name"] = json!(n);
         }
         let body = self
-            .post_auth(
+            .post(
                 &format!("/v1/workspaces/{}/fork", encode_segment(workspace)),
                 req,
-                bearer,
             )
             .await?;
         Ok(Forked {

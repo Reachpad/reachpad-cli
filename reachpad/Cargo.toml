@@ -17,6 +17,15 @@ path = "src/main.rs"
 # Item 13 parity: reach has no hardware path at all; the feature exists so
 # `cargo check -p reach --features hw` compiles like every other bin.
 hw = []
+# The exact-DER pin of the deterministic dev hub certificate, and the
+# `rustls::client::danger::ServerCertVerifier` that implements it
+# (`transport::PinnedCert`). OFF by default, and that is the point: the flag
+# that used to select it (`--quic-dev-pin`) is gone, `Cli::trust` can no longer
+# ask for it, and a certificate-verification override has no business sitting
+# in a binary a user installs from Homebrew or npm. The dev-dependency below
+# is what turns it on for THIS crate's tests, where a hub with a self-signed
+# dev certificate is the subject.
+dev-pin = []
 
 [dependencies]
 proto.workspace = true
@@ -50,8 +59,9 @@ rustls-pemfile.workspace = true
 # TlsTrust postures) the QUIC data path already uses. Workspace-pinned; hub and
 # controld already depend on it, so this adds no crate to the build graph.
 tokio-rustls.workspace = true
-# Regenerates the deterministic pinned dev hub certificate client-side
-# (`--quic-dev-pin`); byte-equality with hub's is pinned by tests/quic_tail.rs.
+# Regenerates the deterministic pinned dev hub certificate client-side, for
+# the `dev-pin` feature above; byte-equality with hub's is pinned by
+# tests/quic_tail.rs. The `--quic-dev-pin` flag that used to reach it is gone.
 rcgen.workspace = true
 # OS-root certificate verification for quic:// to a real hostname. Already
 # in the build graph at this exact version via quinn's default
@@ -60,6 +70,14 @@ rustls-platform-verifier = "0.7"
 blake3.workspace = true
 
 [dev-dependencies]
+# reach depending on reach is not a typo. A dev-dependency on this very
+# package is how Cargo (resolver 2) enables a feature for the TEST build of a
+# crate and for nothing else: `cargo build` / `cargo install` resolve without
+# dev-dependencies and get `dev-pin` off, while `cargo test`, `cargo nextest`
+# and `cargo clippy --all-targets` build the lib with it on. `tests/quic_tail.rs`
+# needs it — it dials a hub holding the deterministic dev certificate — and
+# nothing that ships does.
+reach = { path = ".", features = ["dev-pin"] }
 # `tokio::test(start_paused = true)`: `connect github` waits ten minutes for a
 # ceremony that happens in a browser, and the part worth testing is its pacing
 # — three seconds, longer after a failure it could not read, and a deadline.

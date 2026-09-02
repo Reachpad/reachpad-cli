@@ -26,7 +26,12 @@ use crate::privatefile;
 pub const DEFAULT_PROFILE: &str = "default";
 
 const CONFIG_KEYS: &[&str] = &["endpoint"];
-const CREDENTIAL_KEYS: &[&str] = &["operator_token", "token_id", "token_expires_at_ms"];
+const CREDENTIAL_KEYS: &[&str] = &[
+    "operator_token",
+    "token_id",
+    "token_expires_at_ms",
+    "endpoint_host",
+];
 
 // ---------------------------------------------------------------------------
 // The strict subset
@@ -217,11 +222,27 @@ pub struct Paths {
 
 impl Paths {
     /// The real paths, rooted at `$HOME`.
-    pub fn new(profile: &str) -> Paths {
+    ///
+    /// An unset `HOME` is REFUSED rather than defaulted. It used to fall back
+    /// to `.`, which does not mean "nowhere" — it means the current directory,
+    /// so `auth login` under a cron job, a container entrypoint or a `sudo`
+    /// that dropped the variable wrote `./.config/reachpad/credentials.toml`
+    /// into whatever repository the command happened to run in, and the next
+    /// command in a different directory read no credential and started a fresh
+    /// sign-in. A long-lived operator credential committed to a checkout is
+    /// the worst outcome available here, and the relocation was silent.
+    /// Failing is recoverable in one line; the disclosure is not.
+    pub fn new(profile: &str) -> anyhow::Result<Paths> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        Paths::under(home, profile)
+            .filter(|home| !home.as_os_str().is_empty())
+            .context(
+                "HOME is not set, so there is nowhere to keep your credential. This used to \
+                 fall back to the current directory, which wrote the credential into whatever \
+                 repository you happened to be in. Set HOME, or pass an API key with \
+                 `--api-key env:<VAR>` for the verbs that take one.",
+            )?;
+        Ok(Paths::under(home, profile))
     }
 
     /// The same layout under an explicit home — what the tests drive.
@@ -336,15 +357,70 @@ pub fn save_endpoint(paths: &Paths, endpoint: &str) -> anyhow::Result<()> {
 
 /// The long-lived operator credential from reachpad.dev/connect, plus what the
 /// server told us about the row it belongs to (`auth logout` revokes exactly
-/// that row).
+/// that row) and the host that issued it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credential {
     pub operator_token: String,
     pub token_id: Option<String>,
     pub expires_at_ms: Option<u64>,
+    /// The control-plane HOST this credential was signed in against.
+    ///
+    /// Without it a stored credential was portable to any endpoint BY
+    /// CONSTRUCTION: nothing on disk said where it came from, so nothing could
+    /// refuse to send it somewhere else. `None` is a record written before this
+    /// field existed — see [`Credential::check_endpoint`] for what that costs.
+    ///
+    /// The host, not the authority: the port a dev controld listens on is not
+    /// a trust boundary, and a laptop that moves between `127.0.0.1:7401` and
+    /// `127.0.0.1:9001` is still talking to itself.
+    pub endpoint_host: Option<String>,
+}
+
+/// What [`Credential::check_endpoint`] found. The caller decides what a
+/// warning costs; only [`Binding::Foreign`] is a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Binding {
+    /// Bound to this host, or bound to no host because the endpoint is
+    /// loopback — this machine talking to itself.
+    Ok,
+    /// A record written before `endpoint_host` existed. Degraded to a warning
+    /// on purpose: hard-failing would sign every existing laptop out on
+    /// upgrade, in the name of a binding that laptop never had a chance to
+    /// write. It carries the sentence to print and the re-auth prompt.
+    Unbound,
+    /// Bound to a DIFFERENT host than the one this command is aimed at. This
+    /// is the case the field exists for and it is always a refusal.
+    Foreign { stored_host: String },
 }
 
 impl Credential {
+    /// Refuse to hand this credential to a host other than the one that issued
+    /// it.
+    ///
+    /// The bearer header is the whole attack surface: an `rpop1` credential is
+    /// the account's root secret, it is long-lived, and every control call
+    /// attaches it. Pinning `--endpoint` to Reachpad DNS closes the arbitrary
+    /// -host hole; this closes the one inside it, where a credential minted
+    /// against one fleet host is replayed against another.
+    ///
+    /// Loopback is exempt in both directions. A dev controld is this machine,
+    /// the port it listens on is ephemeral in every integration test, and a
+    /// binding that changes on every `cargo nextest run` would teach people to
+    /// ignore the warning.
+    pub fn check_endpoint(&self, endpoint_host: &str) -> Binding {
+        let endpoint_host = endpoint_host.trim();
+        match self.endpoint_host.as_deref().map(str::trim) {
+            None | Some("") => Binding::Unbound,
+            Some(stored) if stored.eq_ignore_ascii_case(endpoint_host) => Binding::Ok,
+            Some(stored) if is_loopback_host(stored) && is_loopback_host(endpoint_host) => {
+                Binding::Ok
+            }
+            Some(stored) => Binding::Foreign {
+                stored_host: stored.to_owned(),
+            },
+        }
+    }
+
     /// Carrier 1: `Authorization: Bearer` — every route but the three below.
     pub fn bearer(&self) -> &str {
         &self.operator_token
@@ -397,7 +473,26 @@ pub fn load_credential(paths: &Paths, now_ms: u64) -> anyhow::Result<Stored> {
         operator_token: operator_token.trim().to_owned(),
         token_id: doc.get(&section, "token_id").map(str::to_owned),
         expires_at_ms,
+        endpoint_host: doc
+            .get(&section, "endpoint_host")
+            .map(|host| host.trim().to_owned())
+            .filter(|host| !host.is_empty()),
     }))
+}
+
+/// The three names that mean "this machine", matched literally. No DNS
+/// resolution, for the same reason [`crate::http_min::Endpoint::is_loopback`]
+/// does none: a name that merely *resolves* to 127.0.0.1 today must not be
+/// able to pass itself off as loopback tomorrow.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// Write this profile's credential, REPLACING what was there.
@@ -419,6 +514,9 @@ pub fn save_credential(paths: &Paths, credential: &Credential) -> anyhow::Result
     }
     if let Some(expires_at_ms) = credential.expires_at_ms {
         doc.set(&section, "token_expires_at_ms", &expires_at_ms.to_string())?;
+    }
+    if let Some(host) = &credential.endpoint_host {
+        doc.set(&section, "endpoint_host", host.trim())?;
     }
     privatefile::write(&path, doc.render().as_bytes())
 }
@@ -555,6 +653,7 @@ mod tests {
                 operator_token: "rpop1.default".into(),
                 token_id: Some("tok-1".into()),
                 expires_at_ms: Some(5_000),
+                endpoint_host: Some("m1.reachpad.dev".into()),
             },
         )
         .unwrap();
@@ -564,6 +663,7 @@ mod tests {
                 operator_token: "rpop1.staging".into(),
                 token_id: None,
                 expires_at_ms: None,
+                endpoint_host: Some("staging.reachpad.dev".into()),
             },
         )
         .unwrap();
@@ -582,6 +682,7 @@ mod tests {
         assert_eq!(c.bearer(), "rpop1.default");
         assert_eq!(c.body_value(), c.bearer());
         assert_eq!(c.token_id.as_deref(), Some("tok-1"));
+        assert_eq!(c.endpoint_host.as_deref(), Some("m1.reachpad.dev"));
 
         // Logging out of one profile leaves the other's credential and both
         // endpoints untouched.
@@ -598,6 +699,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A stored credential used to be portable to any endpoint BY
+    /// CONSTRUCTION: the record held a token, an id and an expiry, and nothing
+    /// that said where it came from — so nothing could refuse to send it
+    /// somewhere else. The `rpop1` credential is the account's root secret and
+    /// it is long-lived, so one delivery to the wrong host is permanent.
+    #[test]
+    fn a_credential_is_refused_against_an_endpoint_it_was_not_issued_for() {
+        let bound = |host: Option<&str>| Credential {
+            operator_token: "rpop1.id.secret".into(),
+            token_id: None,
+            expires_at_ms: None,
+            endpoint_host: host.map(str::to_owned),
+        };
+
+        assert_eq!(
+            bound(Some("m1.reachpad.dev")).check_endpoint("m1.reachpad.dev"),
+            Binding::Ok
+        );
+        // Hostnames are case-insensitive; a credential is not re-issued
+        // because someone typed the endpoint in capitals.
+        assert_eq!(
+            bound(Some("M1.Reachpad.Dev")).check_endpoint("m1.reachpad.dev"),
+            Binding::Ok
+        );
+        // The case the field exists for.
+        assert_eq!(
+            bound(Some("m1.reachpad.dev")).check_endpoint("m2.reachpad.dev"),
+            Binding::Foreign {
+                stored_host: "m1.reachpad.dev".to_owned()
+            }
+        );
+        // And a same-account sibling is still a different host: this is not a
+        // "reachpad.dev or not" check, which is what `--endpoint` already does.
+        assert_eq!(
+            bound(Some("m1.reachpad.dev")).check_endpoint("staging.reachpad.dev"),
+            Binding::Foreign {
+                stored_host: "m1.reachpad.dev".to_owned()
+            }
+        );
+
+        // Loopback is this machine whichever spelling and whichever port, and
+        // an integration test gets a new ephemeral port every run. A binding
+        // that broke on that would only teach people to ignore it.
+        assert_eq!(
+            bound(Some("127.0.0.1")).check_endpoint("localhost"),
+            Binding::Ok
+        );
+        assert_eq!(bound(Some("::1")).check_endpoint("127.0.0.1"), Binding::Ok);
+        // But loopback is not a wildcard in either direction.
+        assert_eq!(
+            bound(Some("127.0.0.1")).check_endpoint("m1.reachpad.dev"),
+            Binding::Foreign {
+                stored_host: "127.0.0.1".to_owned()
+            }
+        );
+
+        // A record written before the field existed. A warning and a re-auth
+        // prompt, NEVER a refusal: hard-failing here would sign out every
+        // laptop on upgrade over a binding it never had a chance to write.
+        assert_eq!(
+            bound(None).check_endpoint("m1.reachpad.dev"),
+            Binding::Unbound
+        );
+        assert_eq!(
+            bound(Some("  ")).check_endpoint("m1.reachpad.dev"),
+            Binding::Unbound
+        );
+    }
+
+    /// The binding is worth nothing if it does not survive the file. It is
+    /// written by `auth login` and read back by every command after it.
+    #[test]
+    fn the_endpoint_binding_round_trips_through_the_file() {
+        let dir = scratch("binding");
+        let paths = Paths::under(&dir, DEFAULT_PROFILE);
+        save_credential(
+            &paths,
+            &Credential {
+                operator_token: "rpop1.id.secret".into(),
+                token_id: None,
+                expires_at_ms: None,
+                endpoint_host: Some("m1.reachpad.dev".into()),
+            },
+        )
+        .unwrap();
+        let Stored::Present(c) = load_credential(&paths, 1).unwrap() else {
+            panic!("the credential is present");
+        };
+        assert_eq!(c.endpoint_host.as_deref(), Some("m1.reachpad.dev"));
+        assert_eq!(
+            c.check_endpoint("evil.example.com"),
+            Binding::Foreign {
+                stored_host: "m1.reachpad.dev".to_owned()
+            }
+        );
+
+        // A file written before the field existed still loads — the parser
+        // refuses keys it does not know, so the reverse direction is what
+        // would break, and it does not.
+        privatefile::write(
+            &paths.credentials_file(),
+            b"[profile.default]\noperator_token = \"rpop1.old.secret\"\n",
+        )
+        .unwrap();
+        let Stored::Present(c) = load_credential(&paths, 1).unwrap() else {
+            panic!("a pre-binding credential still loads");
+        };
+        assert_eq!(c.endpoint_host, None);
+        assert_eq!(c.check_endpoint("m1.reachpad.dev"), Binding::Unbound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `HOME` unset used to fall back to `.`, which is not "nowhere" — it is
+    /// the current directory, so `auth login` under a cron job or a container
+    /// entrypoint wrote the account's long-lived credential into whatever
+    /// repository the command ran in, and the next command in another
+    /// directory found no credential and started a fresh sign-in.
+    #[test]
+    fn an_unset_home_refuses_rather_than_writing_the_credential_into_the_cwd() {
+        // Every test is its own process under nextest, which is how this
+        // workspace runs them — the same assumption `tests/common` makes when
+        // it sets `HOME` for a scratch home.
+        let restore = std::env::var_os("HOME");
+        std::env::remove_var("HOME");
+        let refused = Paths::new(DEFAULT_PROFILE);
+        std::env::set_var("HOME", "");
+        let empty = Paths::new(DEFAULT_PROFILE);
+        if let Some(home) = restore {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        let message = refused.expect_err("an unset HOME is refused").to_string();
+        assert!(message.contains("HOME is not set"), "{message}");
+        assert!(
+            empty.is_err(),
+            "an empty HOME is the same nowhere as an unset one"
+        );
+    }
+
     #[test]
     fn expiry_fails_closed() {
         let dir = scratch("expiry");
@@ -608,6 +850,7 @@ mod tests {
                 operator_token: "rpop1.x".into(),
                 token_id: None,
                 expires_at_ms: Some(1_000),
+                endpoint_host: None,
             },
         )
         .unwrap();
@@ -637,6 +880,7 @@ mod tests {
                 operator_token: "rpop1.first".into(),
                 token_id: Some("tok-first".into()),
                 expires_at_ms: Some(9_000),
+                endpoint_host: Some("first.reachpad.dev".into()),
             },
         )
         .unwrap();
@@ -646,6 +890,7 @@ mod tests {
                 operator_token: "rpop1.second".into(),
                 token_id: None,
                 expires_at_ms: None,
+                endpoint_host: None,
             },
         )
         .unwrap();
@@ -656,9 +901,15 @@ mod tests {
         assert_eq!(c.bearer(), "rpop1.second");
         assert_eq!(c.token_id, None, "the first credential's id is gone");
         assert_eq!(c.expires_at_ms, None);
+        assert_eq!(
+            c.endpoint_host, None,
+            "the first credential's endpoint binding is gone too — a merge would leave the \
+             new credential looking bound to the old host"
+        );
         let text = std::fs::read_to_string(paths.credentials_file()).unwrap();
         assert!(!text.contains("tok-first"), "{text}");
         assert!(!text.contains("9000"), "{text}");
+        assert!(!text.contains("first.reachpad.dev"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

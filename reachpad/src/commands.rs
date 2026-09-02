@@ -7,7 +7,6 @@
 //! that one decision, never a second code path.
 
 use std::io::IsTerminal as _;
-use std::io::Write as _;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -74,8 +73,9 @@ pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
         }
     };
     // The endpoint a login saved is resolved inside `Ctx::new` (conf.rs
-    // `[endpoint]`), not here: `--endpoint` on the command line, then
-    // REACHPAD_ENDPOINT, then the saved one, then the production default.
+    // `[endpoint]`), not here: `--endpoint` on the command line, then the
+    // saved one, then the production default. There is deliberately no
+    // environment variable in that list — see `Cli::endpoint`.
     let mut cli = cli;
     let Some(command) = cli.command.take() else {
         // No verb is not a usage error on a terminal: it is a person who has
@@ -149,7 +149,7 @@ impl Ctx {
         command: &Command,
         tolerate_unreadable_config: bool,
     ) -> Result<Ctx, CliError> {
-        let paths = conf::Paths::new(&cli.profile);
+        let paths = conf::Paths::new(&cli.profile)?;
         match state::migrate_v0_files(&paths, now_ms()) {
             Ok(Some(line)) => eprintln!("reachpad: {line}"),
             Ok(None) => {}
@@ -165,7 +165,11 @@ impl Ctx {
             Err(e) => return Err(e.into()),
         };
         let endpoint = cli.endpoint(config.endpoint.as_deref());
-        let planes = cli.planes(&endpoint);
+        // Fallible, and raised HERE rather than at the first call: this is the
+        // line before a `Ctx` exists, and a `Ctx` is what every credential
+        // hangs off. A refused endpoint therefore cannot reach anything that
+        // could attach a bearer header to it.
+        let planes = cli.planes(&endpoint)?;
         let api_key = match &cli.api_key {
             Some(value) => Some(conf::read_secret_arg("--api-key", value)?),
             None => None,
@@ -197,15 +201,30 @@ impl Ctx {
     /// The two planes for an endpoint other than this command's own — the one
     /// a WorkOS sign-in just named. `--controld`/`--hub` still win, exactly as
     /// they do for [`Ctx::new`].
-    fn planes_for(&self, endpoint: &str) -> cli::Planes {
+    fn planes_for(&self, endpoint: &str) -> Result<cli::Planes, CliError> {
         if endpoint == self.endpoint {
-            return cli::Planes {
+            return Ok(cli::Planes {
                 controld: self.controld.clone(),
                 hub: self.hub.clone(),
-            };
+            });
         }
         let (controld, hub) = self.plane_overrides.clone();
-        cli::planes_from(endpoint, controld, hub)
+        // The endpoint a sign-in exchange named is a value from the network.
+        // It goes through the same allowlist as one typed on the command line,
+        // and it goes through it BEFORE `save_login` presents the credential
+        // to it.
+        Ok(cli::planes_from(endpoint, controld, hub)?)
+    }
+
+    /// The control-plane HOST this command is aimed at — the one a stored
+    /// credential is checked against ([`conf::Credential::check_endpoint`]).
+    /// Derived from `controld`, not from `endpoint`, because `--controld` can
+    /// point somewhere else and the host that receives the credential is the
+    /// only one worth comparing.
+    fn endpoint_host(&self) -> String {
+        crate::http_min::parse_url(&self.controld)
+            .map(|endpoint| endpoint.host)
+            .unwrap_or_else(|_| self.endpoint.clone())
     }
 
     /// The workspace this command acts on: the argument, else `-w` /
@@ -324,7 +343,10 @@ impl Ctx {
     pub(crate) fn credential(&self) -> Result<conf::Credential, CliError> {
         self.deny_api_key()?;
         match conf::load_credential(&self.paths, now_ms())? {
-            conf::Stored::Present(c) => Ok(c),
+            conf::Stored::Present(c) => {
+                state::bind_to_endpoint(&c, &self.endpoint_host())?;
+                Ok(c)
+            }
             conf::Stored::Missing => Err(CliError::from_code("no_credential", None)),
             conf::Stored::Expired => Err(CliError::from_code("operator_token_expired", None)),
         }
@@ -522,18 +544,14 @@ async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
             // file is the whole use, and `--json` has nothing to say about a
             // shell script.
             //
-            // Generated into a buffer first: clap_complete panics on a write
-            // error, and `reachpad completions zsh | head` closes the pipe
-            // early. A closed pipe on this path is the reader saying "enough",
-            // not a failure.
+            // Generated into memory first, because clap_complete writes with
+            // an `.expect()`: handed fd 1 directly it panics the moment the
+            // reader hangs up, which is what `completions bash | head` did
+            // (issue #56). A `Vec<u8>` cannot fail, and the one write that
+            // can goes through `out` like every other line.
             let mut script = Vec::new();
             clap_complete::generate(generator, &mut Cli::command(), "reachpad", &mut script);
-            use std::io::Write as _;
-            match std::io::stdout().write_all(&script) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-                Err(e) => return Err(CliError::usage(format!("cannot write completions: {e}"))),
-            }
+            crate::out::out_bytes(&script);
             Ok(EXIT_OK)
         }
         Command::Ws(ws) => run_ws(ctx, ws).await,
@@ -1186,10 +1204,8 @@ async fn fork(
             "--name names one workspace; with --count the server names them.",
         ));
     }
-    // Either carrier: `--api-key` when one was passed (documented for fork
-    // since v1, silently ignored until 2026-08-31), the workspace's own
-    // token otherwise.
-    let held = ctx.authority(&workspace).await?;
+    let biscuit = ctx.biscuit(&workspace).await?;
+    let held = Held::Biscuit(biscuit);
     let client = ctx.client();
 
     // ONE snapshot for all N children: resolved here, so a fan-out cannot
@@ -1206,13 +1222,11 @@ async fn fork(
     let mut children = Vec::new();
     let mut rows = Vec::new();
     for _ in 0..count {
+        let Held::Biscuit(biscuit) = &held else {
+            unreachable!("fork presents the workspace's own token");
+        };
         let forked = match client
-            .fork(
-                &workspace,
-                held.auth(),
-                snapshot.as_deref(),
-                name.as_deref(),
-            )
+            .fork(&workspace, biscuit, snapshot.as_deref(), name.as_deref())
             .await
         {
             Ok(forked) => forked,
@@ -1353,11 +1367,9 @@ async fn run_command(ctx: &Ctx, spec: RunSpec) -> Result<i32, CliError> {
             // cannot un-merge them, and this is the last place they could be.
             ExecItem::Out { fd, bytes } if !json => {
                 if fd == 2 {
-                    let _ = std::io::stderr().write_all(bytes);
-                    let _ = std::io::stderr().flush();
+                    crate::out::err_bytes(bytes);
                 } else {
-                    let _ = std::io::stdout().write_all(bytes);
-                    let _ = std::io::stdout().flush();
+                    crate::out::out_bytes(bytes);
                 }
             }
             ExecItem::Out { fd, bytes } => {
@@ -1614,18 +1626,26 @@ async fn save_login(
     endpoint: String,
     email: Option<String>,
 ) -> Result<i32, CliError> {
-    let planes = ctx.planes_for(&endpoint);
+    let planes = ctx.planes_for(&endpoint)?;
     let client = Client::with_trust(&planes.controld, ctx.trust.clone());
     let session = client
         .operator_session(&credential)
         .await
         .map_err(|e| CliError::from_api(&e, None))?;
+    // The host that just accepted the credential is the host it is stored
+    // against, and the ONE place a binding is ever written. Taken from the URL
+    // that answered rather than from `endpoint`, so what is recorded is what
+    // was actually dialled — `--controld` included.
+    let endpoint_host = crate::http_min::parse_url(&planes.controld)
+        .map(|control| control.host)
+        .map_err(CliError::from)?;
     conf::save_credential(
         &ctx.paths,
         &conf::Credential {
             operator_token: credential,
             token_id: session.token_id.clone(),
             expires_at_ms: session.token_expires_at_ms,
+            endpoint_host: Some(endpoint_host),
         },
     )?;
     conf::save_endpoint(&ctx.paths, &endpoint)?;
@@ -1747,7 +1767,23 @@ async fn logout(ctx: &Ctx, all: bool) -> Result<i32, CliError> {
     let mut revoked: Vec<String> = Vec::new();
     let mut note = None;
     let mut failure: Option<CliError> = None;
-    if let conf::Stored::Present(credential) = &stored {
+    // The third door on the operator credential, and it does not go through
+    // `Ctx::credential` — the local half has to run even when the credential
+    // cannot be read as usable. So the endpoint binding is checked here, by
+    // hand: a credential bound to another endpoint is not put on the wire,
+    // not even to revoke it, and especially not to revoke it (a revoke
+    // presents the secret to the host it is aimed at). The local files still
+    // go, which is this function's first rule, and the nonzero exit says the
+    // server-side half did not happen.
+    let bound = match &stored {
+        conf::Stored::Present(credential) => {
+            state::bind_to_endpoint(credential, &ctx.endpoint_host())
+        }
+        _ => Ok(()),
+    };
+    if let Err(e) = bound {
+        failure = Some(e);
+    } else if let conf::Stored::Present(credential) = &stored {
         let client = ctx.client();
         let own = credential.token_id.clone();
         let mut others: Vec<String> = Vec::new();

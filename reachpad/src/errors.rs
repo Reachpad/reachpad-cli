@@ -100,6 +100,21 @@ pub const TABLE: &[Row] = &[
         exit_code: EXIT_CREDENTIAL,
         retriable: Retriable::No,
     },
+    // Decided on this machine, never sent by a server. The stored credential
+    // names the host that issued it, and this command is aimed at a different
+    // one — so the bearer header is not attached and the call is not made.
+    // Refusing rather than warning is the whole point: an `rpop1` credential
+    // is the account's root secret and it is long-lived, so one delivery to
+    // the wrong host is permanent.
+    Row {
+        code: "credential_endpoint_mismatch",
+        selector: None,
+        sentence: "Your saved credential belongs to a different endpoint, so it was not sent. Run `reachpad auth login` against the endpoint you meant, or drop `--endpoint` / `--controld`.",
+        numbers: Some("It was issued for {stored_host}; this command is aimed at {endpoint_host}."),
+        next_command: Some(SIGN_IN),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
     Row {
         code: "no_identity_token",
         selector: None,
@@ -247,16 +262,16 @@ pub const TABLE: &[Row] = &[
         retriable: Retriable::No,
     },
     Row {
-        // The ports verbs, which is where this refusal is most likely to be
-        // read by somebody automating. `--role owner` is the honest advice
-        // and it is not the whole story: there is no role between
-        // `collaborator` and `owner`, so the key that may publish a port is
-        // also the key that may archive the workspace. Saying so here is not
-        // a fix — the roles are a frozen lattice (§7.4) and a narrower one
-        // needs an ADR — but it stops the remedy reading as free.
+        // The ports verbs. This used to advise `--role owner` and warn that an
+        // owner key can also archive the workspace, because there was no
+        // narrower role. ADR-0106 made the authority depend on the CARRIER
+        // rather than adding a rung: a key needs `write`, so `collaborator` —
+        // the mint default — now publishes a port. What is left to refuse is a
+        // `viewer` key, which carries `read` only, and a share Biscuit, which
+        // may belong to someone the workspace was merely shared WITH.
         code: "not_owner_port_share",
         selector: None,
-        sentence: "Opening or listing a port on {workspace} needs owner access: a link is a capability, and so is the list of them. Mint the key with `--role owner` — noting that an owner key can also archive this workspace, because there is no narrower role today.",
+        sentence: "This credential cannot open or list a port on {workspace}: a link is a capability, and so is the list of them. A `viewer` key can only read — mint one with `--role collaborator`. If you reached this workspace through a share rather than owning it, only its owner can publish a port on it.",
         numbers: None,
         next_command: None,
         exit_code: EXIT_CREDENTIAL,
@@ -343,15 +358,6 @@ pub const TABLE: &[Row] = &[
         code: "api_key_out_of_scope",
         selector: None,
         sentence: "That API key does not cover {workspace}. Mint one that names it: `reachpad keys mint --workspace {workspace}`.",
-        numbers: None,
-        next_command: Some("reachpad keys mint"),
-        exit_code: EXIT_CREDENTIAL,
-        retriable: Retriable::No,
-    },
-    Row {
-        code: "api_key_scoped_cannot_fork",
-        selector: None,
-        sentence: "A workspace-scoped key cannot fork: the child would be outside its scope. Mint an account-wide key (`reachpad keys mint` with no `--workspace`) or use your signed-in credential.",
         numbers: None,
         next_command: Some("reachpad keys mint"),
         exit_code: EXIT_CREDENTIAL,

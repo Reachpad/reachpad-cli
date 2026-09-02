@@ -708,6 +708,34 @@ pub struct Verified {
     /// plus every attenuation) can actually do right now, which is at most
     /// the authority role and shrinks with each attenuation.
     pub role_effective: Role,
+    /// The whole chain's *effective* expiry in epoch milliseconds — the first
+    /// instant at which this token stops authorizing anything. Like
+    /// [`Self::role_effective`] it is the MINIMUM over the authority block and
+    /// every appended block, so it shrinks with each attenuation and can never
+    /// exceed the `exp` the root-signed authority block carries.
+    ///
+    /// # Why this is on the struct at all
+    ///
+    /// A route that re-mints a credential from a presented one has to clamp
+    /// the new token to what the presented CHAIN was actually worth, and
+    /// until this field existed it structurally could not: `Verified` handed
+    /// back the principal and the role and dropped the expiry on the floor.
+    /// `attach` did exactly that — it re-minted the presented share token as a
+    /// fresh authority-block token at `now + BISCUIT_TTL_MS`, discarding the
+    /// attenuation block that carried the owner's `expires_at_ms`, so a
+    /// collaborator whose share had ended re-attached hourly forever (trap
+    /// 81). The fix is a `min`, and a `min` needs both numbers.
+    ///
+    /// # It is a floor, never an optimistic guess
+    ///
+    /// The datalog is still the authority on whether the token verifies; this
+    /// is a restatement of the expiry checks for callers that must reason
+    /// about the chain's remaining life. An appended block whose time check is
+    /// not in the canonical `check if time($t), $t < <ms>` shape (the only
+    /// shape [`attenuate`] emits) cannot be restated, so it reads as `now_ms`
+    /// — no remaining life at all. That can only make a re-mint SHORTER, and
+    /// short is the direction a credential is allowed to be wrong in.
+    pub expires_at_ms: u64,
 }
 
 /// The outcome of a successful [`verify_node_token`] (ADR-0021).
@@ -1064,7 +1092,10 @@ pub fn attenuate(
 /// generation, not a workspace capability, and it must authorize *nothing*
 /// through this path. See [`verify_node_token`] for the other direction.
 ///
-/// On success returns the token's principal and effective role. Signature or
+/// On success returns the token's principal, effective role and the whole
+/// chain's effective expiry — the last of which is what lets a route that
+/// re-mints from a presented token clamp the new one to the presented one's
+/// remaining life instead of laundering it into a fresh hour. Signature or
 /// parse failures return [`Error::Token`]; failed
 /// authorization (expiry, workspace mismatch, insufficient role,
 /// principal-binding violation) and non-conforming token shape (see
@@ -1168,9 +1199,87 @@ fn authorize_verified(
         Role::Harness
     };
 
+    // Effective expiry, on the same "minimum over the whole chain" rule as
+    // the role. The authority `exp` is a FACT, read through the same
+    // {authority, authorizer} query scope everything else here uses, so an
+    // appended `exp` fact is invisible and cannot widen it. Appended blocks
+    // carry checks, never facts, so their bounds are read out of the printed
+    // datalog — the same `print_block_source` the structural gate above
+    // already trusts, on blocks it has already forced into a bounded,
+    // checks-only, inert-symbol shape.
+    let expires_at_ms = effective_expiry_ms(biscuit, &mut authorizer, now, &budget)?;
+
     Ok(Verified {
         principal,
         role_effective,
+        expires_at_ms,
+    })
+}
+
+/// The first instant at which `biscuit` stops authorizing anything: the
+/// minimum of the authority block's `exp` fact and every appended block's time
+/// bound.
+///
+/// The authority `exp` is **mandatory**. Every user-facing token this crate
+/// mints carries one ([`mint`], [`mint_harness`]), the authority block is
+/// root-signed, and a chain whose expiry cannot be read is a chain no caller
+/// can safely re-mint from — so its absence is [`Error::Denied`], not a
+/// permissive `None`.
+fn effective_expiry_ms(
+    biscuit: &Biscuit,
+    authorizer: &mut Authorizer,
+    now: i64,
+    budget: &Budget,
+) -> Result<u64, Error> {
+    let mut floor = query_authority_u64(authorizer, "exp", budget)?;
+    let now_ms = u64::try_from(now).unwrap_or(0);
+    for index in 1..biscuit.block_count() {
+        let source = biscuit
+            .print_block_source(index)
+            .map_err(|e| Error::Denied(format!("block {index} is unreadable: {e}")))?;
+        for statement in top_level_statements(&source) {
+            if !statement.contains("time(") {
+                continue;
+            }
+            // Unreadable means "expires now": see `Verified::expires_at_ms`.
+            // The alternative — ignoring a bound we cannot restate — would
+            // report a LONGER life than the chain has, which is the one
+            // direction this number must never be wrong in.
+            floor = floor.min(time_check_bound_ms(statement).unwrap_or(now_ms));
+        }
+    }
+    Ok(floor)
+}
+
+/// The expiry a printed `check if time($t), $t < <ms>` imposes, or `None` for
+/// any other statement mentioning `time`.
+///
+/// Deliberately exact rather than permissive. `attenuate` emits exactly one
+/// shape and biscuit's printer round-trips it verbatim (`check if time($t),
+/// $t < 500000`), so anything else came from a hand-built block, and the
+/// honest answer for a constraint this function does not understand is that
+/// it does not understand it. `<=` is accepted as well because it is the one
+/// other way to write the same idea: `$t <= n` still authorizes AT `n`, so the
+/// first instant it refuses is `n + 1`.
+fn time_check_bound_ms(statement: &str) -> Option<u64> {
+    let rest = statement.strip_prefix("check if")?.trim_start();
+    let rest = rest.strip_prefix("time(")?;
+    let (var, rest) = rest.split_once(')')?;
+    let var = var.trim();
+    if !var.starts_with('$') || var.len() < 2 {
+        return None;
+    }
+    let rest = rest.trim_start().strip_prefix(',')?.trim_start();
+    let rest = rest.strip_prefix(var)?.trim_start();
+    let (inclusive, digits) = match rest.strip_prefix("<=") {
+        Some(d) => (true, d),
+        None => (false, rest.strip_prefix('<')?),
+    };
+    let bound = u64::try_from(digits.trim().parse::<i64>().ok()?).ok()?;
+    Some(if inclusive {
+        bound.saturating_add(1)
+    } else {
+        bound
     })
 }
 

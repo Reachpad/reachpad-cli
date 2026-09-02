@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::commands::Ctx;
 use crate::errors::{CliError, EXIT_OK};
+use crate::privatefile;
 
 const INSTALLER_URL: &str = "https://reachpad.dev/install";
 
@@ -171,12 +172,34 @@ fn owner(source: InstallSource) -> &'static str {
     }
 }
 
+/// Reserve a private directory under the system temp dir for the installer.
+///
+/// `std::fs::create_dir` alone gave it 0777 masked by the ambient umask —
+/// world-searchable on a default umask, in a directory every user on the
+/// machine can write. What lands in it is a shell script fetched over the
+/// network and then EXECUTED, so anyone able to enter the directory could
+/// replace the script between the download and the `sh`. 0700 makes the race
+/// unreachable rather than merely narrow.
+///
+/// `DirBuilder::mode` for the create, so the directory is never briefly
+/// world-searchable, and [`privatefile::ensure_dir`] after it, because mkdir's
+/// mode is masked by the umask and only `ensure_dir` states 0700 as a fact.
+/// The exclusive create — `create`, not `create_all` — is kept: it is what
+/// makes the reservation a reservation, and it is why an existing directory is
+/// retried under a different name instead of being adopted.
 fn create_scratch_dir() -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt as _;
     let base = std::env::temp_dir();
     for sequence in 0..100_u32 {
         let path = base.join(format!("reachpad-update-{}-{sequence}", std::process::id()));
-        match std::fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
+        match std::fs::DirBuilder::new()
+            .mode(privatefile::DIR_MODE)
+            .create(&path)
+        {
+            Ok(()) => {
+                privatefile::ensure_dir(&path)?;
+                return Ok(path);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(error)
@@ -187,18 +210,31 @@ fn create_scratch_dir() -> anyhow::Result<PathBuf> {
     anyhow::bail!("could not reserve a temporary directory for the update")
 }
 
+/// How the installer is fetched. A named constant because the shape of this
+/// list is a security property, not a formatting choice, and a test asserts it.
+///
+/// `--proto =https` constrains the URL we hand curl. `--proto-redir =https`
+/// constrains where a REDIRECT may take it, and `--location` two lines down is
+/// what makes that reachable: without the pair, one 302 from the installer
+/// host downgraded the fetch to plain `http`, and what comes back is executed
+/// by `sh` in the very next statement. `--fail` so an error page is not
+/// mistaken for a script.
+const CURL_ARGS: &[&str] = &[
+    "--proto",
+    "=https",
+    "--proto-redir",
+    "=https",
+    "--tlsv1.2",
+    "--fail",
+    "--silent",
+    "--show-error",
+    "--location",
+    "--output",
+];
+
 fn run_native_update(installer: &Path, install_dir: &Path) -> anyhow::Result<()> {
     let downloaded = Command::new("curl")
-        .args([
-            "--proto",
-            "=https",
-            "--tlsv1.2",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--output",
-        ])
+        .args(CURL_ARGS)
         .arg(installer)
         .arg(INSTALLER_URL)
         .stdin(Stdio::null())
@@ -315,5 +351,44 @@ mod tests {
         assert!(deferred_to(InstallSource::HomebrewCask)
             .unwrap()
             .starts_with("brew uninstall --cask"));
+    }
+
+    /// The scratch directory holds a shell script that is downloaded and then
+    /// EXECUTED. It used to be created with `std::fs::create_dir` — 0777 masked
+    /// by the ambient umask, i.e. world-searchable on a default umask, inside a
+    /// directory every user on the machine can write. That is a window in which
+    /// another user replaces the script between the fetch and the `sh`.
+    #[test]
+    fn the_update_scratch_directory_is_private_before_anything_lands_in_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = create_scratch_dir().unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            privatefile::DIR_MODE,
+            "{} is mode {mode:o}, not 0700",
+            dir.display()
+        );
+        // And the reservation is still exclusive: a second call cannot be
+        // handed the directory the first one is using.
+        let second = create_scratch_dir().unwrap();
+        assert_ne!(dir, second);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    /// `--location` without `--proto-redir` is a downgrade waiting for a 302:
+    /// curl follows the redirect to `http://`, and the bytes it writes are run
+    /// by `sh` in the next statement. The two flags only mean anything
+    /// together, so they are asserted together.
+    #[test]
+    fn a_redirect_cannot_downgrade_the_installer_fetch_to_plaintext() {
+        let pair = CURL_ARGS
+            .windows(2)
+            .any(|w| w == ["--proto-redir", "=https"]);
+        assert!(pair, "curl is invoked without --proto-redir =https");
+        assert!(CURL_ARGS.windows(2).any(|w| w == ["--proto", "=https"]));
+        assert!(CURL_ARGS.contains(&"--location"));
+        assert!(CURL_ARGS.contains(&"--fail"));
     }
 }

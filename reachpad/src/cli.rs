@@ -11,6 +11,13 @@
 //! planes). Loopback needs `--endpoint http://127.0.0.1:7401`, or the bare
 //! name `localhost`, which expands to the dev listen addresses of controld
 //! (7401) and hub (7420) — plaintext reaches nothing else (`http_min`).
+//!
+//! Every other global flag here takes an `env =`; `--endpoint` does NOT, and
+//! that asymmetry is deliberate. The endpoint names the host this CLI hands
+//! the account's long-lived operator credential to, and `REACHPAD_ENDPOINT`
+//! made one exported variable enough to redirect it. See [`Cli::endpoint`] and
+//! [`planes_from`], which put every endpoint — flag, saved, or returned by a
+//! sign-in — through the one allowlist in `cli_auth`.
 
 use std::path::PathBuf;
 
@@ -36,14 +43,21 @@ pub const DEFAULT_TIMEOUT: &str = "10m";
 pub struct Cli {
     /// The reachpad endpoint: one host, one port (443), both planes.
     /// Defaults to what `auth login` saved, or `m1.reachpad.dev`.
-    #[arg(long, global = true, env = "REACHPAD_ENDPOINT")]
+    ///
+    /// Deliberately NOT readable from an environment variable, and
+    /// `REACHPAD_ENDPOINT` is gone with it. Every control call carries the
+    /// long-lived `rpop1` operator credential on a bearer header, so the host
+    /// this expands to is the host that credential is handed to — and an
+    /// exported variable is the cheapest thing in a workspace for something
+    /// else to set. It is a flag, typed on the command line, and the value is
+    /// still put through [`crate::cli_auth::validate_credential_origin`]
+    /// before a socket opens.
+    #[arg(long, global = true)]
     pub endpoint: Option<String>,
 
     /// An API key (`rpak1.…`) instead of your saved credential, for the verbs
     /// that act on ONE workspace: `status`, `run`, `pause`, `fork`, `archive`,
-    /// `events`, `ports`. `fork` takes an ACCOUNT-WIDE key only (one minted
-    /// with no `--workspace` scope): a scoped key's children would be born
-    /// outside its scope, so the fleet refuses them.
+    /// `events`, `ports`.
     ///
     /// Account-wide verbs — `list`, `budget`, `keys`, `auth` — need your own
     /// credential. They REFUSE a key rather than quietly falling back to
@@ -145,8 +159,10 @@ pub struct Planes {
 }
 
 impl Cli {
-    /// The endpoint in force: the flag or `REACHPAD_ENDPOINT`, else what
-    /// `auth login` saved for this profile, else production.
+    /// The endpoint in force: the `--endpoint` flag, else what `auth login`
+    /// saved for this profile, else production. Only [`Cli::planes`] decides
+    /// whether it names a host this CLI will speak to; this is the choice,
+    /// not the check.
     pub fn endpoint(&self, saved: Option<&str>) -> String {
         self.endpoint
             .clone()
@@ -161,27 +177,46 @@ impl Cli {
     /// HTTPS, data over QUIC, both on 443. A loopback name or an explicit
     /// `http://` URL is the dev shape — plaintext is refused to anything else
     /// before a socket opens, so this can only ever name this machine.
-    pub fn planes(&self, endpoint: &str) -> Planes {
+    pub fn planes(&self, endpoint: &str) -> anyhow::Result<Planes> {
         planes_from(endpoint, self.controld.clone(), self.hub.clone())
     }
 
     /// The TLS trust posture for both planes — one decision, applied to the
     /// control connection and the data connection alike.
+    ///
+    /// `--hub-ca` is the only thing that can narrow it. The dev-certificate
+    /// pin is not reachable from here at all: no flag selects it, and the
+    /// verifier behind it is compiled only under the crate's `dev-pin`
+    /// feature, which no shipped build enables. `..Default::default()` rather
+    /// than a `dev_pin: false` literal because that field does not exist in a
+    /// build without the feature — and a posture nothing can widen is exactly
+    /// what the default should be.
     pub fn trust(&self) -> crate::transport::TlsTrust {
         crate::transport::TlsTrust {
-            dev_pin: false,
             ca_files: self.hub_ca.clone(),
+            ..Default::default()
         }
     }
 }
 
 /// [`Cli::planes`] as a free function, so `auth login` can expand the endpoint
 /// a WorkOS sign-in named without holding the parsed `Cli`.
+///
+/// Both halves are validated before they are returned, and that is what the
+/// return type is for. An endpoint is not a preference: it decides which host
+/// receives the `rpop1` operator credential (control plane) and which one
+/// receives workspace Biscuits (data plane). Whatever reached here — a flag, a
+/// `config.toml` line, the pair a sign-in exchange named — is untrusted until
+/// [`crate::cli_auth::validate_credential_origin`] and
+/// [`crate::cli_auth::validate_hub_url`] have both said yes, so there is no
+/// order of operations in which a credential attaches to an unchecked host.
+/// `--controld` / `--hub` go through the same two calls: a hidden v0.1.0 flag
+/// is not a way around the allowlist.
 pub fn planes_from(
     endpoint: &str,
     controld_override: Option<String>,
     hub_override: Option<String>,
-) -> Planes {
+) -> anyhow::Result<Planes> {
     let endpoint = endpoint.trim().trim_end_matches('/');
     let (controld, hub) = if let Some(rest) = endpoint.strip_prefix("http://") {
         let host = rest.split(':').next().unwrap_or(rest);
@@ -194,10 +229,13 @@ pub fn planes_from(
             (format!("https://{host}"), format!("quic://{host}"))
         }
     };
-    Planes {
+    let planes = Planes {
         controld: controld_override.unwrap_or(controld),
         hub: hub_override.unwrap_or(hub),
-    }
+    };
+    crate::cli_auth::validate_credential_origin(&planes.controld)?;
+    crate::cli_auth::validate_hub_url(&planes.hub)?;
+    Ok(planes)
 }
 
 /// Hosts that mean "this machine", where the dev listen addresses are what an
@@ -972,12 +1010,65 @@ mod tests {
         let cli = parse(&["reachpad", "list"]);
         assert_eq!(cli.endpoint(None), DEFAULT_ENDPOINT);
         assert_eq!(cli.endpoint(Some("saved.example")), "saved.example");
-        let planes = cli.planes(&cli.endpoint(None));
+        let planes = cli.planes(&cli.endpoint(None)).unwrap();
         assert_eq!(planes.controld, "https://m1.reachpad.dev");
         assert_eq!(planes.hub, "quic://m1.reachpad.dev");
         // An explicit flag outranks the saved one.
         let cli = parse(&["reachpad", "--endpoint", "flag.example", "list"]);
         assert_eq!(cli.endpoint(Some("saved.example")), "flag.example");
+    }
+
+    /// The headline defect this file used to carry: `--endpoint` took
+    /// `REACHPAD_ENDPOINT`, expanded ANY host into `https://<host>` with no
+    /// check, and `Ctx::credential` then put the account's `rpop1` credential
+    /// on a bearer header to whatever came out. One exported variable
+    /// exfiltrated the account's root credential.
+    ///
+    /// Two halves, both asserted here: the variable is not read at all, and an
+    /// off-Reachpad host is refused at expansion time — before a `Ctx` exists,
+    /// so before anything can attach a credential to it.
+    #[test]
+    fn an_endpoint_is_pinned_to_reachpad_and_is_not_an_environment_variable() {
+        use clap::CommandFactory as _;
+        // clap would surface an `env =` here; the flag has none, so an
+        // exported value cannot become the endpoint.
+        let endpoint = Cli::command()
+            .get_arguments()
+            .find(|a| a.get_id() == "endpoint")
+            .expect("--endpoint exists")
+            .get_env()
+            .is_some();
+        assert!(
+            !endpoint,
+            "--endpoint must not read an environment variable: it names the host the \
+             operator credential is sent to"
+        );
+
+        let cli = parse(&["reachpad", "list"]);
+        assert!(cli.planes("m1.reachpad.dev").is_ok());
+        assert!(cli.planes("https://staging.reachpad.dev").is_ok());
+        assert!(cli.planes("localhost").is_ok());
+        assert!(cli.planes("http://127.0.0.1:7401").is_ok());
+        for hostile in [
+            "evil.example.com",
+            "https://evil.example.com",
+            // The suffix check is a DNS-label check, not a substring one.
+            "reachpad.dev.evil.example.com",
+            // Plaintext off-box was already refused at connect time; it is
+            // refused here too, before the URL can be handed to anything.
+            "http://m1.reachpad.dev",
+        ] {
+            assert!(
+                cli.planes(hostile).is_err(),
+                "{hostile} must not become an endpoint"
+            );
+        }
+
+        // And the hidden v0.1.0 halves are not a way around it.
+        let cli = parse(&["reachpad", "--controld", "https://evil.example.com", "list"]);
+        assert!(cli.planes("m1.reachpad.dev").is_err());
+        let cli = parse(&["reachpad", "--hub", "ws://evil.example.com/ws", "list"]);
+        assert!(cli.planes("m1.reachpad.dev").is_err());
     }
 
     /// ADR-0040: one host, one port, both planes — and loopback is the one
@@ -986,7 +1077,7 @@ mod tests {
     fn an_endpoint_expands_into_both_planes() {
         let planes = |args: &[&str], endpoint: &str| {
             let cli = parse(args);
-            cli.planes(endpoint)
+            cli.planes(endpoint).unwrap()
         };
         let p = planes(&["reachpad", "list"], "https://m1.reachpad.dev/");
         assert_eq!(p.controld, "https://m1.reachpad.dev");
@@ -1013,7 +1104,11 @@ mod tests {
     fn trust_is_one_decision_for_both_planes() {
         let cli = parse(&["reachpad", "--hub-ca", "/tmp/staging.pem", "list"]);
         let trust = cli.trust();
-        assert!(!trust.dev_pin);
+        // Not `!trust.dev_pin`: that field is gone in a build without the
+        // `dev-pin` feature, which is every build that ships. What the flags
+        // can produce is asserted through `describe`, which reads the same
+        // posture either way.
+        assert!(!trust.describe().contains("DEV ONLY"));
         assert_eq!(trust.ca_files.len(), 1);
         assert_eq!(
             parse(&["reachpad", "list"]).trust().describe(),
