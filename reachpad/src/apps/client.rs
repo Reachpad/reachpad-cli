@@ -414,19 +414,16 @@ impl Apps {
 /// The API's refusal, said the API's way.
 ///
 /// CLI.md is exact about this: print the `message` verbatim and exit 1, except
-/// for 401, where the sentence a person can act on is the one this CLI owns.
+/// for 401, where the sentence a person can act on is the one this CLI owns
+/// and the exit code is the credential one every other half of this CLI uses.
 /// A body with no message at all still names the status, because "it failed" is
 /// not something anyone can do anything with.
 pub fn refuse(status: u16, body: &Value) -> CliError {
     if status == 401 {
         return CliError {
             code: "unauthorized".to_owned(),
-            message: "Run `reachpad login`.".to_owned(),
-            next_command: Some("reachpad login".to_owned()),
-            retriable: false,
             status: Some(status),
-            exit_code: 1,
-            data: None,
+            ..super::not_signed_in("Run `reachpad login`.")
         };
     }
     let code = body["error"].as_str().unwrap_or("request_failed");
@@ -481,10 +478,7 @@ pub async fn bearer(paths: &conf::Paths, now_ms: u64) -> Result<String, CliError
     let credential = match conf::load_credential(paths, now_ms)? {
         conf::Stored::Present(credential) => credential,
         conf::Stored::Missing | conf::Stored::Expired => {
-            return Err(super::failure_next(
-                "Run `reachpad login`.",
-                "reachpad login",
-            ))
+            return Err(super::not_signed_in("Run `reachpad login`."))
         }
     };
     if let Some(access) = credential.workos_access(now_ms) {
@@ -494,10 +488,9 @@ pub async fn bearer(paths: &conf::Paths, now_ms: u64) -> Result<String, CliError
         // The `--operator-token` path: a real Reachpad credential, and no
         // WorkOS session at all. Say which sign-in is missing rather than
         // "unauthorized".
-        return Err(super::failure_next(
+        return Err(super::not_signed_in(
             "This machine signed in with an operator credential, which the apps API does not \
              take. Run `reachpad login` to sign in through your browser.",
-            "reachpad login",
         ));
     };
     let refreshed = match crate::cli_auth::refresh_workos(&session).await {
@@ -511,10 +504,7 @@ pub async fn bearer(paths: &conf::Paths, now_ms: u64) -> Result<String, CliError
             if let Some(access) = reread_access(paths, now_ms, &session) {
                 return Ok(access);
             }
-            return Err(super::failure_next(
-                format!("{e:#} Run `reachpad login`."),
-                "reachpad login",
-            ));
+            return Err(super::not_signed_in(format!("{e:#} Run `reachpad login`.")));
         }
     };
     let access = refreshed.access_token.clone();
@@ -814,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_is_the_servers_sentence_and_exit_one() {
+    fn a_refusal_is_the_servers_sentence_and_a_401_is_the_credential_exit() {
         let error = refuse(
             409,
             &json!({ "error": "slug_taken", "message": "That address is already in use." }),
@@ -824,8 +814,12 @@ mod tests {
         assert_eq!(error.exit_code, 1);
         // 401 is the one sentence this CLI owns, because it names the remedy.
         let unauthorized = refuse(401, &json!({ "error": "x", "message": "Nope." }));
+        assert_eq!(unauthorized.code, "unauthorized");
         assert_eq!(unauthorized.message, "Run `reachpad login`.");
-        assert_eq!(unauthorized.exit_code, 1);
+        assert_eq!(unauthorized.next_command.as_deref(), Some("reachpad login"));
+        // The credential exit code, the same one a workspace verb uses when
+        // nobody is signed in.
+        assert_eq!(unauthorized.exit_code, crate::errors::EXIT_CREDENTIAL);
         // And a body with nothing in it still says the status out loud.
         assert!(refuse(500, &Value::Null).message.contains("500"));
     }

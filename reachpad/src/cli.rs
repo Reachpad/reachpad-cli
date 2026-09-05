@@ -497,7 +497,11 @@ pub enum Command {
         /// The folder. Defaults to the linked project, else this one.
         path: Option<PathBuf>,
         /// A version number. Defaults to the live one.
-        #[arg(long, value_name = "N")]
+        //
+        // `--from` was the v0.5.1 spelling and still parses, hidden: `read`
+        // and `read-version` say `--version`, and one grammar for one idea
+        // beats three verbs spelling it two ways.
+        #[arg(long = "version", alias = "from", value_name = "N")]
         from: Option<u64>,
         /// Overwrite files this folder has changed.
         #[arg(long)]
@@ -516,7 +520,7 @@ pub enum Command {
         /// The file, as it is named in the app.
         file: String,
         /// The version to take it from.
-        #[arg(long, value_name = "N")]
+        #[arg(long = "version", alias = "from", value_name = "N")]
         from: u64,
         /// The folder. Defaults to the linked project, else this one.
         path: Option<PathBuf>,

@@ -125,6 +125,11 @@ pub fn core() -> String {
          name or an id.** The address is the server's to decide, slugs get suffixed when \
          they collide, and a guessed URL is a link that 404s.\n\
          \n\
+         A publish is not always a version that serves. A migration that fails or a secret \
+         nobody has set makes the version FAIL: `publish` prints the reason, exits 1, prints \
+         no `URL:` line, and the app's link keeps serving the previous version. Read the \
+         reason, fix it, and publish again. `reachpad versions` says which version is live.\n\
+         \n\
          ## 5. Sharing, only if asked\n\
          \n\
          New apps are visible to the owner. To widen that:\n\
@@ -271,6 +276,9 @@ mod tests {
             // Apps-only sign-in: the state every reachpad.dev login lands in.
             "Workspaces are not available on this endpoint.",
             "credential: apps",
+            // A publish whose version fails is a failure, not a URL.
+            "makes the version FAIL",
+            "exits 1",
         ] {
             assert!(text.contains(required), "the skill never says {required:?}");
         }

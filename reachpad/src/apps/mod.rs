@@ -67,6 +67,20 @@ pub fn failure_next(message: impl Into<String>, next_command: impl Into<String>)
     }
 }
 
+/// "You are not signed in", from the apps half of the CLI.
+///
+/// One spelling and one exit code across both products: the workspace verbs
+/// have said `reachpad login` and exited [`EXIT_CREDENTIAL`] since the table
+/// in [`crate::errors`] was written, and an apps verb answering the same
+/// question with exit 1 made a caller branch on which half it had asked.
+pub fn not_signed_in(message: impl Into<String>) -> CliError {
+    CliError {
+        exit_code: crate::errors::EXIT_CREDENTIAL,
+        next_command: Some("reachpad login".to_owned()),
+        ..failure(message)
+    }
+}
+
 /// Where `sync` keeps what the tree last agreed with.
 const BASE_FILE: &str = "base.json";
 
@@ -492,7 +506,7 @@ pub(crate) async fn publish(
         .ok_or_else(|| failure("the upload finished without naming a snapshot."))?
         .to_owned();
 
-    let (app, version) = if first {
+    let (app, mut version) = if first {
         let name = name.unwrap_or_else(|| folder_name(&checked.root));
         let mut body = json!({
             "name": name,
@@ -538,24 +552,138 @@ pub(crate) async fn publish(
 
     let number = version["number"].as_u64().unwrap_or(1);
     write_base(&checked.root, number, &checked.files)?;
+
+    // A version that is still building has no verdict yet, and the answer to
+    // "did this go live" is the whole point of the command. Wait for one
+    // rather than printing a URL that may never serve this source.
+    let id = app_id(&app)?.to_owned();
+    if status_of(&version) == Status::Pending {
+        if let Some(settled) = await_verdict(&apps, &id, number).await? {
+            version = settled;
+        }
+    }
+
     let name = app["name"].as_str().unwrap_or("this app").to_owned();
-    let pending = version["status"].as_str() == Some("pending_review");
     let live_url = app["url"].as_str().unwrap_or_default().to_owned();
     let version_url = version["url"].as_str().unwrap_or(&live_url).to_owned();
 
-    let mut lines = vec![format!("Published {name} v{number}")];
-    if pending {
-        lines.push(url_line(&version_url));
-        lines.push(format!(
-            "Awaiting review at {}/apps/{}",
-            site_origin(apps.base()),
-            app_id(&app)?
-        ));
-    } else {
-        lines.push(url_line(&live_url));
-    }
+    // The app record was read before the version settled, so `live_version`
+    // is the number the link served when this publish started — which is the
+    // one a failed version leaves in place.
+    let previous_live = app["live_version"].as_u64().filter(|live| *live != number);
+
+    let lines = match status_of(&version) {
+        Status::Failed => {
+            return Err(version_failed(number, &version, previous_live, &app));
+        }
+        Status::PendingReview => vec![
+            format!("Published {name} v{number}, waiting for review"),
+            url_line(&version_url),
+            format!("Awaiting review at {}/apps/{id}", site_origin(apps.base())),
+        ],
+        Status::Pending => vec![
+            format!("Published {name} v{number}, still building"),
+            url_line(&version_url),
+            format!("`reachpad versions` says whether v{number} went live."),
+        ],
+        Status::Live => vec![format!("Published {name} v{number}"), url_line(&live_url)],
+    };
     ctx.emit(json!({ "app": app, "version": version }), &lines);
     Ok(EXIT_OK)
+}
+
+/// What the server decided about a version. `status` is absent on an apps API
+/// older than this field, and every version that API served was live, so an
+/// unreadable status is [`Status::Live`] rather than a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Live,
+    Failed,
+    PendingReview,
+    Pending,
+}
+
+fn status_of(version: &Value) -> Status {
+    match version["status"].as_str() {
+        Some("failed") => Status::Failed,
+        Some("pending_review") => Status::PendingReview,
+        Some("pending" | "building") => Status::Pending,
+        _ => Status::Live,
+    }
+}
+
+/// How long a build gets to reach a verdict before `publish` reports what it
+/// knows. Short enough that a person is not left staring at a prompt, long
+/// enough that the common build finishes inside it.
+const BUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The first gap, doubled up to [`BUILD_POLL_MAX`] after each read. A build
+/// that finishes quickly is reported quickly, and one that does not costs a
+/// handful of requests rather than one a second for half a minute.
+const BUILD_POLL_FIRST: std::time::Duration = std::time::Duration::from_millis(500);
+const BUILD_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The version row once it stops saying `pending`, or `None` if it never does
+/// inside [`BUILD_WAIT`].
+///
+/// A read that fails is not a verdict and must not become one: the publish
+/// already happened, so a network blip here answers "still building" rather
+/// than "failed".
+async fn await_verdict(apps: &Apps, app: &str, number: u64) -> Result<Option<Value>, CliError> {
+    let deadline = std::time::Instant::now() + BUILD_WAIT;
+    let mut gap = BUILD_POLL_FIRST;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(gap).await;
+        gap = (gap * 2).min(BUILD_POLL_MAX);
+        let Ok(listed) = apps.versions(app, 50).await else {
+            continue;
+        };
+        let found = listed["versions"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["number"].as_u64() == Some(number))
+            })
+            .cloned();
+        match found {
+            Some(row) if status_of(&row) != Status::Pending => return Ok(Some(row)),
+            _ => continue,
+        }
+    }
+    Ok(None)
+}
+
+/// A publish the server accepted and then refused to serve.
+///
+/// The sentence is the server's, verbatim: it names the migration file or the
+/// unset secret, and paraphrasing it would cost the caller the one fact that
+/// says what to fix. The exit code is 1 and `--json` carries the version, so a
+/// caller reads `data.version.failure` instead of the prose.
+fn version_failed(
+    number: u64,
+    version: &Value,
+    previous_live: Option<u64>,
+    app: &Value,
+) -> CliError {
+    let mut message = match version["failure"].as_str().map(str::trim) {
+        Some(failure) if !failure.is_empty() => {
+            format!("v{number} did not go live: {failure}")
+        }
+        _ => format!("v{number} did not go live, and the apps API did not say why."),
+    };
+    // On its own line: the server's sentence ends wherever it ends, and
+    // "…SQLITE_ERROR The link still serves v2." reads as one run-on.
+    if let Some(live) = previous_live {
+        message.push_str(&format!("\nThe link still serves v{live}."));
+    }
+    CliError {
+        code: "version_failed".to_owned(),
+        message,
+        next_command: None,
+        retriable: false,
+        status: None,
+        exit_code: 1,
+        data: Some(json!({ "app": app, "version": version })),
+    }
 }
 
 /// The shape check, not a validator: exactly one `@`, something either side,
@@ -739,6 +867,16 @@ pub(crate) async fn versions(ctx: &Ctx) -> Result<i32, CliError> {
     }
     if rows.is_empty() {
         lines.push("Nothing published yet.".to_owned());
+    }
+    // A pinned version link is served by the preview host, which asks a
+    // browser for a handshake first — so a script that fetches one polls
+    // forever. This is the read that answers from the API instead.
+    if rows.iter().any(|row| status_of(row) != Status::Live) {
+        lines.push(
+            "Read a version that is not live with `reachpad read-version <n>`; its link needs a \
+             browser."
+                .to_owned(),
+        );
     }
     // CLI.md: every remote verb that names an app ends with the one line an
     // agent is told to copy. The per-version links above are not it.
@@ -971,9 +1109,9 @@ pub(crate) async fn sync(
             take_remote.len() + drop_local.len()
         );
     }
-    publish(ctx, path, None, None, message, None, false, None).await?;
+    let code = publish(ctx, path, None, None, message, None, false, None).await?;
     let _ = app;
-    Ok(EXIT_OK)
+    Ok(code)
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,23 +1313,27 @@ pub(crate) async fn secrets_verb(ctx: &Ctx, command: SecretsCommand) -> Result<i
         }
         SecretsCommand::List => {
             let apps = open(ctx).await?;
-            let listed = apps.secrets().await?;
-            // A bare array is the contract. Anything else is a server this
-            // version does not understand, and printing "no secrets yet" for
-            // it would be a lie a person acts on by setting one twice.
-            let rows = listed.as_array().ok_or_else(|| {
-                failure(format!(
-                    "the apps API answered GET /api/secrets with {}, and this verb reads an \
-                     array of secrets.",
-                    shape(&listed)
-                ))
-            })?;
+            let rows = secret_rows(&apps).await?;
             let rows: Vec<Value> = rows.iter().map(secret_json).collect();
             ctx.emit(Value::Array(rows.clone()), &secret_lines(&rows));
         }
         SecretsCommand::Remove { name } => {
             secrets::check_name(&name)?;
             let apps = open(ctx).await?;
+            // The DELETE is idempotent, so the server answers a name that was
+            // never set exactly as it answers one it just removed. Read the
+            // list first: "Removed CLITEST_KEY." for a typo is a person
+            // believing they revoked a key that is still live.
+            let held = secret_rows(&apps).await?;
+            if !held
+                .iter()
+                .any(|row| row["name"].as_str() == Some(name.as_str()))
+            {
+                return Err(failure_next(
+                    format!("No secret named {name}. reachpad secrets list shows what exists."),
+                    "reachpad secrets list",
+                ));
+            }
             let answer = apps.remove_secret(&name).await?;
             let rotation = Rotation::from(&answer);
             let mut lines = vec![format!("Removed {name}.")];
@@ -1253,6 +1395,22 @@ impl Rotation {
     fn json(&self, name: &str) -> Value {
         json!({ "name": name, "rotated": self.updated, "failed": self.failed })
     }
+}
+
+/// Every secret the org has set, as the API sent them.
+///
+/// A bare array is the contract. Anything else is a server this version does
+/// not understand, and printing "no secrets yet" for it would be a lie a
+/// person acts on by setting one twice.
+async fn secret_rows(apps: &Apps) -> Result<Vec<Value>, CliError> {
+    let listed = apps.secrets().await?;
+    listed.as_array().cloned().ok_or_else(|| {
+        failure(format!(
+            "the apps API answered GET /api/secrets with {}, and this verb reads an array \
+                 of secrets.",
+            shape(&listed)
+        ))
+    })
 }
 
 /// One listed secret, rebuilt from the fields this version knows.
@@ -1451,6 +1609,22 @@ pub(crate) async fn mkdir(
     parent: Option<String>,
 ) -> Result<i32, CliError> {
     let apps = open(ctx).await?;
+    // Two folders with one name in one parent are indistinguishable in `ls`,
+    // and nothing downstream can tell a caller which id it wants.
+    let folders = folder_rows(&apps).await?;
+    let parent = match parent {
+        Some(parent) => Some(resolve_folder(&folders, &parent)?),
+        None => None,
+    };
+    if let Some(twin) = folders.iter().find(|row| {
+        row["name"].as_str() == Some(name.as_str())
+            && row["parent_id"].as_str() == parent.as_deref()
+    }) {
+        return Err(failure(format!(
+            "A folder named {name} is already here ({}). Use it or pick another name.",
+            twin["id"].as_str().unwrap_or("?")
+        )));
+    }
     let mut body = json!({ "name": name });
     if let Some(parent) = parent {
         body["parent_id"] = json!(parent);
@@ -1469,11 +1643,12 @@ pub(crate) async fn mkdir(
 
 pub(crate) async fn mv(ctx: &Ctx, what: String, to: String) -> Result<i32, CliError> {
     let apps = open(ctx).await?;
+    let folders = folder_rows(&apps).await?;
     // `/` is the top level, which the API spells as a null parent.
     let destination = if to == "/" || to.is_empty() {
         Value::Null
     } else {
-        json!(to)
+        json!(resolve_folder(&folders, &to)?)
     };
     if what.starts_with("app_") || what.starts_with("https://") || what.starts_with("http://") {
         let app = resolve_target(&apps, &what).await?;
@@ -1490,19 +1665,16 @@ pub(crate) async fn mv(ctx: &Ctx, what: String, to: String) -> Result<i32, CliEr
         );
         return Ok(EXIT_OK);
     }
+    let id = resolve_folder(&folders, &what)?;
     // A folder move carries `base_updated_at`, so a concurrent move is a 409
     // rather than a silent clobber.
-    let folders = apps.folders().await?["folders"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
     let folder = folders
         .iter()
-        .find(|row| row["id"].as_str() == Some(what.as_str()))
+        .find(|row| row["id"].as_str() == Some(id.as_str()))
         .ok_or_else(|| failure(format!("there is no folder {what}.")))?;
     let moved = apps
         .patch_folder(
-            &what,
+            &id,
             &json!({
                 "parent_id": destination,
                 "base_updated_at": folder["updated_at"],
@@ -1522,14 +1694,53 @@ pub(crate) async fn mv(ctx: &Ctx, what: String, to: String) -> Result<i32, CliEr
 
 pub(crate) async fn rmdir(ctx: &Ctx, folder: String) -> Result<i32, CliError> {
     let apps = open(ctx).await?;
-    apps.delete_folder(&folder).await?;
+    let id = resolve_folder(&folder_rows(&apps).await?, &folder)?;
+    apps.delete_folder(&id).await?;
     ctx.emit(
-        json!({ "folder": folder, "removed": true }),
+        json!({ "folder": id, "removed": true }),
         &[format!(
             "Removed the folder {folder}. Nothing inside it was deleted."
         )],
     );
     Ok(EXIT_OK)
+}
+
+/// Every folder in the org, as the API sent them.
+async fn folder_rows(apps: &Apps) -> Result<Vec<Value>, CliError> {
+    Ok(apps.folders().await?["folders"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// The id of the folder a caller named, which may be the id itself or the name
+/// printed beside it by `ls` and `tree`.
+///
+/// An id is tried first and never guessed at: a folder whose NAME is another
+/// folder's id must not shadow it. A name that more than one folder holds is a
+/// question this function refuses to answer, with the ids to choose between,
+/// because picking one would silently delete or move the wrong tree.
+fn resolve_folder(folders: &[Value], named: &str) -> Result<String, CliError> {
+    if folders.iter().any(|row| row["id"].as_str() == Some(named)) {
+        return Ok(named.to_owned());
+    }
+    let matched: Vec<&str> = folders
+        .iter()
+        .filter(|row| row["name"].as_str() == Some(named))
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    match matched.as_slice() {
+        [id] => Ok((*id).to_owned()),
+        [] => Err(failure_next(
+            format!("There is no folder {named}. reachpad tree lists them."),
+            "reachpad tree",
+        )),
+        ids => Err(failure(format!(
+            "{} folders are named {named} ({}). Name the one you mean by id.",
+            ids.len(),
+            ids.join(", ")
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------

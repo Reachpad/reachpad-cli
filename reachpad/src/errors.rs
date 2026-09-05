@@ -70,14 +70,14 @@ pub struct Row {
     pub retriable: Retriable,
 }
 
-const SIGN_IN: &str = "reachpad auth login";
+const SIGN_IN: &str = "reachpad login";
 
 pub const TABLE: &[Row] = &[
     // ---- no credential, in all five spellings the fleet has for it --------
     Row {
         code: "no_credential",
         selector: None,
-        sentence: "Not signed in. Run `reachpad auth login` — get your credential at https://reachpad.dev/connect.",
+        sentence: "Not signed in. Run `reachpad login` — get your credential at https://reachpad.dev/connect.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -94,7 +94,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "api_key_not_accepted",
         selector: None,
-        sentence: "This needs your own credential, not an API key: a key cannot mint or read keys, and cannot answer for the whole account. Drop `--api-key` / `REACHPAD_API_KEY`, or run `reachpad auth login`.",
+        sentence: "This needs your own credential, not an API key: a key cannot mint or read keys, and cannot answer for the whole account. Drop `--api-key` / `REACHPAD_API_KEY`, or run `reachpad login`.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -124,7 +124,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "credential_endpoint_mismatch",
         selector: None,
-        sentence: "Your saved credential belongs to a different endpoint, so it was not sent. Run `reachpad auth login` against the endpoint you meant, or drop `--endpoint` / `--controld`.",
+        sentence: "Your saved credential belongs to a different endpoint, so it was not sent. Run `reachpad login` against the endpoint you meant, or drop `--endpoint` / `--controld`.",
         numbers: Some("It was issued for {stored_host}; this command is aimed at {endpoint_host}."),
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -133,7 +133,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "no_identity_token",
         selector: None,
-        sentence: "Not signed in. Run `reachpad auth login` — get your credential at https://reachpad.dev/connect.",
+        sentence: "Not signed in. Run `reachpad login` — get your credential at https://reachpad.dev/connect.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -142,7 +142,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "no_token",
         selector: None,
-        sentence: "Not signed in. Run `reachpad auth login` — get your credential at https://reachpad.dev/connect.",
+        sentence: "Not signed in. Run `reachpad login` — get your credential at https://reachpad.dev/connect.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -151,7 +151,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "no_operator_token",
         selector: None,
-        sentence: "Not signed in. Run `reachpad auth login` — get your credential at https://reachpad.dev/connect.",
+        sentence: "Not signed in. Run `reachpad login` — get your credential at https://reachpad.dev/connect.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -160,7 +160,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "no_authority",
         selector: None,
-        sentence: "Nothing proved who is asking. Run `reachpad auth login`, or pass an API key with `--api-key env:<VAR>`.",
+        sentence: "Nothing proved who is asking. Run `reachpad login`, or pass an API key with `--api-key env:<VAR>`.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -170,7 +170,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "bad_operator_token",
         selector: None,
-        sentence: "That credential was not accepted. Get a fresh one at https://reachpad.dev/connect and run `reachpad auth login`.",
+        sentence: "That credential was not accepted. Get a fresh one at https://reachpad.dev/connect and run `reachpad login`.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -179,7 +179,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "operator_token_expired",
         selector: None,
-        sentence: "Your credential has expired. Get a fresh one at https://reachpad.dev/connect and run `reachpad auth login`.",
+        sentence: "Your credential has expired. Get a fresh one at https://reachpad.dev/connect and run `reachpad login`.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -188,7 +188,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "operator_token_revoked",
         selector: None,
-        sentence: "Your credential was revoked. Get a new one at https://reachpad.dev/connect and run `reachpad auth login`.",
+        sentence: "Your credential was revoked. Get a new one at https://reachpad.dev/connect and run `reachpad login`.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -215,7 +215,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "not_user_identity",
         selector: None,
-        sentence: "That credential does not identify a user. Run `reachpad auth login`.",
+        sentence: "That credential does not identify a user. Run `reachpad login`.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -270,7 +270,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "not_owner",
         selector: None,
-        sentence: "This needs owner access to {workspace}. Mint the key with `--role owner`, or use the credential from `reachpad auth login`.",
+        sentence: "This needs owner access to {workspace}. Mint the key with `--role owner`, or use the credential from `reachpad login`.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -308,7 +308,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "not_workspace_owner",
         selector: None,
-        sentence: "This needs owner access to {workspace}. Mint the key with `--role owner`, or use the credential from `reachpad auth login`.",
+        sentence: "This needs owner access to {workspace}. Mint the key with `--role owner`, or use the credential from `reachpad login`.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -317,7 +317,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "principal_unknown",
         selector: None,
-        sentence: "That credential does not name anyone this fleet knows. Run `reachpad auth login` again.",
+        sentence: "That credential does not name anyone this fleet knows. Run `reachpad login` again.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -326,7 +326,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "principal_not_of_user",
         selector: None,
-        sentence: "That credential belongs to another account. Run `reachpad auth login` again.",
+        sentence: "That credential belongs to another account. Run `reachpad login` again.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
@@ -335,7 +335,7 @@ pub const TABLE: &[Row] = &[
     Row {
         code: "not_your_user",
         selector: None,
-        sentence: "That credential belongs to another account. Run `reachpad auth login` again.",
+        sentence: "That credential belongs to another account. Run `reachpad login` again.",
         numbers: None,
         next_command: Some(SIGN_IN),
         exit_code: EXIT_CREDENTIAL,
