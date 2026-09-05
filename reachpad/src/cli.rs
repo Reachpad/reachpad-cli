@@ -53,9 +53,9 @@ pub struct Cli {
     /// long-lived `rpop1` operator credential on a bearer header, so the host
     /// this expands to is the host that credential is handed to — and an
     /// exported variable is the cheapest thing in a workspace for something
-    /// else to set. It is a flag, typed on the command line, and the value is
-    /// still put through [`crate::cli_auth::validate_credential_origin`]
-    /// before a socket opens.
+    /// else to set. It is a flag, typed on the command line, and the value
+    /// still has to be reachpad.dev, a `*.reachpad.dev` host on 443, or a
+    /// controld on this machine before a socket opens.
     #[arg(long, global = true)]
     pub endpoint: Option<String>,
 
@@ -459,6 +459,11 @@ pub enum Command {
         path: Option<PathBuf>,
     },
     /// Validate this folder without uploading anything.
+    ///
+    /// `services` takes `db` and `files`, and only a function may name a
+    /// service or a secret. A key this version does not know is kept in
+    /// `reachpad.json` and passed through to the server; `check` names it on
+    /// stderr so a typo is visible.
     Check {
         /// The folder. Defaults to the linked project, else this one.
         path: Option<PathBuf>,

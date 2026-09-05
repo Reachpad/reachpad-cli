@@ -14,7 +14,7 @@
 
 use crate::errors::CliError;
 
-use super::failure;
+use super::{failure, failure_next};
 
 /// The longest name the front door will store.
 pub const MAX_NAME: usize = 64;
@@ -103,9 +103,13 @@ pub async fn read_value(name: &str, arg: Option<&str>) -> Result<String, CliErro
         Some(arg) if arg.starts_with("env:") => {
             let var = &arg[4..];
             let text = std::env::var(var).map_err(|_| {
-                failure(format!(
-                    "the environment variable {var} is not set, so there is no value for {name}."
-                ))
+                failure_next(
+                    format!(
+                        "the environment variable {var} is not set, so there is no value for \
+                         {name}."
+                    ),
+                    format!("reachpad secrets set {name}"),
+                )
             })?;
             chomp(&text)
         }

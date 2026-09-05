@@ -301,7 +301,17 @@ pub fn migrate_v0_files(paths: &Paths, now_ms: u64) -> anyhow::Result<Option<Str
     if stamp.exists() {
         return Ok(None);
     }
-    if !matches!(conf::load_credential(paths, now_ms)?, conf::Stored::Missing) {
+    // Two questions, not one. `load_credential` reports `Missing` both for an
+    // empty store and for a WorkOS record it cannot assemble, since it wants
+    // the access token, the refresh token and the client id together. Asking
+    // it alone would let this function replace a half-written apps sign-in
+    // with a v0.1.0 operator token the apps API does not take. Nothing here
+    // may take a WorkOS key away; only `logout` may.
+    //
+    // `load_credential` first, so an unparsable credentials.toml still refuses
+    // the command here rather than being quietly stamped as migrated.
+    let stored = conf::load_credential(paths, now_ms)?;
+    if !matches!(stored, conf::Stored::Missing) || conf::has_workos_keys(paths) {
         // A v1 credential is on disk, so the migration is over whether or not
         // it was this code that ended it. Say so permanently, before a
         // `logout` empties the store and makes this look like a fresh laptop.
@@ -590,6 +600,65 @@ mod tests {
         );
         assert_eq!(migrate_v0_files(&paths, 1).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A WorkOS record the loader cannot assemble is still a sign-in, and the
+    /// migration must not write over it. `load_credential` wants the access
+    /// token, the refresh token and the client id together and reports
+    /// `Missing` when one is absent, which is the same answer it gives for an
+    /// empty store: so before the `has_workos_keys` guard the stamp was the
+    /// only thing between an apps sign-in and a v0.1.0 operator token, and a
+    /// machine that has never been stamped has no stamp.
+    ///
+    /// The negative control is the released 0.5.0 binary, which has the stamp
+    /// and not the guard: given this fixture and one `reachpad whoami` it
+    /// leaves `credentials.toml` holding one key, `operator_token`. Run
+    /// against the code as it stood one commit ago, each case below fails on
+    /// the `assert_eq!` comparing the file to itself.
+    #[test]
+    fn a_half_written_workos_record_is_not_migrated_over() {
+        for missing in [
+            "workos_access_token",
+            "workos_refresh_token",
+            "workos_client_id",
+        ] {
+            let dir = scratch(&format!("migrate-partial-{missing}"));
+            let paths = Paths::under(&dir, conf::DEFAULT_PROFILE);
+            let old = dir.join(".config").join("reach").join("token");
+            privatefile::write(&old.with_file_name("token.operator"), b"rpop1.v0.old\n").unwrap();
+
+            let kept: Vec<&str> = [
+                "workos_access_token",
+                "workos_refresh_token",
+                "workos_client_id",
+            ]
+            .into_iter()
+            .filter(|key| *key != missing)
+            .collect();
+            let mut text = "[profile.default]\n".to_owned();
+            for key in &kept {
+                text.push_str(&format!("{key} = \"value-of-{key}\"\n"));
+            }
+            privatefile::write(&paths.credentials_file(), text.as_bytes()).unwrap();
+            // The loader cannot make a session out of it, which is exactly the
+            // state the guard used to mistake for an empty store.
+            assert_eq!(
+                conf::load_credential(&paths, 1).unwrap(),
+                conf::Stored::Missing
+            );
+
+            assert_eq!(migrate_v0_files(&paths, 1).unwrap(), None);
+            let after = std::fs::read_to_string(paths.credentials_file()).unwrap();
+            assert_eq!(after, text, "the record changed (missing {missing})");
+            assert!(
+                !after.contains("operator_token"),
+                "a v0 operator token replaced the sign-in (missing {missing})"
+            );
+            // And it is recorded as done, so this is asked once and not on
+            // every command for the life of the machine.
+            assert!(migration_stamp(&paths).exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// The other half: the machine that has genuinely never migrated still

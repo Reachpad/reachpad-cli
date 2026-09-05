@@ -26,6 +26,16 @@ use crate::privatefile;
 pub const DEFAULT_PROFILE: &str = "default";
 
 const CONFIG_KEYS: &[&str] = &["endpoint"];
+/// The four keys one WorkOS sign-in writes. Named once, because
+/// [`has_workos_keys`] has to recognise a record [`load_credential`] cannot
+/// assemble as well as one it can.
+const WORKOS_KEYS: &[&str] = &[
+    "workos_access_token",
+    "workos_refresh_token",
+    "workos_expires_at_ms",
+    "workos_client_id",
+];
+
 const CREDENTIAL_KEYS: &[&str] = &[
     "operator_token",
     "token_id",
@@ -583,6 +593,28 @@ pub fn load_credential(paths: &Paths, now_ms: u64) -> anyhow::Result<Stored> {
         endpoint_host,
         workos,
     }))
+}
+
+/// Whether this profile's credential file holds ANY part of a WorkOS session.
+///
+/// [`load_credential`] needs the access token, the refresh token and the
+/// client id together before it will report a session, and reads a record
+/// missing one of them as `Stored::Missing`: the same answer it gives for an
+/// empty store. That is the right answer for spending a session and the wrong
+/// one for deciding whether a sign-in is there to be overwritten, which is why
+/// the v0.1.0 migration asks this instead (docs/TRAPS.md trap 84).
+///
+/// A file this parser refuses is not a reason to say "no session here": the
+/// caller is about to replace the file, so an unreadable one is treated as
+/// occupied.
+pub fn has_workos_keys(paths: &Paths) -> bool {
+    let Ok(doc) = load_doc(&paths.credentials_file(), CREDENTIAL_KEYS) else {
+        return true;
+    };
+    let section = paths.section();
+    WORKOS_KEYS
+        .iter()
+        .any(|key| doc.get(&section, key).is_some_and(|v| !v.trim().is_empty()))
 }
 
 /// The three names that mean "this machine", matched literally. No DNS

@@ -56,6 +56,94 @@ pub fn validate_apps_origin(url: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// The apps CONTENT domain. Apps moved off `reachpad.dev` to their own
+/// registrable domain on 2026-09-04, so an app's cookies can never be sent to
+/// the webapp's origin (apps-v1 audit finding 4). The front door Worker answers
+/// the whole of `*.reachpad.app`, and on the apex it serves `/healthz`,
+/// `/_rp/internal/*` and `/_rp/upload/<ticket>` and nothing else
+/// (`apps-front-door/README.md` "Hosts", `src/router.ts` `handleApex`).
+pub const APPS_CONTENT_DOMAIN: &str = "reachpad.app";
+
+/// The one path an upload ticket is served on:
+/// `PUT https://reachpad.app/_rp/upload/<ticket>`, where the ticket is
+/// `[a-z0-9]{1,64}` and is the whole capability — the front door takes no
+/// bearer there and spends the ticket on first use
+/// (`apps-front-door/src/router.ts` `handleUpload`, and `createTicket` in
+/// `src/uploads.ts`, which mints the `put_url` as
+/// `https://${APPS_DOMAIN}/_rp/upload/${ticket}`).
+const UPLOAD_PATH_PREFIX: &str = "/_rp/upload/";
+
+/// Where this CLI is willing to PUT a customer's SOURCE.
+///
+/// Deliberately a second, separate check rather than a widening of
+/// [`validate_apps_origin`]: the ticket's host is chosen by the server, and the
+/// two hops are not the same risk. The apps API takes the WorkOS access token,
+/// so its allowlist guards a sign-in. The upload PUT carries no bearer at all —
+/// the ticket id in the path is the credential — so what a bad host would get
+/// here is the source tree and nothing else. Widening the credential allowlist
+/// to let the upload through would put the sign-in on the wider list too.
+///
+/// Three ways in, and no more:
+///  * anywhere the apps API itself may live (which includes loopback, so the
+///    fake-server tests keep working);
+///  * `https://reachpad.app` on 443, under `/_rp/upload/` — the apex and the
+///    one path the front door serves an upload on;
+///  * when `REACHPAD_APPS_API` points somewhere other than production, the
+///    host the API base itself is on. A preview front door names its own
+///    domain in the ticket, and a person who has already pointed the CLI at a
+///    preview has already made that choice.
+pub fn validate_upload_origin(api_base: &str, put_url: &str) -> Result<(), CliError> {
+    let ticket = http_min::parse_url(put_url).map_err(CliError::from)?;
+    ticket.ensure_confidential().map_err(CliError::from)?;
+    let origin = match ticket.scheme {
+        http_min::Scheme::Tls => format!("https://{}", ticket.authority()),
+        http_min::Scheme::Plaintext => format!("http://{}", ticket.authority()),
+    };
+    if validate_apps_origin(&origin).is_ok() {
+        return Ok(());
+    }
+    let apex_upload = ticket.scheme == http_min::Scheme::Tls
+        && ticket.port == 443
+        && ticket.host.eq_ignore_ascii_case(APPS_CONTENT_DOMAIN)
+        && ticket.base_path.starts_with(UPLOAD_PATH_PREFIX);
+    if apex_upload {
+        return Ok(());
+    }
+    if !is_default_api(api_base) {
+        if let Ok(api) = http_min::parse_url(api_base) {
+            if api.scheme == ticket.scheme
+                && api.port == ticket.port
+                && api.host.eq_ignore_ascii_case(&ticket.host)
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(super::failure(format!(
+        "refusing to send your source to {host}: an upload ticket is served by \
+         reachpad.app on 443 under {UPLOAD_PATH_PREFIX}, by reachpad.dev, *.reachpad.dev or a \
+         Vercel preview on 443, or by a server on this machine, and nothing else.",
+        host = ticket.host
+    )))
+}
+
+/// Is this base the production apps API? Compared as an origin, so a trailing
+/// slash or a differently written path does not make production look like an
+/// override.
+fn is_default_api(api_base: &str) -> bool {
+    match (
+        http_min::parse_url(api_base),
+        http_min::parse_url(DEFAULT_APPS_API),
+    ) {
+        (Ok(given), Ok(default)) => {
+            given.scheme == default.scheme
+                && given.port == default.port
+                && given.host.eq_ignore_ascii_case(&default.host)
+        }
+        _ => false,
+    }
+}
+
 /// A ready-to-use apps client: the base URL and a bearer that is known good for
 /// the next few minutes.
 pub struct Apps {
@@ -106,14 +194,15 @@ impl Apps {
 
     /// PUT the tarball at the ticket's absolute `put_url`. The ticket is the
     /// authorization, so no bearer travels with it — but the URL still goes
-    /// through the origin allowlist, because the body is the customer's source.
+    /// through [`validate_upload_origin`], because the body is the customer's
+    /// source and the host was chosen by the server, not by the person.
     pub async fn put_snapshot(&self, put_url: &str, tarball: &[u8]) -> Result<Value, CliError> {
+        validate_upload_origin(&self.base, put_url)?;
         let endpoint = http_min::parse_url(put_url).map_err(CliError::from)?;
         let base = match endpoint.scheme {
             http_min::Scheme::Tls => format!("https://{}", endpoint.authority()),
             http_min::Scheme::Plaintext => format!("http://{}", endpoint.authority()),
         };
-        validate_apps_origin(&base)?;
         let path = if endpoint.base_path.is_empty() {
             "/".to_owned()
         } else {
@@ -392,7 +481,10 @@ pub async fn bearer(paths: &conf::Paths, now_ms: u64) -> Result<String, CliError
     let credential = match conf::load_credential(paths, now_ms)? {
         conf::Stored::Present(credential) => credential,
         conf::Stored::Missing | conf::Stored::Expired => {
-            return Err(super::failure("Run `reachpad login`."))
+            return Err(super::failure_next(
+                "Run `reachpad login`.",
+                "reachpad login",
+            ))
         }
     };
     if let Some(access) = credential.workos_access(now_ms) {
@@ -402,9 +494,10 @@ pub async fn bearer(paths: &conf::Paths, now_ms: u64) -> Result<String, CliError
         // The `--operator-token` path: a real Reachpad credential, and no
         // WorkOS session at all. Say which sign-in is missing rather than
         // "unauthorized".
-        return Err(super::failure(
+        return Err(super::failure_next(
             "This machine signed in with an operator credential, which the apps API does not \
              take. Run `reachpad login` to sign in through your browser.",
+            "reachpad login",
         ));
     };
     let refreshed = match crate::cli_auth::refresh_workos(&session).await {
@@ -418,7 +511,10 @@ pub async fn bearer(paths: &conf::Paths, now_ms: u64) -> Result<String, CliError
             if let Some(access) = reread_access(paths, now_ms, &session) {
                 return Ok(access);
             }
-            return Err(super::failure(format!("{e:#} Run `reachpad login`.")));
+            return Err(super::failure_next(
+                format!("{e:#} Run `reachpad login`."),
+                "reachpad login",
+            ));
         }
     };
     let access = refreshed.access_token.clone();
@@ -632,6 +728,89 @@ mod tests {
         assert!(validate_apps_origin("https://reachpad.dev.example.com/api").is_err());
         assert!(validate_apps_origin("https://reachpad.dev:8443/api/apps").is_err());
         assert!(validate_apps_origin("http://reachpad.dev/api/apps").is_err());
+    }
+
+    /// The upload hop is a SEPARATE allowlist, because the ticket host is the
+    /// server's choice and the body is the customer's source.
+    #[test]
+    fn the_upload_allowlist_adds_the_apps_content_domain_and_nothing_else() {
+        let prod = DEFAULT_APPS_API;
+        // The production shape: the webapp issues a ticket on the front door.
+        assert!(validate_upload_origin(prod, "https://reachpad.app/_rp/upload/tkt").is_ok());
+        // Everything the apps API allowlist already allows, unchanged.
+        assert!(validate_upload_origin(prod, "https://reachpad.dev/_rp/upload/tkt").is_ok());
+        assert!(validate_upload_origin(prod, "https://x.reachpad.dev/_rp/upload/tkt").is_ok());
+        assert!(validate_upload_origin(prod, "https://p.vercel.app/_rp/upload/tkt").is_ok());
+        assert!(validate_upload_origin(prod, "http://127.0.0.1:7777/_rp/upload/tkt").is_ok());
+
+        // A host nobody named, a path the front door does not serve, a port it
+        // does not listen on, a subdomain of the content domain (those are
+        // customers' apps), and plaintext.
+        for bad in [
+            "https://evil.example/_rp/upload/tkt",
+            "https://reachpad.app/other/tkt",
+            "https://reachpad.app/_rp/upload/",
+            "https://reachpad.app:8443/_rp/upload/tkt",
+            "https://todo.reachpad.app/_rp/upload/tkt",
+            "http://reachpad.app/_rp/upload/tkt",
+        ] {
+            assert!(
+                validate_upload_origin(prod, bad).is_err(),
+                "{bad} was allowed"
+            );
+        }
+
+        // The refusal names the body at stake, not the sign-in — the PUT
+        // carries no bearer — and lists where an upload may go.
+        let message = validate_upload_origin(prod, "https://evil.example/_rp/upload/tkt")
+            .unwrap_err()
+            .message;
+        assert!(
+            message.contains("refusing to send your source to evil.example"),
+            "{message}"
+        );
+        assert!(!message.contains("sign-in"), "{message}");
+        assert!(message.contains("reachpad.app"), "{message}");
+        assert!(message.contains("/_rp/upload/"), "{message}");
+        assert!(message.contains("*.reachpad.dev"), "{message}");
+        assert!(message.contains("on this machine"), "{message}");
+    }
+
+    /// A non-default API base may name its own host in the ticket — that is how
+    /// a preview front door, or the tests' fake, hands back a `put_url`. A
+    /// PRODUCTION base may not: nothing widens the list on reachpad.dev.
+    #[test]
+    fn only_a_non_default_api_base_may_name_its_own_upload_host() {
+        let preview = "https://front-door-git-x.example.dev/api/apps";
+        assert!(validate_upload_origin(
+            preview,
+            "https://front-door-git-x.example.dev/_rp/upload/t"
+        )
+        .is_ok());
+        // Same base, a different host: still refused.
+        assert!(
+            validate_upload_origin(preview, "https://elsewhere.example.dev/_rp/upload/t").is_err()
+        );
+        // Production, with the same ticket: refused.
+        assert!(validate_upload_origin(
+            DEFAULT_APPS_API,
+            "https://front-door-git-x.example.dev/_rp/upload/t"
+        )
+        .is_err());
+        // A trailing slash does not turn production into an override.
+        assert!(validate_upload_origin(
+            "https://reachpad.dev/api/apps/",
+            "https://front-door-git-x.example.dev/_rp/upload/t"
+        )
+        .is_err());
+    }
+
+    /// Widening the upload hop must not widen the credential hop: the apps API
+    /// allowlist still refuses the content domain, which never sees a bearer.
+    #[test]
+    fn the_apps_api_allowlist_still_refuses_the_content_domain() {
+        assert!(validate_apps_origin("https://reachpad.app").is_err());
+        assert!(validate_apps_origin("https://todo.reachpad.app").is_err());
     }
 
     #[test]

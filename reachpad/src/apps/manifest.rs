@@ -22,6 +22,12 @@ use crate::errors::CliError;
 /// The file name, everywhere. Never spelled inline.
 pub const MANIFEST_FILE: &str = "reachpad.json";
 
+/// The capabilities a function can bind, held identically in the server's
+/// `APP_SERVICES` (`lib/apps/types.ts`). Checked here as well as there because
+/// a name the fleet does not run is a manifest that publishes and then fails
+/// at the app's first call, with a 403 nobody traces back to the typo.
+pub const SERVICES: &[&str] = &["db", "files"];
+
 /// The runtime a version is built for (`AppKind` in API.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -150,6 +156,37 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         Some(_) => return Err("`entry` is empty".to_owned()),
         None => return Err("`entry` is missing".to_owned()),
     }
+    let is_page = object.get("kind").and_then(|k| k.as_str()) != Some("function");
+    // `services` names the capabilities a function binds. The order is the
+    // server's (`manifestFrom`): the name is judged before the kind is, so a
+    // page asking for `mail` hears about the name it got wrong first.
+    if let Some(services) = object.get("services") {
+        let list = services.as_array().ok_or_else(|| {
+            format!(
+                "`services` is {}; it is an array of names, like [\"db\"]",
+                shape(services)
+            )
+        })?;
+        for entry in list {
+            let name = entry.as_str().ok_or_else(|| {
+                format!(
+                    "`services` holds {}; every entry is a name, like \"db\"",
+                    shape(entry)
+                )
+            })?;
+            if !SERVICES.contains(&name) {
+                return Err(format!(
+                    "{name} is not a service. services takes {}.",
+                    SERVICES.join(", ")
+                ));
+            }
+        }
+        // A page is static files on a CDN with no code to hold a capability,
+        // so a service on one is a manifest that will never do what it says.
+        if is_page && !list.is_empty() {
+            return Err("Only function apps use services.".to_owned());
+        }
+    }
     // `secrets` is a list of names an app binds, and every one of them has to
     // be a name the org could have set. A publish that names STRIPE_key fails
     // at the front door with a sentence about a secret nobody set, which is a
@@ -171,6 +208,11 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
             if let Some(reason) = super::secrets::name_reason(name) {
                 return Err(format!("`secrets`: {reason}"));
             }
+        }
+        // Same reason as `services`: a page has no bindings, so a secret named
+        // on one is a value the app could never read.
+        if is_page && !list.is_empty() {
+            return Err("Only function apps use secrets.".to_owned());
         }
     }
     serde_json::from_value(value).map_err(|e| format!("{e}"))
@@ -270,6 +312,62 @@ mod tests {
             .unwrap_err()
             .contains("relative"));
         assert!(parse(r#"{"kind":"page","entry":"/etc/passwd"}"#).is_err());
+    }
+
+    /// `services` reached the server unread: `["mail"]` published here and was
+    /// refused there, and a page carrying `services` or `secrets` published a
+    /// manifest that could never do what it said. Same sentences as
+    /// `lib/apps/service.ts`, so one answer reaches the person whichever door
+    /// refuses.
+    #[test]
+    fn services_and_secrets_are_judged_here_the_way_the_server_judges_them() {
+        assert_eq!(
+            parse(r#"{"kind":"function","entry":"server.js","services":["mail"]}"#).unwrap_err(),
+            "mail is not a service. services takes db, files."
+        );
+        // The name is judged before the kind is, which is the server's order.
+        assert_eq!(
+            parse(r#"{"kind":"page","entry":"i.html","services":["mail"]}"#).unwrap_err(),
+            "mail is not a service. services takes db, files."
+        );
+        assert_eq!(
+            parse(r#"{"kind":"page","entry":"i.html","services":["db"]}"#).unwrap_err(),
+            "Only function apps use services."
+        );
+        assert_eq!(
+            parse(r#"{"kind":"page","entry":"i.html","secrets":["STRIPE_KEY"]}"#).unwrap_err(),
+            "Only function apps use secrets."
+        );
+        assert!(parse(r#"{"kind":"page","entry":"i.html","services":[]}"#).is_ok());
+        assert!(parse(r#"{"kind":"page","entry":"i.html","secrets":[]}"#).is_ok());
+        assert!(
+            parse(r#"{"kind":"function","entry":"s.js","services":["db","files"]}"#).is_ok(),
+            "both services are still allowed on a function"
+        );
+        assert!(
+            parse(r#"{"kind":"function","entry":"s.js","services":"db"}"#)
+                .unwrap_err()
+                .contains("array of names")
+        );
+        assert!(
+            parse(r#"{"kind":"function","entry":"s.js","services":[7]}"#)
+                .unwrap_err()
+                .contains("every entry is a name")
+        );
+    }
+
+    /// The other half of the same rule: an unknown key is NOT a refusal. The
+    /// schema is additive only, so an older CLI has to carry a newer field
+    /// through rather than stop on it.
+    #[test]
+    fn an_unknown_key_is_carried_rather_than_refused() {
+        let manifest = parse(r#"{"kind":"page","entry":"i.html","regions":["iad"]}"#).unwrap();
+        assert_eq!(
+            manifest.extra.keys().collect::<Vec<_>>(),
+            vec!["regions"],
+            "the unknown key is where `check` looks for it"
+        );
+        assert_eq!(manifest.wire()["regions"], serde_json::json!(["iad"]));
     }
 
     #[test]

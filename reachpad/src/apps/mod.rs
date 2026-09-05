@@ -52,6 +52,21 @@ pub fn failure(message: impl Into<String>) -> CliError {
     }
 }
 
+/// [`failure`], carrying the command its sentence just named.
+///
+/// The `--json` envelope's `next_command` is the field an agent reads instead
+/// of the prose, and a refusal that tells a person to run `reachpad init`
+/// while telling a program `null` is two answers to one question. Passed
+/// explicitly at each site rather than scraped back out of the message: the
+/// sentence is written for a reader and the field is a command to run, and
+/// deriving one from the other makes both fragile.
+pub fn failure_next(message: impl Into<String>, next_command: impl Into<String>) -> CliError {
+    CliError {
+        next_command: Some(next_command.into()),
+        ..failure(message)
+    }
+}
+
 /// Where `sync` keeps what the tree last agreed with.
 const BASE_FILE: &str = "base.json";
 
@@ -293,11 +308,14 @@ struct Checked {
 fn check_tree(path: Option<PathBuf>) -> Result<Checked, CliError> {
     let (root, linked) = project(path)?;
     let manifest = linked.map(|linked| linked.manifest).ok_or_else(|| {
-        failure(format!(
-            "there is no {} in {} or any folder above it. Run `reachpad init` here.",
-            manifest::MANIFEST_FILE,
-            root.display()
-        ))
+        failure_next(
+            format!(
+                "there is no {} in {} or any folder above it. Run `reachpad init` here.",
+                manifest::MANIFEST_FILE,
+                root.display()
+            ),
+            "reachpad init",
+        )
     })?;
     let entry = root.join(&manifest.entry);
     if !entry.is_file() {
@@ -387,6 +405,21 @@ fn exports_default_fetch(source: &str) -> bool {
 
 pub(crate) async fn check(ctx: &Ctx, path: Option<PathBuf>) -> Result<i32, CliError> {
     let checked = check_tree(path)?;
+    // Named, not refused. The manifest schema is additive only, so an older
+    // CLI meeting a newer key has to carry it through rather than stop on it
+    // (see `Manifest::extra`) — but a key nothing reads is far more often a
+    // typo than a field from the future, and silence is how `sercets` reaches
+    // production. Stderr, so `--json` keeps one parseable line on stdout.
+    if !ctx.is_quiet() && !checked.manifest.extra.is_empty() {
+        let unknown: Vec<&str> = checked.manifest.extra.keys().map(String::as_str).collect();
+        eprintln!(
+            "reachpad: {} holds {} keys this version does not read: {}. \
+             They are kept and passed through unchanged.",
+            manifest::MANIFEST_FILE,
+            unknown.len(),
+            unknown.join(", "),
+        );
+    }
     ctx.emit(
         json!({
             "path": checked.root.display().to_string(),

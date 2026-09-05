@@ -52,9 +52,12 @@ pub fn core() -> String {
          ```\n\
          \n\
          `kind` is `page` or `function`. `entry` is a path relative to that folder. \
-         `env`, `services` and `secrets` are optional objects/arrays. Leave `app` alone: \
-         the first publish writes it, and it is how every later command knows which app \
-         this folder is.\n\
+         `env`, `services` and `secrets` are optional objects/arrays. `services` takes \
+         `db` and `files`; only a `function` may name a service or a secret. A key this \
+         CLI does not know is kept and passed through to the server, and `reachpad check` \
+         names it on stderr, so a newer field survives an older CLI and a typo is still \
+         visible. Leave `app` alone: the first publish writes it, and it is how every \
+         later command knows which app this folder is.\n\
          \n\
          ## 3. Write the app\n\
          \n\
