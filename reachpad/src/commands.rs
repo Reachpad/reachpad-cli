@@ -6,7 +6,7 @@
 //! number the shell reads comes from the same row. `--json` is a rendering of
 //! that one decision, never a second code path.
 
-use std::io::IsTerminal as _;
+use std::{future::Future, io::IsTerminal as _, pin::Pin};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -15,9 +15,11 @@ use clap::Parser as _;
 use serde_json::{json, Value};
 
 use crate::api::{self, Auth, Client, ExecItem, ExecSpec};
+use crate::apps;
 use crate::cli::{
-    self, AuthCommand, BudgetCommand, Cli, Command, ConnectCommand, KeysCommand, KillSwitchCommand,
-    PortsCommand, StateFilter, TokenCommand, WaitState, WsCommand,
+    self, AccessCommand, AuthCommand, BudgetCommand, Cli, Command, ConnectCommand, DevCommand,
+    KeysCommand, KillSwitchCommand, PortsCommand, SecretsCommand, StateFilter, TokenCommand,
+    WaitState, WsCommand,
 };
 use crate::conf;
 use crate::errors::{self, CliError, EXIT_OK, EXIT_USAGE};
@@ -93,6 +95,10 @@ pub async fn run(argv: Vec<String>) -> anyhow::Result<i32> {
         Ok(ctx) => ctx,
         Err(e) => return Ok(report(&e, command_name(&command), json)),
     };
+    // `dispatch` selects one command future behind a heap boundary. Keeping
+    // its union of branches out of this public future matters in debug
+    // builds, where otherwise its poll frame can exhaust libtest/Tokio's
+    // small test-thread stack before a real HTTP request is polled.
     match dispatch(&ctx, command).await {
         Ok(code) => Ok(code),
         Err(e) => Ok(ctx.report(&e)),
@@ -118,6 +124,8 @@ pub(crate) struct Ctx {
     /// argument, and the scope list of `keys mint`.
     workspaces: Vec<String>,
     api_key: Option<String>,
+    /// `--target`: the app an apps verb acts on, when it is not the folder.
+    target: Option<String>,
     token: Option<String>,
     token_file: Option<std::path::PathBuf>,
     /// `--controld` / `--hub`, kept so `auth login` can re-derive the planes
@@ -187,6 +195,7 @@ impl Ctx {
             timeout_ms: cli.timeout,
             workspaces: cli.workspace.clone(),
             api_key,
+            target: cli.target.clone(),
             token: cli.token.clone(),
             token_file: cli.token_file.clone(),
             plane_overrides: (cli.controld.clone(), cli.hub.clone()),
@@ -196,6 +205,30 @@ impl Ctx {
 
     pub(crate) fn client(&self) -> Client {
         Client::with_trust(&self.controld, self.trust.clone())
+    }
+
+    /// The TLS posture this invocation was given (`--hub-ca`), for the apps
+    /// client, which dials a different host with the same rules.
+    pub(crate) fn trust(&self) -> crate::transport::TlsTrust {
+        self.trust.clone()
+    }
+
+    /// Whether this command's answer is a JSON envelope. The two verbs that
+    /// print BYTES — `read` and `skill get` — need to know, because the bytes
+    /// are the answer and an envelope would be a different one.
+    pub(crate) fn is_json(&self) -> bool {
+        self.json
+    }
+
+    /// `--target`: which app an apps verb acts on.
+    pub(crate) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    /// `-q`: the caller asked for ids and nothing else, so the apps module's
+    /// own stderr notes stay off.
+    pub(crate) fn is_quiet(&self) -> bool {
+        self.quiet
     }
 
     /// The two planes for an endpoint other than this command's own — the one
@@ -343,10 +376,14 @@ impl Ctx {
     pub(crate) fn credential(&self) -> Result<conf::Credential, CliError> {
         self.deny_api_key()?;
         match conf::load_credential(&self.paths, now_ms())? {
-            conf::Stored::Present(c) => {
+            conf::Stored::Present(c) if c.has_operator() => {
                 state::bind_to_endpoint(&c, &self.endpoint_host())?;
                 Ok(c)
             }
+            // Signed in, and signed in for apps: this endpoint answered the
+            // credential exchange with `fleet_unconfigured`, so there is no
+            // operator credential to present and no fleet to present it to.
+            conf::Stored::Present(_) => Err(CliError::from_code("apps_only_credential", None)),
             conf::Stored::Missing => Err(CliError::from_code("no_credential", None)),
             conf::Stored::Expired => Err(CliError::from_code("operator_token_expired", None)),
         }
@@ -465,6 +502,34 @@ fn command_name(command: &Command) -> &'static str {
         Command::Ports(PortsCommand::List { .. }) => "ports.list",
         Command::Ports(PortsCommand::Revoke { .. }) => "ports.revoke",
         Command::Connect(ConnectCommand::Github) => "connect.github",
+        Command::Login { .. } => "auth.login",
+        Command::Whoami => "auth.whoami",
+        Command::Logout { .. } => "auth.logout",
+        Command::Init { .. } => "apps.init",
+        Command::Link { .. } => "apps.link",
+        Command::Check { .. } => "apps.check",
+        Command::Publish { .. } => "apps.publish",
+        Command::Pull { .. } => "apps.pull",
+        Command::Sync { .. } => "apps.sync",
+        Command::Restore { .. } => "apps.restore",
+        Command::Versions => "apps.versions",
+        Command::Read { .. } => "apps.read",
+        Command::ReadVersion { .. } => "apps.read",
+        Command::Db { .. } => "apps.db",
+        Command::Access { .. } => "apps.access",
+        Command::Share { .. } => "apps.share",
+        Command::Shares(_) => "apps.shares",
+        Command::Secrets(SecretsCommand::Set { .. }) => "apps.secrets.set",
+        Command::Secrets(SecretsCommand::List) => "apps.secrets.list",
+        Command::Secrets(SecretsCommand::Remove { .. }) => "apps.secrets.remove",
+        Command::Search { .. } => "apps.search",
+        Command::Ls { .. } => "apps.ls",
+        Command::Tree => "apps.tree",
+        Command::Mkdir { .. } => "apps.mkdir",
+        Command::Mv { .. } => "apps.mv",
+        Command::Rmdir { .. } => "apps.rmdir",
+        Command::Skill(_) => "apps.skill",
+        Command::Dev(DevCommand::Logs { .. }) => "apps.dev.logs",
         Command::Attach { .. } => "workspace.attach",
         Command::Tail { .. } => "workspace.events",
         Command::Credits => "account.credits",
@@ -487,15 +552,21 @@ fn command_name(command: &Command) -> &'static str {
     }
 }
 
-async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
+type CommandFuture<'a> = Pin<Box<dyn Future<Output = Result<i32, CliError>> + 'a>>;
+
+/// Select one command without building an async state machine that contains
+/// every branch. In unoptimised builds that union produced a ~1 MiB native
+/// poll frame; boxing only after entering an `async fn dispatch` would leave
+/// that frame on the caller's stack, so the selector itself must be sync.
+fn dispatch(ctx: &Ctx, command: Command) -> CommandFuture<'_> {
     match command {
         Command::Create {
             name,
             name_flag,
             repo,
-        } => create(ctx, name.or(name_flag), repo, None).await,
-        Command::List { state } => list(ctx, state, None).await,
-        Command::Status { workspace, wait } => status(ctx, workspace, wait).await,
+        } => Box::pin(create(ctx, name.or(name_flag), repo, None)),
+        Command::List { state } => Box::pin(list(ctx, state, None)),
+        Command::Status { workspace, wait } => Box::pin(status(ctx, workspace, wait)),
         Command::Run {
             workspace,
             shell,
@@ -504,37 +575,49 @@ async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
             stdin,
             argv,
         } => {
-            run_command(
-                ctx,
-                RunSpec {
-                    workspace,
-                    shell,
-                    cwd,
-                    env,
-                    stdin,
-                    argv,
-                },
-            )
-            .await
+            let spec = RunSpec {
+                workspace,
+                shell,
+                cwd,
+                env,
+                stdin,
+                argv,
+            };
+            Box::pin(run_command(ctx, spec))
         }
-        Command::Pause { workspace, wait } => pause(ctx, workspace, wait).await,
+        Command::Pause { workspace, wait } => Box::pin(pause(ctx, workspace, wait)),
         Command::Fork {
             workspace,
             count,
             snapshot,
             name,
-        } => fork(ctx, workspace, count, snapshot, name).await,
-        Command::Archive { workspace } => archive(ctx, workspace).await,
-        Command::Events { workspace, since } => events(ctx, workspace, since).await,
-        Command::Auth(auth) => run_auth(ctx, auth).await,
-        Command::Keys(keys) => run_keys(ctx, keys).await,
-        Command::Budget(budget) => run_budget(ctx, budget).await,
-        Command::KillSwitch(switch) => run_kill_switch(ctx, switch).await,
-        Command::Ports(ports) => run_ports(ctx, ports).await,
-        Command::Connect(connect) => run_connect(ctx, connect).await,
-        Command::Doctor => crate::doctor::run(ctx).await,
-        Command::Update => crate::self_update::run(ctx),
-        Command::Completions { shell } => {
+        } => Box::pin(fork(ctx, workspace, count, snapshot, name)),
+        Command::Archive { workspace } => Box::pin(archive(ctx, workspace)),
+        Command::Events { workspace, since } => Box::pin(events(ctx, workspace, since)),
+        Command::Auth(auth) => Box::pin(run_auth(ctx, auth)),
+        Command::Keys(keys) => Box::pin(run_keys(ctx, keys)),
+        Command::Budget(budget) => Box::pin(run_budget(ctx, budget)),
+        Command::KillSwitch(switch) => Box::pin(run_kill_switch(ctx, switch)),
+        Command::Ports(ports) => Box::pin(run_ports(ctx, ports)),
+        Command::Connect(connect) => Box::pin(run_connect(ctx, connect)),
+        Command::Login {
+            operator_token,
+            account_url,
+            no_browser,
+        } => Box::pin(run_auth(
+            ctx,
+            AuthCommand::Login {
+                operator_token,
+                account_url,
+                no_browser,
+            },
+        )),
+        Command::Whoami => Box::pin(whoami(ctx)),
+        Command::Logout { all } => Box::pin(logout(ctx, all)),
+        Command::Skill(skill) => Box::pin(async move { apps::run_skill(ctx, skill) }),
+        Command::Doctor => Box::pin(crate::doctor::run(ctx)),
+        Command::Update => Box::pin(async move { crate::self_update::run(ctx) }),
+        Command::Completions { shell } => Box::pin(async move {
             let generator = match shell {
                 cli::CompletionShell::Bash => clap_complete::Shell::Bash,
                 cli::CompletionShell::Zsh => clap_complete::Shell::Zsh,
@@ -553,8 +636,8 @@ async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
             clap_complete::generate(generator, &mut Cli::command(), "reachpad", &mut script);
             crate::out::out_bytes(&script);
             Ok(EXIT_OK)
-        }
-        Command::Ws(ws) => run_ws(ctx, ws).await,
+        }),
+        Command::Ws(ws) => Box::pin(run_ws(ctx, ws)),
         Command::Attach {
             workspace,
             pty,
@@ -565,30 +648,32 @@ async fn dispatch(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
             no_raw,
             wait_for_node_ms,
         } => {
-            attach_command(
-                ctx,
-                AttachSpec {
-                    workspace,
-                    pty,
-                    new,
-                    list,
-                    no_place,
-                    linger_ms,
-                    no_raw,
-                    wait_for_node_ms,
-                },
-            )
-            .await
+            let spec = AttachSpec {
+                workspace,
+                pty,
+                new,
+                list,
+                no_place,
+                linger_ms,
+                no_raw,
+                wait_for_node_ms,
+            };
+            Box::pin(attach_command(ctx, spec))
         }
-        Command::Tail { workspace } => tail_command(ctx, workspace).await,
-        Command::Credits => credits(ctx).await,
-        Command::Token(TokenCommand::Inspect) => {
+        Command::Tail { workspace } => Box::pin(tail_command(ctx, workspace)),
+        Command::Credits => Box::pin(credits(ctx)),
+        Command::Token(TokenCommand::Inspect) => Box::pin(async move {
             let workspace = self_or_any(ctx)?;
             let token = ctx.biscuit(&workspace).await?;
             let facts = crate::inspect::inspect_b64(&token)?;
             print_inspection(&facts);
             Ok(EXIT_OK)
-        }
+        }),
+        // Everything else in the apps surface goes through one branch future.
+        // Keeping that future behind the same heap boundary as the fleet arms
+        // prevents the apps state machine from being embedded in `run`'s native
+        // debug poll frame.
+        command => Box::pin(run_apps(ctx, command)),
     }
 }
 
@@ -625,19 +710,101 @@ enum Onboarding {
     SignInThenList,
     /// Signed in already: show what is there. A listing is not interactive.
     List,
+    /// Signed in for apps: name the apps verbs. There is no fleet on this
+    /// endpoint, so the listing would refuse.
+    AppsHint,
 }
 
-fn onboarding_action(interactive: bool, signed_in: bool) -> Onboarding {
+/// What the saved credential lets a bare `reachpad` do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignedIn {
+    /// Nothing usable on disk.
+    No,
+    /// A fleet credential: there are workspaces to list.
+    Fleet,
+    /// A WorkOS session and no operator credential. Listing workspaces anyway
+    /// ended the product's first instruction with "Not signed in. Run
+    /// `reachpad auth login`" at a machine that had just signed in.
+    Apps,
+}
+
+fn onboarding_action(interactive: bool, signed_in: SignedIn) -> Onboarding {
     match (interactive, signed_in) {
-        (_, true) => Onboarding::List,
-        (true, false) => Onboarding::SignInThenList,
-        (false, false) => Onboarding::RefuseNoCredential,
+        (_, SignedIn::Fleet) => Onboarding::List,
+        (_, SignedIn::Apps) => Onboarding::AppsHint,
+        (true, SignedIn::No) => Onboarding::SignInThenList,
+        (false, SignedIn::No) => Onboarding::RefuseNoCredential,
     }
 }
 
 /// A bare `reachpad`, rendered through the same context and error table as
 /// every verb — it IS `list`, with a sign-in in front of it when there is no
 /// credential yet, so its `--json` envelope is a workspace listing.
+/// The apps verbs (reports/apps-v1 CLI.md), in one place and behind the one
+/// boxed future the arm in [`dispatch`] calls.
+///
+/// Every remote verb here refuses an `--api-key`: a key names one workspace,
+/// and an app is not a workspace. The refusal is inherited rather than repeated
+/// — `apps::open` is the single door they all go through.
+async fn run_apps(ctx: &Ctx, command: Command) -> Result<i32, CliError> {
+    match command {
+        Command::Init { path } => apps::init(ctx, path).await,
+        Command::Link { url, path } => apps::link(ctx, url, path).await,
+        Command::Check { path } => apps::check(ctx, path).await,
+        Command::Publish {
+            path,
+            slug,
+            name,
+            message,
+            access,
+            password_stdin,
+            expires_at,
+        } => {
+            apps::publish(
+                ctx,
+                path,
+                slug,
+                name,
+                message,
+                access,
+                password_stdin,
+                expires_at,
+            )
+            .await
+        }
+        Command::Pull { path, from, force } => apps::pull(ctx, path, from, force).await,
+        Command::Sync { path, message } => apps::sync(ctx, path, message).await,
+        Command::Restore { file, from, path } => apps::restore(ctx, file, from, path).await,
+        Command::Versions => apps::versions(ctx).await,
+        Command::Read { path, version } => apps::read(ctx, path, version).await,
+        Command::ReadVersion { number, path } => apps::read(ctx, path, Some(number)).await,
+        Command::Db { sql, params } => apps::database(ctx, sql, params).await,
+        Command::Access { command } => {
+            apps::access(ctx, command.filter(|c| !matches!(c, AccessCommand::Show))).await
+        }
+        Command::Share {
+            email,
+            role,
+            notify,
+            message,
+        } => apps::share(ctx, email, role, notify, message).await,
+        Command::Shares(shares) => apps::shares(ctx, shares).await,
+        Command::Secrets(command) => apps::secrets_verb(ctx, command).await,
+        Command::Search { query, app_type } => apps::search(ctx, query, app_type).await,
+        Command::Ls { folder } => apps::ls(ctx, folder).await,
+        Command::Tree => apps::tree(ctx).await,
+        Command::Mkdir { name, parent } => apps::mkdir(ctx, name, parent).await,
+        Command::Mv { what, to } => apps::mv(ctx, what, to).await,
+        Command::Rmdir { folder } => apps::rmdir(ctx, folder).await,
+        Command::Dev(dev) => apps::dev(ctx, dev).await,
+        // `dispatch` names every other verb before it reaches this call.
+        other => Err(CliError::usage(format!(
+            "{} is not an apps verb (a dispatch bug, not something you typed).",
+            command_name(&other)
+        ))),
+    }
+}
+
 async fn onboarding(cli: &Cli) -> anyhow::Result<i32> {
     let command = Command::List { state: None };
     let json = cli.json && !cli.quiet;
@@ -658,8 +825,9 @@ async fn run_onboarding(cli: &Cli, ctx: &Ctx) -> Result<i32, CliError> {
     // A credential that cannot be READ is not a first run — it is damage, and
     // the error names the file. Only a missing or expired one starts a login.
     let signed_in = match conf::load_credential(&ctx.paths, now_ms())? {
-        conf::Stored::Present(_) => true,
-        conf::Stored::Missing | conf::Stored::Expired => false,
+        conf::Stored::Present(c) if c.has_operator() => SignedIn::Fleet,
+        conf::Stored::Present(_) => SignedIn::Apps,
+        conf::Stored::Missing | conf::Stored::Expired => SignedIn::No,
     };
     match onboarding_action(interactive, signed_in) {
         Onboarding::RefuseNoCredential => Err(CliError::usage(
@@ -669,6 +837,15 @@ async fn run_onboarding(cli: &Cli, ctx: &Ctx) -> Result<i32, CliError> {
              `reachpad --help` lists every command.",
         )),
         Onboarding::List => list(ctx, None, None).await,
+        Onboarding::AppsHint => {
+            ctx.emit(
+                json!({ "credential": { "kind": "apps" } }),
+                &["Signed in for apps. Run `reachpad ls` to list them, or \
+                     `reachpad publish` to publish this folder."
+                    .to_owned()],
+            );
+            Ok(EXIT_OK)
+        }
         Onboarding::SignInThenList => {
             eprintln!("reachpad: no saved sign-in on this machine. Starting browser sign-in.");
             device_login(ctx, crate::cli_auth::DEFAULT_ACCOUNT_URL, false).await?;
@@ -1585,7 +1762,7 @@ async fn login(
         return device_login(ctx, &account_url, no_browser).await;
     };
     let credential = conf::read_secret_arg("--operator-token", &value)?;
-    save_login(ctx, credential, ctx.endpoint.clone(), None).await
+    save_login(ctx, credential, ctx.endpoint.clone(), None, None).await
 }
 
 /// The browser path. Nothing WorkOS returns is persisted: the access token
@@ -1609,11 +1786,82 @@ async fn device_login(ctx: &Ctx, account_url: &str, no_browser: bool) -> Result<
     let login = crate::cli_auth::complete_device_authorization(account_url, device, &ctx.trust)
         .await
         .map_err(CliError::from)?;
+    let Some(fleet) = login.fleet else {
+        return save_apps_only_login(ctx, account_url, login.email, login.workos).await;
+    };
     // The endpoint the exchange named, not the one this invocation defaulted
     // to: a login is also how a laptop learns where its fleet is.
-    let endpoint = crate::cli_auth::endpoint_from_login(&login.controld_url, &login.hub_url)
+    let endpoint = crate::cli_auth::endpoint_from_login(&fleet.controld_url, &fleet.hub_url)
         .map_err(CliError::from)?;
-    save_login(ctx, login.operator_token, endpoint, login.email).await
+    save_login(
+        ctx,
+        fleet.operator_token,
+        endpoint,
+        login.email,
+        Some(login.workos),
+    )
+    .await
+}
+
+/// The sentence an apps-only sign-in ends with. One line, and it says both
+/// halves: this machine IS signed in, and the thing it cannot do here.
+pub fn apps_only_signin_line(host: &str) -> String {
+    format!("Signed in to {host} for apps. Workspaces are not available on this endpoint.")
+}
+
+/// Write an apps-only sign-in: the WorkOS session and nothing else.
+///
+/// The same 0600 file, the same profile section and the same `logout` as a
+/// fleet sign-in — the operator half is simply absent, which is what
+/// [`conf::Credential::has_operator`] reports on.
+pub fn store_apps_only_session(
+    paths: &conf::Paths,
+    workos: conf::WorkosSession,
+) -> Result<(), CliError> {
+    conf::save_credential(
+        paths,
+        &conf::Credential {
+            operator_token: String::new(),
+            token_id: None,
+            expires_at_ms: None,
+            endpoint_host: None,
+            workos: Some(workos),
+        },
+    )?;
+    // Whatever fleet identity this machine had cached belonged to a sign-in
+    // that has just been replaced. Leaving it would let a workspace verb
+    // answer from a token no credential on this machine can renew.
+    state::forget_all(paths)?;
+    Ok(())
+}
+
+/// Store a sign-in that produced no fleet credential.
+///
+/// The account endpoint answered the credential exchange with
+/// `fleet_unconfigured`, so there is no operator token, no endpoint to learn
+/// and no control-plane session to open — and no reason to throw the sign-in
+/// away either. The WorkOS session goes into the same 0600 file the operator
+/// credential would have, is spent by the apps verbs, and is forgotten by the
+/// same `logout`.
+async fn save_apps_only_login(
+    ctx: &Ctx,
+    account_url: &str,
+    email: Option<String>,
+    workos: conf::WorkosSession,
+) -> Result<i32, CliError> {
+    store_apps_only_session(&ctx.paths, workos)?;
+    let host = crate::http_min::parse_url(account_url)
+        .map(|account| account.host)
+        .map_err(CliError::from)?;
+    ctx.emit(
+        json!({
+            "endpoint": Value::Null,
+            "email": email,
+            "credential": { "kind": "apps" },
+        }),
+        &[apps_only_signin_line(&host)],
+    );
+    Ok(EXIT_OK)
 }
 
 /// Exchange the credential for a session, THEN write it — a credential that
@@ -1625,6 +1873,7 @@ async fn save_login(
     credential: String,
     endpoint: String,
     email: Option<String>,
+    workos: Option<conf::WorkosSession>,
 ) -> Result<i32, CliError> {
     let planes = ctx.planes_for(&endpoint)?;
     let client = Client::with_trust(&planes.controld, ctx.trust.clone());
@@ -1646,6 +1895,10 @@ async fn save_login(
             token_id: session.token_id.clone(),
             expires_at_ms: session.token_expires_at_ms,
             endpoint_host: Some(endpoint_host),
+            // Present for a browser sign-in, absent for `--operator-token`:
+            // that path never spoke to WorkOS, so there is no apps session to
+            // record and the apps verbs say so rather than guessing.
+            workos,
         },
     )?;
     conf::save_endpoint(&ctx.paths, &endpoint)?;
@@ -1681,6 +1934,14 @@ async fn save_login(
 }
 
 async fn whoami(ctx: &Ctx) -> Result<i32, CliError> {
+    // An apps-only sign-in is answered by the apps API, which is the only
+    // thing that knows who this machine is. Asking the control plane first
+    // would refuse on a credential that was never supposed to be here.
+    if let conf::Stored::Present(credential) = conf::load_credential(&ctx.paths, now_ms())? {
+        if !credential.has_operator() {
+            return apps::whoami(ctx).await;
+        }
+    }
     let credential = ctx.credential()?;
     let client = ctx.client();
     let session = client
@@ -1715,10 +1976,16 @@ async fn whoami(ctx: &Ctx) -> Result<i32, CliError> {
     let expires = session
         .token_expires_at_ms
         .map_or(Value::Null, render::time);
+    // The apps half, best effort: the build prompt every console generates
+    // reads `org:` from here and stops the agent when it disagrees with the
+    // pinned id, so it has to be printed — but an unreachable apps API must not
+    // turn "who am I" into a failure about a product the caller may not use.
+    let org = apps::whoami_org(ctx).await;
     ctx.emit(
         json!({
             "endpoint": ctx.endpoint,
             "user": session.user_id,
+            "org": org,
             "credential": {
                 "kind": "operator",
                 "id": session.token_id,
@@ -1735,6 +2002,14 @@ async fn whoami(ctx: &Ctx) -> Result<i32, CliError> {
         }),
         &[
             format!("{} at {}", session.user_id, ctx.endpoint),
+            match &org {
+                Some(org) => format!(
+                    "  org: {} ({})",
+                    org["name"].as_str().unwrap_or("?"),
+                    org["id"].as_str().unwrap_or("?")
+                ),
+                None => "  org: not signed in to apps (run `reachpad login`)".to_owned(),
+            },
             format!(
                 "  credential: operator{}",
                 session
@@ -1775,15 +2050,21 @@ async fn logout(ctx: &Ctx, all: bool) -> Result<i32, CliError> {
     // presents the secret to the host it is aimed at). The local files still
     // go, which is this function's first rule, and the nonzero exit says the
     // server-side half did not happen.
-    let bound = match &stored {
-        conf::Stored::Present(credential) => {
-            state::bind_to_endpoint(credential, &ctx.endpoint_host())
-        }
-        _ => Ok(()),
+    //
+    // An apps-only sign-in has no operator credential at all: nothing to bind,
+    // nothing to revoke, and no server-side half to fail. Its WorkOS session
+    // goes with the local files below, which is the whole of that logout.
+    let operator = match &stored {
+        conf::Stored::Present(credential) if credential.has_operator() => Some(credential),
+        _ => None,
+    };
+    let bound = match operator {
+        Some(credential) => state::bind_to_endpoint(credential, &ctx.endpoint_host()),
+        None => Ok(()),
     };
     if let Err(e) = bound {
         failure = Some(e);
-    } else if let conf::Stored::Present(credential) = &stored {
+    } else if let Some(credential) = operator {
         let client = ctx.client();
         let own = credential.token_id.clone();
         let mut others: Vec<String> = Vec::new();
@@ -1822,9 +2103,13 @@ async fn logout(ctx: &Ctx, all: bool) -> Result<i32, CliError> {
             );
         }
     } else {
-        note = Some(match stored {
+        note = Some(match &stored {
             conf::Stored::Expired => "the saved credential had already expired".to_owned(),
-            _ => "there was no credential on this machine".to_owned(),
+            conf::Stored::Present(_) => {
+                "this machine was signed in for apps only, so there was no credential to revoke"
+                    .to_owned()
+            }
+            conf::Stored::Missing => "there was no credential on this machine".to_owned(),
         });
     }
     // Unconditional, and before anything can return: this is the half of
@@ -2965,6 +3250,24 @@ fn print_inspection(i: &crate::inspect::Inspection) {
 mod tests {
     use super::*;
 
+    /// `run` is the public future every binary and in-process integration
+    /// test owns. Keep it small and the dispatch boundary pointer-sized so
+    /// command additions cannot quietly re-embed the union of branches.
+    #[test]
+    fn the_public_run_future_does_not_embed_the_dispatcher() {
+        let future = run(vec!["reachpad".to_owned(), "--version".to_owned()]);
+        let bytes = std::mem::size_of_val(&future);
+        assert!(
+            bytes <= 4 * 1024,
+            "the public run future grew to {bytes} bytes; keep dispatch behind its heap boundary"
+        );
+        assert_eq!(
+            std::mem::size_of::<CommandFuture<'static>>(),
+            2 * std::mem::size_of::<usize>(),
+            "the dispatch boundary must remain one boxed trait-object pointer"
+        );
+    }
+
     #[test]
     fn a_shell_line_is_wrapped_and_an_argv_is_not() {
         assert_eq!(
@@ -3050,12 +3353,49 @@ mod tests {
     #[test]
     fn only_a_terminal_ever_starts_a_browser_sign_in() {
         assert_eq!(
-            onboarding_action(false, false),
+            onboarding_action(false, SignedIn::No),
             Onboarding::RefuseNoCredential,
             "a pipe with no credential must not open a browser; it is told how \
              to sign in without one"
         );
-        assert_eq!(onboarding_action(true, false), Onboarding::SignInThenList);
+        assert_eq!(
+            onboarding_action(true, SignedIn::No),
+            Onboarding::SignInThenList
+        );
+    }
+
+    /// An apps-only sign-in never falls through to the workspace listing. It
+    /// used to, and the listing then refused with "Not signed in. Run
+    /// `reachpad auth login`" at a machine whose login had just succeeded.
+    #[test]
+    fn an_apps_only_sign_in_is_never_told_to_sign_in_again() {
+        assert_eq!(
+            onboarding_action(true, SignedIn::Apps),
+            Onboarding::AppsHint
+        );
+        assert_eq!(
+            onboarding_action(false, SignedIn::Apps),
+            Onboarding::AppsHint
+        );
+    }
+
+    /// One code and one exit status for the state, whichever door reports it.
+    #[test]
+    fn the_apps_only_refusal_is_one_refusal_that_names_the_verb_that_works() {
+        let refusal = CliError::from_code("apps_only_credential", None);
+        assert_eq!(refusal.exit_code, errors::EXIT_CREDENTIAL);
+        assert_eq!(refusal.next_command.as_deref(), Some("reachpad ls"));
+        assert!(
+            refusal.message.contains("signed in for apps"),
+            "{}",
+            refusal.message
+        );
+        // Never the sentence that sends someone back to a login that worked.
+        assert!(
+            !refusal.message.contains("Not signed in"),
+            "{}",
+            refusal.message
+        );
     }
 
     /// Signed in, a bare `reachpad` lists — terminal or not. This is the
@@ -3063,8 +3403,8 @@ mod tests {
     /// `reachpad | tee` all reach it without a tty.
     #[test]
     fn a_signed_in_bare_reachpad_lists_with_or_without_a_terminal() {
-        assert_eq!(onboarding_action(true, true), Onboarding::List);
-        assert_eq!(onboarding_action(false, true), Onboarding::List);
+        assert_eq!(onboarding_action(true, SignedIn::Fleet), Onboarding::List);
+        assert_eq!(onboarding_action(false, SignedIn::Fleet), Onboarding::List);
     }
 
     /// A bare invocation is rendered as a listing, so `reachpad --json` on a

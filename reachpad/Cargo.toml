@@ -68,6 +68,10 @@ rcgen.workspace = true
 # `platform-verifier` feature — this direct reference adds no new code.
 rustls-platform-verifier = "0.7"
 blake3.workspace = true
+# `apps`: the snapshot a publish uploads is a gzipped ustar tarball, and `pull`
+# reads one back. The tar half is hand-written in `apps::pack` (ustar is 512-byte
+# headers and nothing else); the gzip half is not worth hand-writing.
+flate2.workspace = true
 
 [dev-dependencies]
 # reach depending on reach is not a typo. A dev-dependency on this very

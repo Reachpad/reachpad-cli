@@ -31,6 +31,15 @@ const CREDENTIAL_KEYS: &[&str] = &[
     "token_id",
     "token_expires_at_ms",
     "endpoint_host",
+    // The WorkOS half of the same sign-in. The apps API (reports/apps-v1
+    // API.md "Auth") takes the WorkOS access token as its bearer, not the
+    // `rpop1` operator credential, so the pair the device flow returns is kept
+    // here beside it rather than thrown away. Same file, same 0600, same
+    // `logout`. See `Credential::workos`.
+    "workos_access_token",
+    "workos_refresh_token",
+    "workos_expires_at_ms",
+    "workos_client_id",
 ];
 
 // ---------------------------------------------------------------------------
@@ -360,6 +369,14 @@ pub fn save_endpoint(paths: &Paths, endpoint: &str) -> anyhow::Result<()> {
 /// that row) and the host that issued it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credential {
+    /// The fleet credential, EMPTY for an apps-only sign-in.
+    ///
+    /// reachpad.dev answers the credential exchange with `fleet_unconfigured`
+    /// when it is not a fleet front door, which is the ordinary answer now
+    /// that the product there is apps. That sign-in is real — it produced a
+    /// WorkOS session the apps API takes — it just has no operator half. Read
+    /// it through [`Credential::has_operator`] rather than by testing the
+    /// string, and never put an empty one on a bearer header.
     pub operator_token: String,
     pub token_id: Option<String>,
     pub expires_at_ms: Option<u64>,
@@ -374,6 +391,29 @@ pub struct Credential {
     /// a trust boundary, and a laptop that moves between `127.0.0.1:7401` and
     /// `127.0.0.1:9001` is still talking to itself.
     pub endpoint_host: Option<String>,
+    /// The WorkOS session the same sign-in produced, when there was one.
+    ///
+    /// `None` for a credential installed with `--operator-token`, which never
+    /// touched WorkOS: that laptop can drive workspaces and cannot drive apps,
+    /// and the apps verbs say so rather than sending the apps API a credential
+    /// it does not accept.
+    pub workos: Option<WorkosSession>,
+}
+
+/// The WorkOS access/refresh pair, and the client id that refreshes it.
+///
+/// A WorkOS access token lives about five minutes, so the refresh token is the
+/// durable half and the access token is a cache of the last refresh. Both are
+/// secrets and both live in the same 0600 file as the operator credential — a
+/// second store would be a second place to get the mode wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkosSession {
+    pub access_token: String,
+    pub refresh_token: String,
+    /// When the access token stops being accepted, from its own `exp` claim.
+    pub expires_at_ms: Option<u64>,
+    /// The public CLI client id the deployment published; refreshing needs it.
+    pub client_id: String,
 }
 
 /// What [`Credential::check_endpoint`] found. The caller decides what a
@@ -421,9 +461,36 @@ impl Credential {
         }
     }
 
+    /// Whether this record has a fleet credential at all.
+    ///
+    /// False for an apps-only sign-in, and every control-plane door checks it:
+    /// an empty bearer is not a credential, and sending one would turn "this
+    /// endpoint has no fleet" into an unauthorized from a host that was never
+    /// going to answer.
+    pub fn has_operator(&self) -> bool {
+        !self.operator_token.trim().is_empty()
+    }
+
     /// Carrier 1: `Authorization: Bearer` — every route but the three below.
+    ///
+    /// Only for a record [`Credential::has_operator`] said yes about.
     pub fn bearer(&self) -> &str {
         &self.operator_token
+    }
+
+    /// The WorkOS access token, when there is one that is still good.
+    pub fn workos_access(&self, now_ms: u64) -> Option<&str> {
+        let workos = self.workos.as_ref()?;
+        // A minute of margin, taken off the expiry rather than added to the
+        // clock, so `now_ms == 0` (a clock that could not be read) fails
+        // closed into a refresh rather than into a stale bearer.
+        if is_expired(
+            workos.expires_at_ms.map(|at| at.saturating_sub(60_000)),
+            now_ms,
+        ) {
+            return None;
+        }
+        Some(&workos.access_token)
     }
 
     /// Carrier 2: the `operator_token` FIELD of the request body, which is how
@@ -459,24 +526,62 @@ pub fn load_credential(paths: &Paths, now_ms: u64) -> anyhow::Result<Stored> {
     let path = paths.credentials_file();
     let doc = load_doc(&path, CREDENTIAL_KEYS)?;
     let section = paths.section();
-    let Some(operator_token) = doc.get(&section, "operator_token") else {
-        return Ok(Stored::Missing);
+    // All three are required together: an access token with no refresh token
+    // is five minutes of apps access and then a sign-in, and a refresh token
+    // with no client id cannot be spent. A half-written record is read as no
+    // record.
+    let workos = match (
+        doc.get(&section, "workos_access_token"),
+        doc.get(&section, "workos_refresh_token"),
+        doc.get(&section, "workos_client_id"),
+    ) {
+        (Some(access), Some(refresh), Some(client_id))
+            if !access.is_empty() && !refresh.is_empty() && !client_id.is_empty() =>
+        {
+            Some(WorkosSession {
+                access_token: access.to_owned(),
+                refresh_token: refresh.to_owned(),
+                expires_at_ms: u64_field(&path, &doc, &section, "workos_expires_at_ms")?,
+                client_id: client_id.to_owned(),
+            })
+        }
+        _ => None,
     };
-    if operator_token.trim().is_empty() {
-        return Ok(Stored::Missing);
-    }
+    let endpoint_host = doc
+        .get(&section, "endpoint_host")
+        .map(|host| host.trim().to_owned())
+        .filter(|host| !host.is_empty());
+    let operator_token = doc
+        .get(&section, "operator_token")
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let Some(operator_token) = operator_token else {
+        // No operator half. With a WorkOS session that is an apps-only
+        // sign-in and a usable record; without one there is nothing here.
+        // The fleet fields stay empty rather than being invented: `token_id`
+        // names a row to revoke and `token_expires_at_ms` an expiry, and
+        // neither exists when no credential was ever minted.
+        return Ok(match workos {
+            Some(workos) => Stored::Present(Credential {
+                operator_token: String::new(),
+                token_id: None,
+                expires_at_ms: None,
+                endpoint_host,
+                workos: Some(workos),
+            }),
+            None => Stored::Missing,
+        });
+    };
     let expires_at_ms = u64_field(&path, &doc, &section, "token_expires_at_ms")?;
     if is_expired(expires_at_ms, now_ms) {
         return Ok(Stored::Expired);
     }
     Ok(Stored::Present(Credential {
-        operator_token: operator_token.trim().to_owned(),
+        operator_token: operator_token.to_owned(),
         token_id: doc.get(&section, "token_id").map(str::to_owned),
         expires_at_ms,
-        endpoint_host: doc
-            .get(&section, "endpoint_host")
-            .map(|host| host.trim().to_owned())
-            .filter(|host| !host.is_empty()),
+        endpoint_host,
+        workos,
     }))
 }
 
@@ -508,7 +613,11 @@ pub fn save_credential(paths: &Paths, credential: &Credential) -> anyhow::Result
     let mut doc = load_doc(&path, CREDENTIAL_KEYS)?;
     let section = paths.section();
     doc.remove_section(&section);
-    doc.set(&section, "operator_token", credential.operator_token.trim())?;
+    // Omitted entirely for an apps-only sign-in. An empty value would be a
+    // key that reads back as no key, which is a slower way of saying nothing.
+    if credential.has_operator() {
+        doc.set(&section, "operator_token", credential.operator_token.trim())?;
+    }
     if let Some(id) = &credential.token_id {
         doc.set(&section, "token_id", id)?;
     }
@@ -517,6 +626,14 @@ pub fn save_credential(paths: &Paths, credential: &Credential) -> anyhow::Result
     }
     if let Some(host) = &credential.endpoint_host {
         doc.set(&section, "endpoint_host", host.trim())?;
+    }
+    if let Some(workos) = &credential.workos {
+        doc.set(&section, "workos_access_token", &workos.access_token)?;
+        doc.set(&section, "workos_refresh_token", &workos.refresh_token)?;
+        doc.set(&section, "workos_client_id", &workos.client_id)?;
+        if let Some(expires_at_ms) = workos.expires_at_ms {
+            doc.set(&section, "workos_expires_at_ms", &expires_at_ms.to_string())?;
+        }
     }
     privatefile::write(&path, doc.render().as_bytes())
 }
@@ -654,6 +771,7 @@ mod tests {
                 token_id: Some("tok-1".into()),
                 expires_at_ms: Some(5_000),
                 endpoint_host: Some("m1.reachpad.dev".into()),
+                workos: None,
             },
         )
         .unwrap();
@@ -664,6 +782,7 @@ mod tests {
                 token_id: None,
                 expires_at_ms: None,
                 endpoint_host: Some("staging.reachpad.dev".into()),
+                workos: None,
             },
         )
         .unwrap();
@@ -711,6 +830,7 @@ mod tests {
             token_id: None,
             expires_at_ms: None,
             endpoint_host: host.map(str::to_owned),
+            workos: None,
         };
 
         assert_eq!(
@@ -781,6 +901,7 @@ mod tests {
                 token_id: None,
                 expires_at_ms: None,
                 endpoint_host: Some("m1.reachpad.dev".into()),
+                workos: None,
             },
         )
         .unwrap();
@@ -851,6 +972,7 @@ mod tests {
                 token_id: None,
                 expires_at_ms: Some(1_000),
                 endpoint_host: None,
+                workos: None,
             },
         )
         .unwrap();
@@ -881,6 +1003,7 @@ mod tests {
                 token_id: Some("tok-first".into()),
                 expires_at_ms: Some(9_000),
                 endpoint_host: Some("first.reachpad.dev".into()),
+                workos: None,
             },
         )
         .unwrap();
@@ -891,6 +1014,7 @@ mod tests {
                 token_id: None,
                 expires_at_ms: None,
                 endpoint_host: None,
+                workos: None,
             },
         )
         .unwrap();

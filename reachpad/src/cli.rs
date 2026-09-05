@@ -38,6 +38,10 @@ pub const DEFAULT_TIMEOUT: &str = "10m";
     version,
     about = "reachpad — run your agents in workspaces that never lose their place",
     after_help = "The whole lifecycle is three verbs: create -> run -> pause.\n\
+                  Apps: init, link, check, publish, pull, sync, versions, read, db,\n\
+                  access, share, shares, secrets, search, ls, tree, mkdir, mv, rmdir,\n\
+                  skill.\n\
+                  Developer verbs live under `reachpad dev --help`.\n\
                   `reachpad --help --json` prints the whole command catalog."
 )]
 pub struct Cli {
@@ -146,6 +150,15 @@ pub struct Cli {
     /// v0.1.0: the file a workspace token is read from and written to.
     #[arg(long, global = true, hide = true)]
     pub token_file: Option<PathBuf>,
+
+    /// The app an apps verb acts on: its URL, a version URL, or its id.
+    ///
+    /// Without it the target is the linked project — the `reachpad.json` in
+    /// this directory or in a parent of it, which the first `publish` or a
+    /// `link` wrote. That is what lets every verb work with no flags from
+    /// anywhere inside a project.
+    #[arg(long, global = true, value_name = "URL|ID")]
+    pub target: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -377,8 +390,10 @@ pub enum Command {
         #[arg(long, value_name = "SEQ")]
         since: Option<u64>,
     },
-    /// Your credential: sign in, see who you are, sign out.
-    #[command(subcommand)]
+    /// The older spelling of `login` / `whoami` / `logout`, kept working and
+    /// out of the top-level list: every runbook and script written against
+    /// `reachpad auth login` still parses.
+    #[command(subcommand, hide = true)]
     Auth(AuthCommand),
     /// API keys (`rpak1.…`) — the credential an agent or CI runner holds.
     #[command(subcommand, alias = "key")]
@@ -406,6 +421,202 @@ pub enum Command {
     /// CLI acts on a workspace.
     #[command(subcommand)]
     Connect(ConnectCommand),
+
+    // ---- your account: sign in, sign out, who you are --------------------
+    /// Sign in through your browser and save the credential.
+    Login {
+        /// Where to read a credential instead of signing in: `-` (stdin),
+        /// `@<path>` or `env:<VAR>`.
+        #[arg(long, value_name = "-|@path|env:VAR")]
+        operator_token: Option<String>,
+        /// Reachpad account service. Plain HTTP is accepted only on loopback.
+        #[arg(long, default_value = crate::cli_auth::DEFAULT_ACCOUNT_URL)]
+        account_url: String,
+        /// Print the WorkOS URL and code without trying to open a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Who you are, which org, your limits and your balance.
+    Whoami,
+    /// Revoke the credential on the server and delete it from this machine.
+    Logout {
+        /// Revoke every credential you sign in WITH, on every machine.
+        #[arg(long)]
+        all: bool,
+    },
+
+    // ---- apps ------------------------------------------------------------
+    /// Write `reachpad.json` here so this folder can be published.
+    Init {
+        /// The folder. Defaults to this one.
+        path: Option<PathBuf>,
+    },
+    /// Attach this folder to an app that already exists.
+    Link {
+        /// The app URL, a version URL, or the app id.
+        url: String,
+        /// The folder to write `reachpad.json` into. Defaults to this one.
+        path: Option<PathBuf>,
+    },
+    /// Validate this folder without uploading anything.
+    Check {
+        /// The folder. Defaults to the linked project, else this one.
+        path: Option<PathBuf>,
+    },
+    /// Publish: create the app the first time, add a version after that.
+    Publish {
+        /// The folder. Defaults to the linked project, else this one.
+        path: Option<PathBuf>,
+        /// Preferred address. Taken from the name when absent; a collision is
+        /// suffixed by the server. First publish only.
+        #[arg(long)]
+        slug: Option<String>,
+        /// Display name. Defaults to the folder's name. First publish only.
+        #[arg(long)]
+        name: Option<String>,
+        /// What changed, in a few words.
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// Who can open it. First publish only — later, use `access set`.
+        #[arg(long, value_enum)]
+        access: Option<AccessArg>,
+        /// Read the public link's password from stdin. First publish only.
+        #[arg(long)]
+        password_stdin: bool,
+        /// When the public link stops working (RFC 3339). First publish only.
+        #[arg(long, value_name = "TIME")]
+        expires_at: Option<String>,
+    },
+    /// Bring an app's source down into a folder.
+    Pull {
+        /// The folder. Defaults to the linked project, else this one.
+        path: Option<PathBuf>,
+        /// A version number. Defaults to the live one.
+        #[arg(long, value_name = "N")]
+        from: Option<u64>,
+        /// Overwrite files this folder has changed.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Pull, merge what changed on both sides, then publish.
+    Sync {
+        /// The folder. Defaults to the linked project, else this one.
+        path: Option<PathBuf>,
+        /// What changed, in a few words.
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+    },
+    /// Write one file from an older version back into the folder.
+    Restore {
+        /// The file, as it is named in the app.
+        file: String,
+        /// The version to take it from.
+        #[arg(long, value_name = "N")]
+        from: u64,
+        /// The folder. Defaults to the linked project, else this one.
+        path: Option<PathBuf>,
+    },
+    /// Every published version, newest first.
+    Versions,
+    /// Print a file from the live version (the entry file by default).
+    Read {
+        /// A path inside the app. Defaults to the version's entry file.
+        path: Option<String>,
+        /// A version number. Defaults to the live one.
+        #[arg(long, value_name = "N")]
+        version: Option<u64>,
+    },
+    /// `read` with the version number as the argument.
+    #[command(name = "read-version")]
+    ReadVersion {
+        /// The version number.
+        number: u64,
+        /// A path inside the app. Defaults to the version's entry file.
+        path: Option<String>,
+    },
+    /// Run one SQL statement against the app's database.
+    Db {
+        /// The statement. One per call; values go in `--params`.
+        // `allow_hyphen_values`, because a statement may legitimately start
+        // with a `--` line comment, and clap would otherwise read
+        // `reachpad db "-- fix\nDROP TABLE items"` as an unknown flag and exit
+        // 2 — never reaching the refusal that comment was hiding.
+        #[arg(allow_hyphen_values = true)]
+        sql: String,
+        /// A JSON array of values for the statement's `?` placeholders.
+        #[arg(long, value_name = "JSON")]
+        params: Option<String>,
+    },
+    /// Who can open this app, and how to change it.
+    ///
+    /// With no subcommand it READS: `reachpad access` prints the current rung
+    /// and changes nothing, which is what a person types first.
+    Access {
+        #[command(subcommand)]
+        command: Option<AccessCommand>,
+    },
+    /// Give one person access by email.
+    Share {
+        /// Their email address.
+        email: String,
+        /// What they may do.
+        #[arg(long, value_enum, default_value = "viewer")]
+        role: ShareRoleArg,
+        /// Send them an email about it.
+        #[arg(long)]
+        notify: bool,
+        /// A line to include in that email.
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// The people this app is shared with.
+    #[command(subcommand)]
+    Shares(SharesCommand),
+    /// Org secrets, bound into apps by name.
+    #[command(subcommand)]
+    Secrets(SecretsCommand),
+    /// Find apps by name.
+    Search {
+        /// What to look for.
+        query: String,
+        /// Only this badge: app, page, doc or file.
+        #[arg(long = "type", value_name = "TYPE")]
+        app_type: Option<String>,
+    },
+    /// The apps and folders in one folder.
+    Ls {
+        /// A folder id. Defaults to the top level.
+        folder: Option<String>,
+    },
+    /// The whole folder hierarchy.
+    Tree,
+    /// Make a folder.
+    Mkdir {
+        /// Its name.
+        name: String,
+        /// The folder to put it in.
+        #[arg(long = "in", value_name = "FOLDER")]
+        parent: Option<String>,
+    },
+    /// Move an app or a folder into another folder.
+    Mv {
+        /// The app or folder to move: an id, or an app URL.
+        what: String,
+        /// Where it goes. A folder id, or `/` for the top level.
+        #[arg(long = "to", value_name = "FOLDER")]
+        to: String,
+    },
+    /// Remove an EMPTY folder. Never removes an app.
+    Rmdir {
+        /// The folder id.
+        folder: String,
+    },
+    /// Instructions for a coding agent, matched to this binary.
+    #[command(subcommand)]
+    Skill(SkillCommand),
+    /// Developer verbs. Not part of the app surface.
+    #[command(subcommand, hide = true)]
+    Dev(DevCommand),
 
     // ---- this installation, not the account ------------------------------
     /// Check this installation: binary, PATH, saved login, endpoints, reach.
@@ -456,6 +667,134 @@ pub enum CompletionShell {
     Bash,
     Zsh,
     Fish,
+}
+
+/// The three rungs of `access`. Spelled with hyphens on the command line and
+/// underscores on the wire (`AccessLevel` in API.md); [`AccessArg::wire`] is
+/// the one place that translation happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AccessArg {
+    /// The owner and the people it is shared with.
+    Restricted,
+    /// Anyone in the org who has the link.
+    #[value(name = "org-link")]
+    OrgLink,
+    /// Anyone at all who has the link.
+    #[value(name = "public-link")]
+    PublicLink,
+}
+
+impl AccessArg {
+    pub fn wire(self) -> &'static str {
+        match self {
+            AccessArg::Restricted => "restricted",
+            AccessArg::OrgLink => "org_link",
+            AccessArg::PublicLink => "public_link",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ShareRoleArg {
+    /// May open it.
+    Viewer,
+    /// May open it and publish new versions.
+    Editor,
+}
+
+impl ShareRoleArg {
+    pub fn wire(self) -> &'static str {
+        match self {
+            ShareRoleArg::Viewer => "viewer",
+            ShareRoleArg::Editor => "editor",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AccessCommand {
+    /// Print who can open this app right now. The default.
+    Show,
+    /// Change who can open it.
+    Set {
+        /// The new level.
+        #[arg(value_enum)]
+        level: AccessArg,
+        /// Read a password for the public link from stdin.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Remove the public link's password.
+        #[arg(long)]
+        clear_password: bool,
+        /// When the public link stops working (RFC 3339).
+        #[arg(long, value_name = "TIME")]
+        expires_at: Option<String>,
+        /// Remove the expiry.
+        #[arg(long)]
+        clear_expiry: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SharesCommand {
+    /// Everyone this app is shared with.
+    List,
+    /// Take one person's access away.
+    Revoke {
+        /// Their email address.
+        email: String,
+    },
+}
+
+/// `reachpad secrets`: the org's secrets, not one app's.
+///
+/// Every app in the org binds the same names, so none of these verbs takes an
+/// app and `--target` is refused rather than ignored.
+#[derive(Subcommand, Debug)]
+pub enum SecretsCommand {
+    /// Set one secret for the org.
+    Set {
+        /// The name apps bind it by, like STRIPE_KEY.
+        name: String,
+        /// Where to read the value: `-` (stdin), `@<path>` or `env:<VAR>`.
+        ///
+        /// Left out, the value comes from stdin when something is piped in,
+        /// and from a hidden prompt when it is not. Never the value itself:
+        /// argv is readable by every other process on the machine.
+        #[arg(value_name = "-|@path|env:VAR")]
+        value: Option<String>,
+    },
+    /// Every secret set for the org, and which apps bind each one.
+    List,
+    /// Take one secret away.
+    Remove {
+        /// Its name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillCommand {
+    /// The topics this binary can print.
+    List,
+    /// Print one topic.
+    Get {
+        /// The topic name. `core` is the one that matters.
+        topic: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DevCommand {
+    /// A function app's log lines.
+    Logs {
+        /// Only lines after this RFC 3339 time.
+        #[arg(long, value_name = "TIME")]
+        since: Option<String>,
+        /// At most this many lines.
+        #[arg(long, default_value_t = 100)]
+        tail: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1365,26 +1704,23 @@ mod tests {
             other => panic!("wrong parse: {other:?}"),
         }
         // `owner` is mintable as a KEY role and is not grantable as a SHARE
-        // role. The half of that this file used to prove — `share --role
-        // owner` refused at clap — went with the verb (ADR-0075): what the
-        // CLI now proves is that the verb is gone and stays gone, including
-        // its hidden spelling, because a hidden verb is still in the catalog
-        // an agent plans against (§13.1). The refusal itself moved
-        // server-side, where a direct API caller meets it too:
-        // `bins/controld/tests/edges_routes.rs` and `controld_api.rs` assert
-        // `400 invalid_role` for `owner` and for `harness`.
-        for argv in [
-            vec!["reachpad", "share", "ws-1", "--role", "owner"],
-            vec!["reachpad", "share", "ws-1", "--role", "viewer"],
-            vec!["reachpad", "share", "ws-1"],
-        ] {
-            assert!(
-                Cli::try_parse_from(argv.clone()).is_err(),
-                "the retired verb still parses: {argv:?}"
-            );
-        }
+        // role, and it still is not: `share` came back as the APPS verb (its
+        // roles are viewer and editor, and nothing else), so the clap refusal
+        // this test has always asserted is asserted against the new verb.
+        assert!(
+            Cli::try_parse_from(["reachpad", "share", "a@b.com", "--role", "owner"]).is_err(),
+            "`owner` is not a role a person can be given on an app"
+        );
+        // The workspace-sharing verb ADR-0075 retired is still gone. What the
+        // name means now is "give a person access to an APP by email", which
+        // is a different object with a different argument, and a workspace id
+        // in that position is refused by `apps::share` before any request is
+        // made — see `an_app_share_takes_an_email_and_says_so_when_it_is_not`.
+        assert!(
+            Cli::try_parse_from(["reachpad", "share", "ws-1", "--role", "collaborator"]).is_err()
+        );
         // The control: an unrelated hidden v0.1.0 spelling still parses, so
-        // the assertions above are about `share` and not about a parser that
+        // the assertions above are about roles and not about a parser that
         // has stopped accepting hidden verbs altogether.
         assert!(Cli::try_parse_from(["reachpad", "credits"]).is_ok());
     }

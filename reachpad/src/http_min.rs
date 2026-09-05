@@ -27,7 +27,7 @@
 //! permitted because that is where hub forwards control requests to controld
 //! (ADR-0040) and where every in-process test drives them.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -38,6 +38,31 @@ use crate::transport::TlsTrust;
 /// ALPN offered on `https://` control connections: hub's TLS endpoint serves
 /// the control plane over HTTP/1.1 (it speaks no h2).
 pub const HTTP_1_1_ALPN: &[u8] = b"http/1.1";
+
+/// Phase budgets for the CLI's control transport. A failed host must not
+/// inherit the kernel's multi-minute SYN retry schedule, and a peer that
+/// accepts TCP but never completes TLS must not hold a command forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ordinary control calls return one small JSON response. Exec is deliberately
+/// excluded: its NDJSON response lasts for the command's caller-supplied
+/// timeout and is bounded by `errors::exec_deadline_ms` instead.
+const REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The control API returns small JSON documents. Bound both sides of the
+/// header delimiter so a peer cannot turn a CLI command into an unbounded
+/// allocation by never closing its response or by declaring a giant body.
+const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Transfer coding is buffered before the ordinary response is decoded, so it
+/// needs a bound of its own. This allowance is deliberately separate from the
+/// decoded JSON ceiling: a payload exactly at that ceiling remains valid when
+/// chunk-size lines and CRLFs are added on the wire.
+const MAX_RESPONSE_CHUNK_FRAMING_BYTES: usize = 1024 * 1024;
+// Keep this in step with controld's `execbroker::MAX_NDJSON_LINE`: a guest
+// control frame can be 1 MiB, and base64 plus its JSON envelope stays below
+// 2 MiB. The stream as a whole remains unbounded and backpressured.
+const MAX_NDJSON_LINE_BYTES: usize = 2 * 1024 * 1024;
 
 /// A parsed HTTP response: status code + JSON body (Null when empty).
 #[derive(Debug)]
@@ -258,6 +283,166 @@ pub async fn get_json_trust(
     send_json(base_url, "GET", path, None, bearer, None, trust).await
 }
 
+/// Any method with an optional JSON body — what the apps API needs, where the
+/// same client has to speak `PUT`, `PATCH` and `DELETE` as well as the two
+/// verbs the fleet routes use. Same confidentiality rule as everything else in
+/// this module.
+pub async fn json_request(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    bearer: Option<&str>,
+    trust: &TlsTrust,
+) -> anyhow::Result<Response> {
+    send_json(base_url, method, path, body, bearer, None, trust).await
+}
+
+/// A response whose body is BYTES, not JSON: the source of one file, and the
+/// snapshot tarball. `parse_response` insists on JSON, which is right for every
+/// control route and wrong for the two apps routes that answer with content.
+#[derive(Debug)]
+pub struct Raw {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+impl Raw {
+    /// The body as JSON, for the error case: every apps failure answers with
+    /// `{ error, message }` whatever the route's success shape is.
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// Send `payload` with an explicit content type and read the reply as bytes.
+/// The two directions the apps snapshot travels — the `PUT` to the upload
+/// ticket, and the `GET` of a version's source — are both this call.
+pub async fn request_bytes(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    payload: &[u8],
+    content_type: &str,
+    bearer: Option<&str>,
+    trust: &TlsTrust,
+) -> anyhow::Result<Raw> {
+    let endpoint = parse_url(base_url)?;
+    endpoint.ensure_confidential()?;
+    let request = request_head_with_type(
+        &endpoint,
+        method,
+        path,
+        bearer,
+        None,
+        payload.len(),
+        content_type,
+    )?;
+    let tcp = connect_tcp(&endpoint).await?;
+    match endpoint.scheme {
+        Scheme::Plaintext => {
+            exchange_raw_within(tcp, request.as_bytes(), payload, &endpoint.authority()).await
+        }
+        Scheme::Tls => {
+            let tls = connect_tls(tcp, &endpoint, trust).await?;
+            exchange_raw_within(tls, request.as_bytes(), payload, &endpoint.authority()).await
+        }
+    }
+}
+
+/// The most a bytes-bodied response may be. The snapshot routes are the only
+/// callers and API.md caps a snapshot at 50 MiB; this is the ceiling that stops
+/// a peer streaming forever into a `Vec` that grows until the process is killed.
+const MAX_RAW_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+
+async fn exchange_raw<S>(stream: S, head: &[u8], payload: &[u8]) -> anyhow::Result<Raw>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    exchange_raw_capped(stream, head, payload, MAX_RAW_RESPONSE_BYTES).await
+}
+
+async fn exchange_raw_capped<S>(
+    mut stream: S,
+    head: &[u8],
+    payload: &[u8],
+    cap: usize,
+) -> anyhow::Result<Raw>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream.write_all(head).await?;
+    stream.write_all(payload).await?;
+    stream.flush().await?;
+    let mut raw = Vec::new();
+    let mut header_end = None;
+    let mut chunked = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(end) = header_end {
+                    ensure_response_wire_size(
+                        raw.len().saturating_sub(end).saturating_add(n),
+                        cap,
+                        chunked,
+                    )?;
+                    raw.extend_from_slice(&chunk[..n]);
+                    continue;
+                }
+
+                raw.extend_from_slice(&chunk[..n]);
+                match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    Some(pos) => {
+                        let end = pos + 4;
+                        ensure_response_header_size(end)?;
+                        let head = std::str::from_utf8(&raw[..end - 4])
+                            .context("HTTP response headers are not UTF-8")?;
+                        let (is_chunked, content_length) = response_framing(head)?;
+                        if let Some(len) = content_length {
+                            ensure_buffered_body_size(len, cap)?;
+                        }
+                        chunked = is_chunked;
+                        ensure_response_wire_size(raw.len() - end, cap, chunked)?;
+                        header_end = Some(end);
+                    }
+                    None => ensure_response_header_size(raw.len())?,
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !raw.is_empty() => break,
+            Err(e) => return Err(e).context("reading HTTP response"),
+        }
+    }
+    parse_raw_capped(&raw, cap)
+}
+
+/// Give byte responses the same ordinary exchange deadline as JSON calls.
+/// The larger body ceiling is a size distinction, not permission for a peer
+/// to stall a publish or pull indefinitely.
+async fn exchange_raw_within<S>(
+    stream: S,
+    head: &[u8],
+    payload: &[u8],
+    authority: &str,
+) -> anyhow::Result<Raw>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let operation = async {
+        exchange_raw(stream, head, payload)
+            .await
+            .with_context(|| format!("HTTP request to {authority} failed"))
+    };
+    within_phase(
+        "HTTP response",
+        REQUEST_RESPONSE_TIMEOUT,
+        Box::pin(operation),
+    )
+    .await
+}
+
 /// GET with a JSON BODY — `GET /v1/api-keys` is the one route shaped this
 /// way (the operator credential travels in the body, docs/API.md §7.2), and
 /// hub relays methods it does not interpret, so the shape survives the proxy.
@@ -342,33 +527,87 @@ async fn send_payload_keyed(
         content_type,
     )?;
 
-    let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-        .await
-        .with_context(|| format!("connecting to {}", endpoint.authority()))?;
+    let tcp = connect_tcp(&endpoint).await?;
     match endpoint.scheme {
-        Scheme::Plaintext => exchange(tcp, request.as_bytes(), payload).await,
+        Scheme::Plaintext => {
+            exchange_within(tcp, request.as_bytes(), payload, &endpoint.authority()).await
+        }
         Scheme::Tls => {
-            let config = trust.client_config(&[HTTP_1_1_ALPN])?;
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-            // An IP literal becomes ServerName::IpAddress and is checked
-            // against the certificate's IP SANs; a name is checked as a name.
-            let server_name = rustls::pki_types::ServerName::try_from(endpoint.host.clone())
-                .with_context(|| {
-                    format!(
-                        "{:?} is not a name or address a certificate can be verified against",
-                        endpoint.host
-                    )
-                })?;
-            let tls = connector.connect(server_name, tcp).await.with_context(|| {
+            let tls = connect_tls(tcp, &endpoint, trust).await?;
+            exchange_within(tls, request.as_bytes(), payload, &endpoint.authority()).await
+        }
+    }
+}
+
+/// TCP connect under an explicit budget. The kernel's default SYN retry
+/// schedule is measured in minutes, which is not a useful CLI failure mode.
+async fn connect_tcp(endpoint: &Endpoint) -> anyhow::Result<TcpStream> {
+    // Box before entering the generic timeout wrapper so this concrete I/O
+    // future is pointer-sized in `within_phase`'s debug state.
+    within_phase(
+        "TCP connect",
+        CONNECT_TIMEOUT,
+        Box::pin(async {
+            TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+                .await
+                .with_context(|| format!("connecting to {}", endpoint.authority()))
+        }),
+    )
+    .await
+}
+
+/// Apply one transport phase's deadline without putting peer-controlled
+/// values in its timeout diagnostic. The ordinary I/O error still carries
+/// the authority where it is useful; the deadline says only which phase
+/// stalled, so it cannot accidentally echo a credential-bearing URL.
+async fn within_phase<T, F>(
+    phase: &'static str,
+    within: Duration,
+    operation: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    match tokio::time::timeout(within, operation).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "control-plane {phase} timed out after {} seconds",
+            within.as_secs()
+        ),
+    }
+}
+
+/// TLS setup has its own phase budget, separate from TCP and the response.
+async fn connect_tls(
+    tcp: TcpStream,
+    endpoint: &Endpoint,
+    trust: &TlsTrust,
+) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let config = trust.client_config(&[HTTP_1_1_ALPN])?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    // An IP literal becomes ServerName::IpAddress and is checked against the
+    // certificate's IP SANs; a name is checked as a name.
+    let server_name =
+        rustls::pki_types::ServerName::try_from(endpoint.host.clone()).with_context(|| {
+            format!(
+                "{:?} is not a name or address a certificate can be verified against",
+                endpoint.host
+            )
+        })?;
+    within_phase(
+        "TLS handshake",
+        TLS_HANDSHAKE_TIMEOUT,
+        Box::pin(async {
+            connector.connect(server_name, tcp).await.with_context(|| {
                 format!(
                     "TLS handshake with {} failed (trusting {})",
                     endpoint.authority(),
                     trust.describe()
                 )
-            })?;
-            exchange(tls, request.as_bytes(), payload).await
-        }
-    }
+            })
+        }),
+    )
+    .await
 }
 
 /// Build the request head. Split out so the credential-handling rule (no line
@@ -466,34 +705,70 @@ async fn exchange<S>(mut stream: S, head: &[u8], payload: &[u8]) -> anyhow::Resu
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    stream.write_all(head).await?;
-    stream.write_all(payload).await?;
-    stream.flush().await?;
-    let mut raw = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match stream.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => raw.extend_from_slice(&chunk[..n]),
-            // A peer that drops the connection without a TLS close_notify is
-            // common and harmless once a complete response is in hand; only an
-            // empty read is a real failure.
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !raw.is_empty() => break,
-            Err(e) => return Err(e).context("reading HTTP response"),
-        }
-    }
-    parse_response(&raw)
+    let raw = exchange_raw_capped(&mut stream, head, payload, MAX_RESPONSE_BODY_BYTES).await?;
+    response_from_raw(raw)
+}
+
+/// Bound the write plus response read for ordinary request/response calls.
+/// This wrapper, rather than `exchange` itself, keeps the streaming exec path
+/// free to use the command's longer caller-supplied deadline.
+async fn exchange_within<S>(
+    stream: S,
+    head: &[u8],
+    payload: &[u8],
+    authority: &str,
+) -> anyhow::Result<Response>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // `authority` is deliberately used only for immediate I/O errors. Timeout
+    // text must name the stalled phase without reflecting a URL-shaped value.
+    let operation = async {
+        exchange(stream, head, payload)
+            .await
+            .with_context(|| format!("HTTP request to {authority} failed"))
+    };
+    within_phase(
+        "HTTP response",
+        REQUEST_RESPONSE_TIMEOUT,
+        Box::pin(operation),
+    )
+    .await
 }
 
 /// Parse a complete HTTP/1.1 response (we always send `Connection: close`,
 /// so the peer's EOF delimits it).
 pub fn parse_response(raw: &[u8]) -> anyhow::Result<Response> {
+    response_from_raw(parse_raw_capped(raw, MAX_RESPONSE_BODY_BYTES)?)
+}
+
+fn response_from_raw(raw: Raw) -> anyhow::Result<Response> {
+    let body = if raw.body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&raw.body).context("response body is not JSON")?
+    };
+    Ok(Response {
+        status: raw.status,
+        body,
+    })
+}
+
+/// The same parse, stopping one step short of the JSON. Everything about
+/// framing — `Content-Length`, `chunked`, EOF — lives here once.
+pub fn parse_raw(raw: &[u8]) -> anyhow::Result<Raw> {
+    parse_raw_capped(raw, MAX_RAW_RESPONSE_BYTES)
+}
+
+fn parse_raw_capped(raw: &[u8], body_limit: usize) -> anyhow::Result<Raw> {
     let header_end = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4)
         .context("malformed HTTP response: no header terminator")?;
-    let head =
-        std::str::from_utf8(&raw[..header_end]).context("HTTP response headers are not UTF-8")?;
+    ensure_response_header_size(header_end)?;
+    let head = std::str::from_utf8(&raw[..header_end - 4])
+        .context("HTTP response headers are not UTF-8")?;
     let mut lines = head.split("\r\n");
     let status_line = lines.next().context("empty HTTP response")?;
     let status: u16 = status_line
@@ -502,48 +777,47 @@ pub fn parse_response(raw: &[u8]) -> anyhow::Result<Response> {
         .and_then(|s| s.parse().ok())
         .with_context(|| format!("malformed status line {status_line:?}"))?;
 
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
+    let mut content_type: Option<String> = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
         let value = value.trim();
-        if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.parse().ok();
-        } else if name.eq_ignore_ascii_case("transfer-encoding")
-            && value.eq_ignore_ascii_case("chunked")
-        {
-            chunked = true;
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(value.to_owned());
         }
     }
+    let (chunked, content_length) = response_framing(head)?;
 
-    let rest = &raw[header_end + 4..];
+    let rest = &raw[header_end..];
+    ensure_response_wire_size(rest.len(), body_limit, chunked)?;
     let body: Vec<u8> = if chunked {
-        decode_chunked(rest)?
+        decode_chunked(rest, body_limit)?
     } else if let Some(len) = content_length {
+        ensure_buffered_body_size(len, body_limit)?;
         anyhow::ensure!(rest.len() >= len, "truncated HTTP body");
         rest[..len].to_vec()
     } else {
         rest.to_vec() // Connection: close — EOF delimits the body
     };
-
-    let body = if body.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_slice(&body).context("response body is not JSON")?
-    };
-    Ok(Response { status, body })
+    Ok(Raw {
+        status,
+        content_type,
+        body,
+    })
 }
 
 /// Decode a `Transfer-Encoding: chunked` body.
-fn decode_chunked(mut rest: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn decode_chunked(mut rest: &[u8], body_limit: usize) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
+    let mut framing_bytes = 0usize;
     loop {
         let line_end = rest
             .windows(2)
             .position(|w| w == b"\r\n")
             .context("malformed chunked body: missing size line")?;
+        framing_bytes = framing_bytes.saturating_add(line_end + 2);
+        ensure_chunk_framing_size(framing_bytes)?;
         let size_line = std::str::from_utf8(&rest[..line_end])
             .context("chunk size line is not UTF-8")?
             .split(';') // chunk extensions are ignored
@@ -554,13 +828,126 @@ fn decode_chunked(mut rest: &[u8]) -> anyhow::Result<Vec<u8>> {
             .with_context(|| format!("bad chunk size {size_line:?}"))?;
         rest = &rest[line_end + 2..];
         if size == 0 {
+            let trailer_bytes = if rest.starts_with(b"\r\n") {
+                2
+            } else {
+                rest.windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|pos| pos + 4)
+                    .context("truncated chunked body: incomplete trailer section")?
+            };
+            framing_bytes = framing_bytes.saturating_add(trailer_bytes);
+            ensure_chunk_framing_size(framing_bytes)?;
+            anyhow::ensure!(
+                rest.len() == trailer_bytes,
+                "malformed chunked body: bytes after the terminal chunk"
+            );
             return Ok(out);
         }
-        anyhow::ensure!(rest.len() >= size + 2, "truncated chunk");
+        // Check the bound before `size + 2` or slicing: a size line holding
+        // `usize::MAX` used to overflow here and then panic below.
+        ensure_buffered_body_size(out.len().saturating_add(size), body_limit)?;
+        let framed_size = size + 2; // safe: `size` is now below the bounded body cap
+        anyhow::ensure!(rest.len() >= framed_size, "truncated chunk");
         out.extend_from_slice(&rest[..size]);
         anyhow::ensure!(&rest[size..size + 2] == b"\r\n", "missing chunk terminator");
+        framing_bytes = framing_bytes.saturating_add(2);
+        ensure_chunk_framing_size(framing_bytes)?;
         rest = &rest[size + 2..];
     }
+}
+
+fn response_framing(head: &str) -> anyhow::Result<(bool, Option<usize>)> {
+    let mut content_length = None;
+    let mut chunked = false;
+    let mut transfer_encoding_seen = false;
+    for line in head.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            let parsed = value
+                .parse::<usize>()
+                .context("malformed Content-Length response header")?;
+            anyhow::ensure!(
+                content_length.is_none_or(|prior| prior == parsed),
+                "conflicting Content-Length response headers"
+            );
+            content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            anyhow::ensure!(
+                !transfer_encoding_seen,
+                "multiple Transfer-Encoding response headers are unsupported"
+            );
+            transfer_encoding_seen = true;
+            let mut codings = value.split(',').map(str::trim);
+            let first = codings.next().unwrap_or("");
+            anyhow::ensure!(
+                first.eq_ignore_ascii_case("chunked") && codings.next().is_none(),
+                "unsupported Transfer-Encoding response header"
+            );
+            chunked = true;
+        }
+    }
+    anyhow::ensure!(
+        !(chunked && content_length.is_some()),
+        "ambiguous HTTP response framing: both Transfer-Encoding and Content-Length"
+    );
+    Ok((chunked, content_length))
+}
+
+fn ensure_response_header_size(bytes: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes <= MAX_RESPONSE_HEADER_BYTES,
+        "control-plane HTTP response headers exceed the 64 KiB safety limit \
+         ({bytes} bytes > {MAX_RESPONSE_HEADER_BYTES} bytes); refusing to buffer them"
+    );
+    Ok(())
+}
+
+fn ensure_response_body_size(bytes: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes <= MAX_RESPONSE_BODY_BYTES,
+        "control-plane HTTP response body exceeds the 16 MiB safety limit \
+         ({bytes} bytes > {MAX_RESPONSE_BODY_BYTES} bytes); refusing to buffer it; \
+         the control API must paginate larger responses"
+    );
+    Ok(())
+}
+
+fn ensure_buffered_body_size(bytes: usize, limit: usize) -> anyhow::Result<()> {
+    if limit == MAX_RESPONSE_BODY_BYTES {
+        return ensure_response_body_size(bytes);
+    }
+    anyhow::ensure!(
+        bytes <= limit,
+        "HTTP byte response body exceeds its safety limit \
+         ({bytes} bytes > {limit} bytes); refusing to buffer it"
+    );
+    Ok(())
+}
+
+fn ensure_response_wire_size(bytes: usize, body_limit: usize, chunked: bool) -> anyhow::Result<()> {
+    if !chunked {
+        return ensure_buffered_body_size(bytes, body_limit);
+    }
+    let wire_limit = body_limit.saturating_add(MAX_RESPONSE_CHUNK_FRAMING_BYTES);
+    anyhow::ensure!(
+        bytes <= wire_limit,
+        "chunked control-plane HTTP response exceeds the combined decoded-body and framing \
+         safety limit ({bytes} bytes > {wire_limit} bytes); refusing to buffer it"
+    );
+    Ok(())
+}
+
+fn ensure_chunk_framing_size(bytes: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes <= MAX_RESPONSE_CHUNK_FRAMING_BYTES,
+        "control-plane HTTP chunk framing exceeds the 1 MiB safety limit \
+         ({bytes} bytes > {MAX_RESPONSE_CHUNK_FRAMING_BYTES} bytes); refusing to buffer it"
+    );
+    Ok(())
 }
 
 /// POST and consume the response body **line by line as it arrives**.
@@ -589,28 +976,11 @@ where
     endpoint.ensure_confidential()?;
     let payload = serde_json::to_vec(body).context("request body serialization")?;
     let request = request_head(&endpoint, "POST", path, bearer, payload.len())?;
-    let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-        .await
-        .with_context(|| format!("connecting to {}", endpoint.authority()))?;
+    let tcp = connect_tcp(&endpoint).await?;
     match endpoint.scheme {
         Scheme::Plaintext => stream_lines(tcp, request.as_bytes(), &payload, on_line).await,
         Scheme::Tls => {
-            let config = trust.client_config(&[HTTP_1_1_ALPN])?;
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-            let server_name = rustls::pki_types::ServerName::try_from(endpoint.host.clone())
-                .with_context(|| {
-                    format!(
-                        "{:?} is not a name or address a certificate can be verified against",
-                        endpoint.host
-                    )
-                })?;
-            let tls = connector.connect(server_name, tcp).await.with_context(|| {
-                format!(
-                    "TLS handshake with {} failed (trusting {})",
-                    endpoint.authority(),
-                    trust.describe()
-                )
-            })?;
+            let tls = connect_tls(tcp, &endpoint, trust).await?;
             stream_lines(tls, request.as_bytes(), &payload, on_line).await
         }
     }
@@ -638,13 +1008,18 @@ where
     // body and must not be swallowed by the header read.
     let head_end = loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
+            let end = pos + 4;
+            ensure_response_header_size(end)?;
+            break end;
         }
         let n = stream.read(&mut chunk).await.context("reading headers")?;
         if n == 0 {
             anyhow::bail!("connection closed before the response headers were complete");
         }
         buf.extend_from_slice(&chunk[..n]);
+        if !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            ensure_response_header_size(buf.len())?;
+        }
     };
     let headers = String::from_utf8_lossy(&buf[..head_end]).into_owned();
     let status: u16 = headers
@@ -653,9 +1028,7 @@ where
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .context("no status line in the response")?;
-    let chunked = headers
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked");
+    let (chunked, content_length) = response_framing(&headers)?;
 
     // THE TRANSFER ENCODING IS DECODED, not guessed at.
     //
@@ -673,6 +1046,8 @@ where
     let mut raw: Vec<u8> = buf[head_end..].to_vec();
     let mut line: Vec<u8> = Vec::new();
     let mut eof = false;
+    let mut in_trailers = false;
+    let mut content_remaining = if chunked { None } else { content_length };
     // Chunked state: bytes still to read from the current chunk, or `None`
     // when the next thing on the wire is a size line.
     let mut remaining: Option<usize> = None;
@@ -681,9 +1056,34 @@ where
         let mut body: Vec<u8> = Vec::new();
         if chunked {
             loop {
+                if in_trailers {
+                    let trailer_end = if raw.starts_with(b"\r\n") {
+                        Some(2)
+                    } else {
+                        raw.windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|pos| pos + 4)
+                    };
+                    let Some(end) = trailer_end else {
+                        ensure_response_header_size(raw.len())
+                            .context("chunk trailers exceed the HTTP framing safety limit")?;
+                        break;
+                    };
+                    ensure_response_header_size(end)
+                        .context("chunk trailers exceed the HTTP framing safety limit")?;
+                    anyhow::ensure!(
+                        raw.len() == end,
+                        "malformed chunked body: bytes after the terminal chunk"
+                    );
+                    raw.drain(..end);
+                    eof = true;
+                    break;
+                }
                 match remaining {
                     None => {
                         let Some(pos) = raw.windows(2).position(|w| w == b"\r\n") else {
+                            ensure_response_header_size(raw.len())
+                                .context("chunk size line exceeds the HTTP framing safety limit")?;
                             break;
                         };
                         let size_line = String::from_utf8_lossy(&raw[..pos]).into_owned();
@@ -697,25 +1097,28 @@ where
                         let size = usize::from_str_radix(hex, 16)
                             .with_context(|| format!("bad chunk size {hex:?}"))?;
                         if size == 0 {
-                            eof = true;
-                            break;
+                            in_trailers = true;
+                            continue;
                         }
                         remaining = Some(size);
+                    }
+                    Some(0) => {
+                        if raw.len() < 2 {
+                            break;
+                        }
+                        anyhow::ensure!(&raw[..2] == b"\r\n", "missing chunk terminator");
+                        raw.drain(..2);
+                        remaining = None;
                     }
                     Some(want) => {
                         let take = want.min(raw.len());
                         body.extend_from_slice(&raw[..take]);
                         raw.drain(..take);
                         if take == want {
-                            // Consume the CRLF that closes the chunk, when it
-                            // has arrived.
-                            if raw.len() >= 2 && &raw[..2] == b"\r\n" {
-                                raw.drain(..2);
-                                remaining = None;
-                            } else {
-                                remaining = Some(0);
-                                break;
-                            }
+                            // The terminator may be split across socket reads.
+                            // `Some(0)` validates it before any later bytes can
+                            // accumulate behind malformed framing.
+                            remaining = Some(0);
                         } else {
                             remaining = Some(want - take);
                             break;
@@ -724,11 +1127,26 @@ where
                 }
             }
         } else {
-            body.append(&mut raw);
+            if let Some(want) = content_remaining {
+                anyhow::ensure!(
+                    raw.len() <= want,
+                    "HTTP response body exceeds its declared Content-Length"
+                );
+                let took = raw.len();
+                body.append(&mut raw);
+                let left = want - took;
+                content_remaining = Some(left);
+                if left == 0 {
+                    eof = true;
+                }
+            } else {
+                body.append(&mut raw);
+            }
         }
 
         line.extend_from_slice(&body);
         while let Some(pos) = line.iter().position(|b| *b == b'\n') {
+            ensure_ndjson_line_size(pos)?;
             let one: Vec<u8> = line.drain(..=pos).collect();
             let text = String::from_utf8_lossy(&one[..one.len() - 1]);
             let text = text.trim_end_matches('\r');
@@ -739,6 +1157,7 @@ where
                 return Ok(status);
             }
         }
+        ensure_ndjson_line_size(line.len())?;
 
         if eof {
             break;
@@ -749,6 +1168,21 @@ where
             Err(e) => return Err(e).context("reading the ndjson body"),
         };
         if n == 0 {
+            if chunked {
+                let reason = if in_trailers {
+                    "incomplete trailer section"
+                } else {
+                    match remaining {
+                        Some(0) => "missing chunk terminator",
+                        Some(_) => "chunk ended before its declared size",
+                        None => "missing terminal zero chunk",
+                    }
+                };
+                anyhow::bail!("truncated chunked response: {reason}");
+            }
+            if content_remaining.is_some_and(|left| left != 0) {
+                anyhow::bail!("truncated HTTP response body");
+            }
             break;
         }
         raw.extend_from_slice(&chunk[..n]);
@@ -762,6 +1196,109 @@ where
         }
     }
     Ok(status)
+}
+
+fn ensure_ndjson_line_size(bytes: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes <= MAX_NDJSON_LINE_BYTES,
+        "exec response NDJSON line exceeds the 2 MiB safety limit \
+         ({bytes} bytes > {MAX_NDJSON_LINE_BYTES} bytes); refusing to buffer it"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod raw_body_tests {
+    use super::*;
+
+    /// The bytes-bodied routes intentionally have a larger ceiling than JSON,
+    /// but a peer still cannot stream forever into the process.
+    #[tokio::test]
+    async fn a_response_body_past_the_ceiling_is_refused_instead_of_buffered() {
+        let (client, mut server) = tokio::io::duplex(8192);
+        let writer = tokio::spawn(async move {
+            let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\n\r\n";
+            let _ = server.write_all(head).await;
+            // More than any cap this test sets, written until the reader stops.
+            let block = vec![0u8; 8192];
+            for _ in 0..64 {
+                if server.write_all(&block).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let refusal = exchange_raw_capped(client, b"GET / HTTP/1.1\r\n\r\n", &[], 4096)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refusal:#}").contains("HTTP byte response body exceeds its safety limit"),
+            "{refusal:#}"
+        );
+        writer.abort();
+    }
+
+    /// The control: a body under the ceiling still arrives whole.
+    #[tokio::test]
+    async fn a_response_under_the_ceiling_still_arrives_whole() {
+        let (client, mut server) = tokio::io::duplex(8192);
+        tokio::spawn(async move {
+            let _ = server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                .await;
+        });
+        let raw = exchange_raw_capped(client, b"GET / HTTP/1.1\r\n\r\n", &[], 4096)
+            .await
+            .unwrap();
+        assert_eq!(raw.status, 200);
+        assert_eq!(raw.body, b"hi");
+    }
+
+    #[test]
+    fn byte_responses_keep_their_own_body_cap_and_content_type() {
+        let wire =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: 5\r\n\r\nhello";
+        let raw = parse_raw_capped(wire, 5).unwrap();
+        assert_eq!(raw.content_type.as_deref(), Some("application/gzip"));
+        assert_eq!(raw.body, b"hello");
+
+        let err = parse_raw_capped(wire, 4).unwrap_err().to_string();
+        assert!(err.contains("5 bytes > 4 bytes"), "{err}");
+        const { assert!(MAX_RAW_RESPONSE_BYTES > MAX_RESPONSE_BODY_BYTES) };
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_byte_response_has_the_ordinary_exchange_deadline() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 1024];
+            let _ = peer.read(&mut request).await.unwrap();
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{")
+                .await
+                .unwrap();
+            assert_eq!(peer.read(&mut request).await.unwrap(), 0);
+        });
+
+        let started = tokio::time::Instant::now();
+        let err = exchange_raw_within(
+            client,
+            b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n",
+            b"",
+            "must-not-appear.example",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "control-plane HTTP response timed out after 30 seconds"
+        );
+        assert!(!err.contains("must-not-appear.example"));
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            REQUEST_RESPONSE_TIMEOUT
+        );
+        server.await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -896,6 +1433,46 @@ mod tests {
     }
 
     #[test]
+    fn chunked_body_limit_is_inclusive_after_transfer_decoding() {
+        let json = format!("\"{}\"", "x".repeat(MAX_RESPONSE_BODY_BYTES - 2));
+        assert_eq!(json.len(), MAX_RESPONSE_BODY_BYTES);
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            json.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(json.as_bytes());
+        raw.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let response = parse_response(&raw).expect("wire framing must not consume body budget");
+        assert_eq!(
+            response.body.as_str().unwrap().len(),
+            MAX_RESPONSE_BODY_BYTES - 2
+        );
+
+        let too_large = MAX_RESPONSE_BODY_BYTES + 1;
+        let raw =
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{too_large:x}\r\nx");
+        let err = parse_response(raw.as_bytes()).unwrap_err().to_string();
+        assert!(
+            err.contains("body exceeds the 16 MiB safety limit"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn chunk_framing_has_its_own_bound() {
+        let extension = "x".repeat(MAX_RESPONSE_CHUNK_FRAMING_BYTES);
+        let raw =
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0;{extension}\r\n\r\n");
+        let err = parse_response(raw.as_bytes()).unwrap_err().to_string();
+        assert!(
+            err.contains("chunk framing exceeds the 1 MiB safety limit"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn parses_eof_delimited_and_empty_bodies() {
         let r = parse_response(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
         assert_eq!(r.status, 204);
@@ -913,6 +1490,302 @@ mod tests {
         assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n{}").is_err());
         // Body that is not JSON.
         assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nxyz").is_err());
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n{}").is_err());
+        assert!(parse_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n{}"
+        )
+        .is_err());
+        assert!(parse_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        )
+        .is_err());
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n{}").is_err());
+    }
+
+    #[test]
+    fn oversized_response_bodies_are_refused_for_every_framing_mode() {
+        let too_large = MAX_RESPONSE_BODY_BYTES + 1;
+
+        // The limits are inclusive: callers never receive a silently
+        // truncated response at the boundary.
+        ensure_response_header_size(MAX_RESPONSE_HEADER_BYTES).unwrap();
+        ensure_response_body_size(MAX_RESPONSE_BODY_BYTES).unwrap();
+
+        let declared = format!("HTTP/1.1 200 OK\r\nContent-Length: {too_large}\r\n\r\n{{}}");
+        let err = parse_response(declared.as_bytes()).unwrap_err().to_string();
+        assert!(
+            err.contains("body exceeds the 16 MiB safety limit"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("> {MAX_RESPONSE_BODY_BYTES} bytes")),
+            "{err}"
+        );
+        assert!(err.contains("must paginate larger responses"), "{err}");
+
+        // `usize::MAX + 2` was the pre-fix overflow/panic at the chunk
+        // terminator check. It must be an ordinary, actionable refusal.
+        let chunked = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\nx",
+            usize::MAX
+        );
+        let err = parse_response(chunked.as_bytes()).unwrap_err().to_string();
+        assert!(
+            err.contains("body exceeds the 16 MiB safety limit"),
+            "{err}"
+        );
+
+        let prefix = b"HTTP/1.1 200 OK\r\n\r\n";
+        let mut eof_delimited = Vec::with_capacity(prefix.len() + too_large);
+        eof_delimited.extend_from_slice(prefix);
+        eof_delimited.resize(prefix.len() + too_large, b' ');
+        let err = parse_response(&eof_delimited).unwrap_err().to_string();
+        assert!(
+            err.contains("body exceeds the 16 MiB safety limit"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_oversized_response_header_is_refused_while_reading() {
+        let (client, mut peer) = tokio::io::duplex(MAX_RESPONSE_HEADER_BYTES + 8192);
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 1024];
+            let _ = peer.read(&mut request).await.unwrap();
+            let oversized = vec![b'x'; MAX_RESPONSE_HEADER_BYTES + 1];
+            peer.write_all(&oversized).await.unwrap();
+        });
+
+        let err = exchange(client, b"GET / HTTP/1.1\r\n\r\n", b"")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("headers exceed the 64 KiB safety limit"),
+            "{err}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_connect_has_a_phase_specific_deadline() {
+        let started = tokio::time::Instant::now();
+        let err = within_phase(
+            "TCP connect",
+            CONNECT_TIMEOUT,
+            Box::pin(std::future::pending::<anyhow::Result<()>>()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "control-plane TCP connect timed out after 5 seconds");
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            CONNECT_TIMEOUT
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stalls_tls_has_a_phase_specific_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut hello = [0u8; 1024];
+            assert!(peer.read(&mut hello).await.unwrap() > 0);
+            // Read again instead of replying. The deadline drops the TLS
+            // stream, at which point the peer sees EOF and this task exits.
+            assert_eq!(peer.read(&mut hello).await.unwrap(), 0);
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let endpoint = parse_url(&format!("https://127.0.0.1:{}", addr.port())).unwrap();
+        let started = tokio::time::Instant::now();
+        let err = connect_tls(tcp, &endpoint, &TlsTrust::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "control-plane TLS handshake timed out after 10 seconds"
+        );
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            TLS_HANDSHAKE_TIMEOUT
+        );
+        server.await.unwrap();
+    }
+
+    async fn stalled_response_error(prefix: &'static [u8]) -> String {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 1024];
+            let _ = peer.read(&mut request).await.unwrap();
+            peer.write_all(prefix).await.unwrap();
+            // Keep the response open. When the deadline drops the client side,
+            // this observes EOF and lets the task finish without real time.
+            assert_eq!(peer.read(&mut request).await.unwrap(), 0);
+        });
+
+        let err = exchange_within(
+            client,
+            b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n",
+            b"",
+            "127.0.0.1:7401",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        server.await.unwrap();
+        err
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_declared_body_has_an_http_response_deadline() {
+        let started = tokio::time::Instant::now();
+        let err = stalled_response_error(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{").await;
+        assert_eq!(
+            err,
+            "control-plane HTTP response timed out after 30 seconds"
+        );
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            REQUEST_RESPONSE_TIMEOUT
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_eof_delimited_response_cannot_wait_forever_for_close() {
+        let started = tokio::time::Instant::now();
+        let err = stalled_response_error(b"HTTP/1.1 200 OK\r\n\r\n{}").await;
+        assert_eq!(
+            err,
+            "control-plane HTTP response timed out after 30 seconds"
+        );
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            REQUEST_RESPONSE_TIMEOUT
+        );
+    }
+
+    async fn scripted_stream(response: Vec<u8>) -> (anyhow::Result<u16>, Vec<String>) {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 1024];
+            let _ = peer.read(&mut request).await.unwrap();
+            peer.write_all(&response).await.unwrap();
+        });
+        let mut lines = Vec::new();
+        let result = stream_lines(client, b"GET / HTTP/1.1\r\n\r\n", b"", |line| {
+            lines.push(line.to_owned());
+            true
+        })
+        .await;
+        server.await.unwrap();
+        (result, lines)
+    }
+
+    #[tokio::test]
+    async fn streaming_exec_rejects_eof_after_exec_end_but_before_the_zero_chunk() {
+        let end = b"{\"ev\":\"exec.end\",\"exit_code\":0}\n";
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            end.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(end);
+        response.extend_from_slice(b"\r\n");
+
+        let (result, lines) = scripted_stream(response).await;
+        assert_eq!(
+            lines,
+            vec![String::from_utf8(end[..end.len() - 1].to_vec()).unwrap()]
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("missing terminal zero chunk"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn streaming_exec_rejects_eof_mid_chunk_and_in_declared_body() {
+        let line = b"{\"ev\":\"exec.end\"}\n";
+        let mut chunked = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            line.len() + 5
+        )
+        .into_bytes();
+        chunked.extend_from_slice(line);
+        let (result, lines) = scripted_stream(chunked).await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "the terminal event arrived before truncation"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("chunk ended before its declared size"),
+            "{err}"
+        );
+
+        let mut declared = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            line.len() + 5
+        )
+        .into_bytes();
+        declared.extend_from_slice(line);
+        let (result, lines) = scripted_stream(declared).await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "the terminal event arrived before truncation"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("truncated HTTP response body"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn streaming_exec_requires_the_terminal_chunks_final_crlf() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        let (result, _) = scripted_stream(response).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("incomplete trailer section"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn streaming_exec_bounds_each_buffered_unit_and_rejects_bad_framing() {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 1024];
+            let _ = peer.read(&mut request).await.unwrap();
+            let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n";
+            peer.write_all(head).await.unwrap();
+            // A stream has no total-body limit, but one unterminated frame is
+            // still one allocation and must be bounded.
+            let oversized = vec![b'x'; MAX_NDJSON_LINE_BYTES + 1];
+            let _ = peer.write_all(&oversized).await;
+        });
+        let err = stream_lines(client, b"GET / HTTP/1.1\r\n\r\n", b"", |_| true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("NDJSON line exceeds the 2 MiB safety limit"),
+            "{err}"
+        );
+        server.await.unwrap();
+
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 1024];
+            let _ = peer.read(&mut request).await.unwrap();
+            peer.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxNO")
+                .await
+                .unwrap();
+        });
+        let err = stream_lines(client, b"GET / HTTP/1.1\r\n\r\n", b"", |_| true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing chunk terminator"), "{err}");
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -3,9 +3,17 @@
 //!
 //! WorkOS owns every authentication operation: device codes, browser
 //! confirmation, Magic Auth, MFA, SSO, policy and short-lived session tokens.
-//! This module never receives a password or factor and never persists a WorkOS
-//! token. The only durable result is the same `rpop1` credential the manual
-//! `/connect` handoff already produced.
+//! This module never receives a password or factor.
+//!
+//! It produces TWO durable results, not one. The first is the same `rpop1`
+//! operator credential the manual `/connect` handoff already produced, and it
+//! is what the whole fleet surface runs on. The second is the WorkOS
+//! access/refresh pair itself, added when the apps surface arrived: the apps
+//! API is a WorkOS-protected resource and takes the access token as its bearer
+//! (reports/apps-v1 API.md "Auth"), so dropping the pair the way this module
+//! used to would have meant a second sign-in ceremony for the same account.
+//! Both live in one 0600 file (`conf::Credential`) and both go away together on
+//! `logout`.
 
 use anyhow::Context as _;
 
@@ -18,6 +26,8 @@ const WORKOS_DEVICE_PATH: &str = "/user_management/authorize/device";
 const WORKOS_TOKEN_PATH: &str = "/user_management/authenticate";
 const CLI_CONFIG_PATH: &str = "/.well-known/reachpad-cli";
 const CLI_EXCHANGE_PATH: &str = "/api/cli-auth/exchange";
+/// The credential exchange's answer when the account endpoint fronts no fleet.
+const FLEET_UNCONFIGURED: &str = "fleet_unconfigured";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 const MAX_CODE_LEN: usize = 2048;
@@ -37,13 +47,97 @@ pub struct DeviceAuthorization {
     client_id: String,
 }
 
-/// The only values that survive WorkOS authentication.
-pub struct CliLogin {
+/// The fleet half of a sign-in: the ADR-0034 operator credential and the two
+/// URLs that say which fleet it belongs to.
+pub struct FleetLogin {
     pub operator_token: String,
     pub operator_expires_at_ms: u64,
     pub controld_url: String,
     pub hub_url: String,
+}
+
+/// The only values that survive WorkOS authentication.
+pub struct CliLogin {
+    /// Absent when the account endpoint has no fleet configured, which is the
+    /// ordinary answer on reachpad.dev since the product there became apps.
+    /// The sign-in still happened; there is just no workspace half to it.
+    pub fleet: Option<FleetLogin>,
     pub email: Option<String>,
+    /// The WorkOS session itself, kept because the apps API is a WorkOS
+    /// resource and takes this token as its bearer (reports/apps-v1 API.md
+    /// "Auth"). Before apps existed this pair was deliberately dropped one
+    /// line after the exchange; a second sign-in ceremony for the same account
+    /// is not a better answer than persisting it beside the credential it was
+    /// exchanged for, in the same 0600 file, revoked by the same `logout`.
+    pub workos: crate::conf::WorkosSession,
+}
+
+/// Trade a refresh token for a fresh access token, rotating the refresh token
+/// with it. WorkOS access tokens live about five minutes, so this is the call
+/// that stands between a sign-in and every apps command after it.
+///
+/// The new refresh token REPLACES the old one — WorkOS rotates on every
+/// refresh, and keeping the spent one would sign the laptop out on its next
+/// command.
+pub async fn refresh_workos(
+    session: &crate::conf::WorkosSession,
+) -> anyhow::Result<crate::conf::WorkosSession> {
+    let response = tokio::time::timeout(
+        AUTH_REQUEST_TIMEOUT,
+        http_min::post_form_trust(
+            WORKOS_API_URL,
+            WORKOS_TOKEN_PATH,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", session.refresh_token.as_str()),
+                ("client_id", session.client_id.as_str()),
+            ],
+            &TlsTrust::default(),
+        ),
+    )
+    .await
+    .context("refreshing the WorkOS session timed out")?
+    .context("refreshing the WorkOS session")?;
+    anyhow::ensure!(
+        response.status == 200,
+        "your sign-in could not be refreshed ({})",
+        response_error(&response.body)
+    );
+    workos_session(&response.body, &session.client_id)
+}
+
+/// Read the access/refresh pair out of a WorkOS token response.
+fn workos_session(
+    body: &serde_json::Value,
+    client_id: &str,
+) -> anyhow::Result<crate::conf::WorkosSession> {
+    let access_token = body_string(body, "access_token", MAX_TOKEN_LEN)?;
+    let refresh_token = body_string(body, "refresh_token", MAX_TOKEN_LEN)?;
+    let expires_at_ms = access_token_expiry_ms(&access_token);
+    Ok(crate::conf::WorkosSession {
+        access_token,
+        refresh_token,
+        expires_at_ms,
+        client_id: client_id.to_owned(),
+    })
+}
+
+/// When a WorkOS access token stops being accepted, read from its own `exp`
+/// claim.
+///
+/// The claim, not a client-side clock arithmetic on `expires_in`: WorkOS does
+/// not always send one, and the token itself is the authority on when it dies.
+/// A token whose payload cannot be read returns `None`, which
+/// [`crate::conf::Credential::workos_access`] treats as spent — one wasted
+/// refresh, never a stale bearer.
+fn access_token_expiry_ms(access_token: &str) -> Option<u64> {
+    use base64::Engine as _;
+    let payload = access_token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    claims["exp"].as_u64()?.checked_mul(1_000)
 }
 
 fn body_string(body: &serde_json::Value, name: &str, max_len: usize) -> anyhow::Result<String> {
@@ -284,7 +378,7 @@ pub async fn complete_device_authorization(
     validate_credential_origin(account_url)?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(device.expires_in);
     let mut interval = device.interval;
-    let (access_token, email) = loop {
+    let (workos, email) = loop {
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
             "WorkOS CLI authentication timed out"
@@ -307,15 +401,15 @@ pub async fn complete_device_authorization(
         .context("WorkOS CLI authentication timed out")?
         .context("polling WorkOS CLI authentication")?;
         if response.status == 200 {
-            let access_token = body_string(&response.body, "access_token", MAX_TOKEN_LEN)?;
-            // WorkOS also returns a refresh token. It is deliberately not read:
-            // the CLI needs one durable Reachpad credential, not a second
-            // persisted WorkOS session with its own rotation lifecycle.
+            // Both halves are kept now. The access token is spent immediately
+            // on the credential exchange below AND persisted for the apps API;
+            // the refresh token is what keeps that working past five minutes.
+            let workos = workos_session(&response.body, &device.client_id)?;
             let email = response.body["user"]["email"]
                 .as_str()
                 .filter(|value| !value.is_empty() && value.len() <= 320)
                 .map(str::to_owned);
-            break (access_token, email);
+            break (workos, email);
         }
         match response_error(&response.body) {
             "authorization_pending" => {}
@@ -330,24 +424,51 @@ pub async fn complete_device_authorization(
         tokio::time::sleep(pause).await;
     };
 
+    let fleet = exchange_for_fleet(account_url, &workos.access_token, reachpad_trust).await?;
+
+    Ok(CliLogin {
+        fleet,
+        email,
+        workos,
+    })
+}
+
+/// Trade the WorkOS access token for the fleet credential, and treat exactly
+/// one refusal as an answer rather than as a failure.
+///
+/// `fleet_unconfigured` is reachpad.dev saying it is not a fleet front door.
+/// That is not a broken login and it is not a reason to throw away a session
+/// the browser just approved: the apps API takes the WorkOS token directly,
+/// and apps is the product on that endpoint. So this returns `Ok(None)` and
+/// the caller stores the session anyway. Every OTHER non-200 is still a failed
+/// sign-in, refused here with the error the server named — widening this to
+/// any refusal would turn a revoked account or a rejected token into a
+/// half-signed-in machine.
+pub async fn exchange_for_fleet(
+    account_url: &str,
+    access_token: &str,
+    reachpad_trust: &TlsTrust,
+) -> anyhow::Result<Option<FleetLogin>> {
     let response = tokio::time::timeout(
         AUTH_REQUEST_TIMEOUT,
         http_min::post_json_trust(
             account_url,
             CLI_EXCHANGE_PATH,
             &serde_json::json!({}),
-            Some(&access_token),
+            Some(access_token),
             reachpad_trust,
         ),
     )
     .await
     .context("Reachpad credential exchange timed out")?
     .context("exchanging the WorkOS session for a Reachpad credential")?;
-    anyhow::ensure!(
-        response.status == 200,
-        "Reachpad refused the authenticated CLI session ({})",
-        response_error(&response.body)
-    );
+    if response.status != 200 {
+        let error = response_error(&response.body);
+        if error == FLEET_UNCONFIGURED {
+            return Ok(None);
+        }
+        anyhow::bail!("Reachpad refused the authenticated CLI session ({error})");
+    }
 
     let operator_token = body_string(&response.body, "operator_token", MAX_TOKEN_LEN)?;
     validate_operator_token(&operator_token)?;
@@ -358,13 +479,12 @@ pub async fn complete_device_authorization(
         .as_u64()
         .context("credential exchange returned no expiry")?;
 
-    Ok(CliLogin {
+    Ok(Some(FleetLogin {
         operator_token,
         operator_expires_at_ms,
         controld_url,
         hub_url,
-        email,
-    })
+    }))
 }
 
 /// Best-effort convenience only. Printing the URI and code remains the real

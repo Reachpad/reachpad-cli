@@ -106,6 +106,21 @@ pub const TABLE: &[Row] = &[
     // Refusing rather than warning is the whole point: an `rpop1` credential
     // is the account's root secret and it is long-lived, so one delivery to
     // the wrong host is permanent.
+    // Decided on this machine. The sign-in on this endpoint produced a WorkOS
+    // session and no operator credential, because the endpoint answered the
+    // credential exchange with `fleet_unconfigured` — apps is the product
+    // there. One code and one exit status for the state, said the same way by
+    // every control-plane door, and it names the verb that DOES work rather
+    // than the sign-in that just ran.
+    Row {
+        code: "apps_only_credential",
+        selector: None,
+        sentence: "This machine is signed in for apps, and this endpoint has no workspaces. Run `reachpad ls` to list your apps.",
+        numbers: None,
+        next_command: Some("reachpad ls"),
+        exit_code: EXIT_CREDENTIAL,
+        retriable: Retriable::No,
+    },
     Row {
         code: "credential_endpoint_mismatch",
         selector: None,
@@ -1004,7 +1019,14 @@ pub const TABLE: &[Row] = &[
         code: "no_capacity",
         selector: None,
         sentence: "The fleet has no room for {workspace} right now.",
-        numbers: None,
+        // controld does not just refuse, it says WHY: `why_no_capacity` sends a
+        // `cause` and a one-sentence `detail` written per cause. Dropping them
+        // put every caller back in the state that work set out to fix -- "no
+        // room" reads identically whether the fleet is saturated, entirely
+        // draining, or (the case this was found on) has no node registered at
+        // all, and only the last one is an outage. The sentence the operator
+        // needs is already on the wire; this prints it.
+        numbers: Some("{detail_cap}."),
         next_command: None,
         exit_code: EXIT_UNAVAILABLE,
         retriable: Retriable::WhenCauseTransient,
@@ -1592,6 +1614,17 @@ fn field(name: &str, body: &Value, workspace: Option<&str>) -> Option<String> {
         let bytes = body.get(format!("{stem}_bytes"))?.as_u64()?;
         return Some(crate::render::gib(bytes));
     }
+    // `{detail_cap}` renders a body field the server wrote as a clause — today
+    // `no_capacity`'s `detail` — as a sentence: leading capital, nothing else
+    // touched. The words stay the server's (I13: the explanation comes off the
+    // wire, never out of a constant here); only the shape is the client's,
+    // exactly the division `{disk_free_h}` makes above. Absent the field, the
+    // whole `numbers` clause disappears rather than rendering a blank.
+    if let Some(stem) = name.strip_suffix("_cap") {
+        let mut chars = body.get(stem)?.as_str()?.chars();
+        let first = chars.next()?;
+        return Some(first.to_uppercase().collect::<String>() + chars.as_str());
+    }
     match body.get(name)? {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
@@ -1859,6 +1892,53 @@ mod tests {
         // No cause at all is not a promise that retrying helps.
         let unknown = render("no_capacity", &json!({}), Some(503), Some("ws-1"));
         assert!(!unknown.retriable);
+    }
+
+    #[test]
+    fn no_capacity_says_which_kind_of_no_room_it_is() {
+        // The case this was written on: every workspace refused, and the whole
+        // fleet had no node registered. "No room" alone reads like saturation
+        // and sent the reader looking for a busy fleet that did not exist.
+        let empty = render(
+            "no_capacity",
+            &json!({
+                "cause": "no_nodes",
+                "detail": "no nodes are registered in the fleet at all",
+            }),
+            Some(503),
+            Some("ws-1"),
+        );
+        assert_eq!(
+            empty.message,
+            "The fleet has no room for ws-1 right now. \
+             No nodes are registered in the fleet at all."
+        );
+        // Ordinary saturation must not read the same as an empty fleet.
+        let full = render(
+            "no_capacity",
+            &json!({
+                "cause": "all_full",
+                "detail": "2 of 2 eligible node(s) are full (every slot in use)",
+            }),
+            Some(503),
+            Some("ws-1"),
+        );
+        assert!(
+            full.message
+                .ends_with("2 of 2 eligible node(s) are full (every slot in use)."),
+            "{}",
+            full.message
+        );
+        assert_ne!(empty.message, full.message);
+        // Negative control, the rule the whole table keeps: a server that sends
+        // no detail yields one clean sentence, never a dangling capital or dot.
+        let bare = render(
+            "no_capacity",
+            &json!({"cause": "no_nodes"}),
+            Some(503),
+            Some("ws-1"),
+        );
+        assert_eq!(bare.message, "The fleet has no room for ws-1 right now.");
     }
 
     #[test]

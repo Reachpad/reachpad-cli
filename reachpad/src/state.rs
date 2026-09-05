@@ -193,7 +193,14 @@ pub async fn identity(client: &Client, paths: &Paths, now_ms: u64) -> Result<Ide
         return Ok(identity);
     }
     let credential = match conf::load_credential(paths, now_ms)? {
-        conf::Stored::Present(c) => c,
+        conf::Stored::Present(c) if c.has_operator() => c,
+        // An apps-only sign-in has no operator credential to mint an identity
+        // from, and the fleet it would ask is the one this endpoint does not
+        // have. The SAME refusal `Ctx::credential` gives, because it is the
+        // same state: telling one caller "not signed in" and another "signed
+        // in for apps" about one credential is how a person ends up running
+        // the sign-in that just succeeded.
+        conf::Stored::Present(_) => return Err(CliError::from_code("apps_only_credential", None)),
         conf::Stored::Missing => return Err(CliError::from_code("no_credential", None)),
         conf::Stored::Expired => return Err(CliError::from_code("operator_token_expired", None)),
     };
@@ -261,11 +268,18 @@ pub async fn workspace_token(
 /// `auth login` — the one command that installs a fresh credential and ends
 /// the migration — on a file the user is being asked to abandon anyway. It is
 /// reported as a warning and NOT migrated.
+///
+/// ONCE means once per machine, recorded in [`migration_stamp`] — not "once
+/// per empty credential store". `Stored::Missing` is also what `reachpad
+/// logout` leaves behind, so the older guard re-ran the migration after every
+/// sign-out and wrote a v0.1.0 operator credential over a sign-in the person
+/// had just ended. On an apps endpoint that turned "signed in for apps" into
+/// "this machine signed in with an operator credential, which the apps API
+/// does not take" — a sign-out that silently signed you back in as someone
+/// older. The stamp is written the moment the v1 store is in use at all,
+/// whether this call migrated anything or found a credential already there.
 pub fn migrate_v0_files(paths: &Paths, now_ms: u64) -> anyhow::Result<Option<String>> {
     if paths.profile() != conf::DEFAULT_PROFILE {
-        return Ok(None);
-    }
-    if !matches!(conf::load_credential(paths, now_ms)?, conf::Stored::Missing) {
         return Ok(None);
     }
     let config = paths.home().join(".config");
@@ -278,8 +292,22 @@ pub fn migrate_v0_files(paths: &Paths, now_ms: u64) -> anyhow::Result<Option<Str
         p.with_file_name(format!("{}.operator", file_name(p)))
             .exists()
     }) else {
+        // Nothing legacy here, so nothing to remember either: a laptop that
+        // never ran v0.1.0 gets no stamp file for a migration that will never
+        // have anything to do.
         return Ok(None);
     };
+    let stamp = migration_stamp(paths);
+    if stamp.exists() {
+        return Ok(None);
+    }
+    if !matches!(conf::load_credential(paths, now_ms)?, conf::Stored::Missing) {
+        // A v1 credential is on disk, so the migration is over whether or not
+        // it was this code that ended it. Say so permanently, before a
+        // `logout` empties the store and makes this look like a fresh laptop.
+        write_migration_stamp(&stamp)?;
+        return Ok(None);
+    }
     let operator = old_token.with_file_name(format!("{}.operator", file_name(&old_token)));
     let credential = match privatefile::read(&operator) {
         Ok(Some(credential)) => credential,
@@ -306,6 +334,8 @@ pub fn migrate_v0_files(paths: &Paths, now_ms: u64) -> anyhow::Result<Option<Str
             // command happened to be aimed at. `None` is the honest answer,
             // and it takes the warn-and-re-auth path.
             endpoint_host: None,
+            // v0.1.x never held a WorkOS session, so there is none to carry.
+            workos: None,
         },
     )?;
 
@@ -340,11 +370,33 @@ pub fn migrate_v0_files(paths: &Paths, now_ms: u64) -> anyhow::Result<Option<Str
             }
         }
     }
+    // Last, so a migration that died halfway is retried rather than recorded
+    // as done. The old files are left alone, which is why the stamp has to
+    // exist at all: they stay on disk forever, ready to be read again.
+    write_migration_stamp(&migration_stamp(paths))?;
     Ok(Some(format!(
         "migrated your credential from {} to {} ({workspaces} workspace(s) carried over); the old files were left alone",
         operator.display(),
         paths.credentials_file().display()
     )))
+}
+
+/// Where "the v0.1.0 migration is done here" is recorded.
+///
+/// Beside the credential rather than under `state_dir()`: `state::forget_all`
+/// deletes that whole directory on every `logout`, which is exactly the moment
+/// this fact has to survive.
+fn migration_stamp(paths: &Paths) -> PathBuf {
+    paths.config_dir().join("migrated-from-v0")
+}
+
+/// Written, never read: only its existence is a fact, so a stamp somebody
+/// chmodded cannot refuse a command the way `privatefile::read` would.
+fn write_migration_stamp(stamp: &std::path::Path) -> anyhow::Result<()> {
+    privatefile::write(
+        stamp,
+        b"the v0.1.0 credential migration has run on this machine; delete this file to run it again\n",
+    )
 }
 
 fn file_name(path: &std::path::Path) -> String {
@@ -489,6 +541,74 @@ mod tests {
         assert!(old.exists(), "the old files are left alone");
         // Once: with a credential in place there is nothing to migrate.
         assert_eq!(migrate_v0_files(&paths, 1).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Stored::Missing` is what `reachpad logout` leaves behind as well as
+    /// what a never-migrated laptop looks like, and the old guard could not
+    /// tell them apart: the next command after a sign-out re-read
+    /// `~/.config/reach/token.operator` and wrote that v0.1.0 credential back.
+    /// Observed on the owner's box 2026-09-05 — an apps-only sign-in was
+    /// replaced by a month-old operator token, and every apps verb then
+    /// refused with "this machine signed in with an operator credential".
+    #[test]
+    fn a_v0_credential_is_not_resurrected_after_a_logout() {
+        let dir = scratch("migrate-after-logout");
+        let paths = Paths::under(&dir, conf::DEFAULT_PROFILE);
+        let old = dir.join(".config").join("reach").join("token");
+        privatefile::write(&old.with_file_name("token.operator"), b"rpop1.v0.old\n").unwrap();
+
+        // The v1 CLI signs in for apps: a WorkOS session and no operator half.
+        conf::save_credential(
+            &paths,
+            &conf::Credential {
+                operator_token: String::new(),
+                token_id: None,
+                expires_at_ms: None,
+                endpoint_host: None,
+                workos: Some(conf::WorkosSession {
+                    access_token: "access-1".into(),
+                    refresh_token: "refresh-1".into(),
+                    expires_at_ms: Some(4_102_444_800_000),
+                    client_id: "client_test".into(),
+                }),
+            },
+        )
+        .unwrap();
+        // A command runs with that sign-in in place: nothing to migrate.
+        assert_eq!(migrate_v0_files(&paths, 1).unwrap(), None);
+
+        // The person signs out.
+        conf::forget_credential(&paths).unwrap();
+
+        // Every later command leaves the store empty, rather than refilling it
+        // from files v0.1.0 wrote.
+        assert_eq!(migrate_v0_files(&paths, 1).unwrap(), None);
+        assert_eq!(
+            conf::load_credential(&paths, 1).unwrap(),
+            conf::Stored::Missing
+        );
+        assert_eq!(migrate_v0_files(&paths, 1).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half: the machine that has genuinely never migrated still
+    /// gets its one migration, and the second command does not repeat it even
+    /// though the first one signed nothing in.
+    #[test]
+    fn the_first_command_still_migrates_and_the_second_does_not_repeat_it() {
+        let dir = scratch("migrate-stamped");
+        let paths = Paths::under(&dir, conf::DEFAULT_PROFILE);
+        let old = dir.join(".config").join("reach").join("token");
+        privatefile::write(&old.with_file_name("token.operator"), b"rpop1.v0.old\n").unwrap();
+
+        migrate_v0_files(&paths, 1).unwrap().expect("migrated");
+        conf::forget_credential(&paths).unwrap();
+        assert_eq!(migrate_v0_files(&paths, 1).unwrap(), None);
+        assert_eq!(
+            conf::load_credential(&paths, 1).unwrap(),
+            conf::Stored::Missing
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -23,6 +23,8 @@
 //! - [`http_min`] — hand-rolled minimal HTTP/1.1 JSON client over tokio
 //!   `TcpStream` (deliberately no reqwest/hyper — §10 anti-bloat).
 //! - [`api`] — typed calls to controld's public endpoints.
+//! - [`apps`] — the apps product: the manifest, the snapshot, the REST
+//!   client, and the verbs that publish and share a document.
 //! - [`errors`] — wire code → sentence, exit code, `--json` envelope.
 //! - [`privatefile`] — 0700 dirs, 0600 files, atomic writes, checked reads.
 //! - [`conf`] — `config.toml` / `credentials.toml` and their strict parser.
@@ -67,6 +69,7 @@ macro_rules! eprintln {
 }
 
 pub mod api;
+pub mod apps;
 pub mod attach;
 pub mod cli;
 pub mod cli_auth;

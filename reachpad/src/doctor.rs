@@ -144,9 +144,19 @@ pub(crate) async fn run(ctx: &Ctx) -> Result<i32, CliError> {
         None
     } else {
         match conf::load_credential(&ctx.paths, crate::commands::now_ms()) {
-            Ok(conf::Stored::Present(credential)) => {
+            Ok(conf::Stored::Present(credential)) if credential.has_operator() => {
                 report.ok("credential", "a saved sign-in is present and unexpired");
                 Some(credential)
+            }
+            // Signed in for apps, with no operator credential to check
+            // against a fleet. Reported as ok, because it is: the account
+            // check below says the rest.
+            Ok(conf::Stored::Present(_)) => {
+                report.ok(
+                    "credential",
+                    "signed in for apps; this endpoint has no fleet credential",
+                );
+                None
             }
             Ok(conf::Stored::Missing) => {
                 report.fail("credential", "no saved sign-in; run `reachpad auth login`");
