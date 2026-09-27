@@ -18,9 +18,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       # --locked here so the lock is checked on every PR, not first discovered
-      # at release time. It is also what makes CI agree with the greentree
-      # `test` check, which has always passed --locked: without it CI was green
-      # on a tree the repo's own gate refused.
+      # at release time. Without it CI can pass with dependencies that differ
+      # from the repository's lockfile.
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
 
